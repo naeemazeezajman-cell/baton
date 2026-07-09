@@ -249,6 +249,13 @@ def get_proposal(pid: uuid.UUID, user: User = Depends(current_user), db: Session
 
 # ---------- create / assign (prototype createRequest) ----------
 
+def _norm_name(s: str | None) -> str:
+    return " ".join((s or "").split()).lower()
+
+
+CLOSED_STATUSES = ("el_sent", "lost", "onboarding_complete")
+
+
 @router.post("", status_code=201)
 def create_proposal(
     body: ProposalCreateIn,
@@ -256,6 +263,22 @@ def create_proposal(
     db: Session = Depends(get_db),
 ):
     drafter = _user(db, user, body.assigned_to)
+
+    # duplicate-prospect guard: refuse while an open matter exists for the same prospect
+    # (case-insensitive, whitespace-normalized); prior lost matters only flag a warning
+    target = _norm_name(body.prospect.name)
+    same_prospect = [
+        x for x in db.scalars(tenant_select(Proposal, user)).all()
+        if _norm_name((x.prospect or {}).get("name")) == target
+    ]
+    open_same = [x for x in same_prospect if x.status not in CLOSED_STATUSES]
+    if open_same:
+        raise conflict(
+            f'An open proposal already exists for "{body.prospect.name.strip()}": '
+            f"{open_same[0].ref} (status: {open_same[0].status}). Open it instead of creating a duplicate."
+        )
+    prior_lost = [x for x in same_prospect if x.status == "lost"]
+
     count = db.scalar(select(func.count()).select_from(Proposal).where(Proposal.tenant_id == user.tenant_id))
     ref = f"P-{count + 1:03d}"
     p = Proposal(
@@ -282,8 +305,15 @@ def create_proposal(
     pass_holder(db, p, drafter, user, "assigned to draft the proposal")
     log_event(db, p, None, f'Auto-email sent to {drafter.email} — "You have been assigned proposal {ref}"', kind="email")
     _notify(db, p, drafter.id, f"You were assigned {ref} — proposal for {body.prospect.name}")
+    if prior_lost:
+        log_event(db, p, None, f"Note: this prospect was previously proposed and LOST ({prior_lost[-1].ref}). "
+                               f"Prior history remains on record.")
     db.commit()
-    return _serialize(p)
+    out = _serialize(p)
+    if prior_lost:
+        out["previously_lost"] = True
+        out["prior_ref"] = prior_lost[-1].ref
+    return out
 
 
 @router.post("/{pid}/assign")

@@ -231,6 +231,34 @@ def test_conversion_on_upload_signed(client):
         files={"file": ("dup.pdf", b"%PDF", "application/pdf")})
 
 
+def test_duplicate_prospect_guard(client):
+    ctx = setup_firm(client)
+    create_proposal(client, ctx)  # "Gulf Horizon Trading LLC" → P-001
+
+    # open proposal for the same prospect (case/whitespace-insensitive) is refused with the ref
+    r = client.post("/proposals", json={
+        "prospect": {"name": "  gulf   HORIZON trading llc ", "email": "x@y.ae"},
+        "services": SERVICES, "assigned_to": ctx["staff"]["id"],
+    }, headers=ctx["manager"]["headers"])
+    assert r.status_code == 409, r.text
+    reason = r.json()["detail"]["reason"]
+    assert "P-001" in reason and "already exists" in reason
+
+
+def test_duplicate_prospect_allowed_after_lost_with_flag(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_signed(client, ctx, pid)
+    act(client, ctx, "manager", pid, "send-client", {"to": "a@b.ae", "subject": "P", "body": "x"})
+    act(client, ctx, "manager", pid, "mark-lost", {"note": "went with another firm"})
+
+    p2 = create_proposal(client, ctx)  # same prospect, prior is lost → allowed + flagged
+    assert p2["ref"] == "P-002"
+    assert p2["previously_lost"] is True and p2["prior_ref"] == "P-001"
+    detail = client.get(f"/proposals/{p2['id']}", headers=ctx["manager"]["headers"]).json()
+    assert any("previously proposed and LOST" in e["text"] for e in detail["events"])
+
+
 def test_role_holder_and_status_guards(client):
     ctx = setup_firm(client)
     pid = create_proposal(client, ctx)["id"]

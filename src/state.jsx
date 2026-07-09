@@ -141,37 +141,92 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
 
   const pushToast = (t) => { setToast(t); setTimeout(() => setToast(null), 3000); };
 
+  /* granular refetchers — each fails silently (the next poll/focus tick recovers) */
+  const refetchUsers = useCallback(
+    () => api.get("/users").then((u) => setUsers(u.filter((x) => x.active).map(mapUser))).catch(() => false), []);
+  const refetchProposals = useCallback(
+    () => api.get("/proposals").then(setProposals).catch(() => false), []);
+  const refetchClients = useCallback(
+    () => api.get("/clients").then(setClientsRaw).catch(() => false), []);
+  const refetchDuties = useCallback(
+    () => api.get("/duties").then((d) => setDuties(d.map(mapDuty))).catch(() => false), []);
+  const refetchNotices = useCallback(
+    () => api.get("/notices").then((n) => setNotices(n.map((x) => ({ id: x.id, userId: me.id, at: ms(x.at), text: x.text, read: x.read })))).catch(() => false),
+    [me.id]);
+  const refetchPayments = useCallback(
+    () => (isAcct || isAdmin ? api.get("/payments").then(setPaymentsRaw).catch(() => false) : Promise.resolve()),
+    [isAcct, isAdmin]);
+  const refetchSigUses = useCallback(
+    () => (isAdmin
+      ? api.get("/signature-uses").then((r) => setSigUses(r.map((s) => ({ id: s.id, by: s.by, doc: s.document, pid: s.context, at: ms(s.at) })))).catch(() => false)
+      : Promise.resolve()),
+    [isAdmin]);
+
   const refetchAll = useCallback(async () => {
-    const [u, p, c, d, n] = await Promise.all([
-      api.get("/users"),
-      api.get("/proposals"),
-      api.get("/clients"),
-      api.get("/duties"),
-      api.get("/notices"),
+    // resilient: one failed fetch must never block the rest (a rejected Promise.all here
+    // used to leave the app on the loading screen after a hard refresh)
+    const results = await Promise.all([
+      refetchUsers(), refetchProposals(), refetchClients(), refetchDuties(),
+      refetchNotices(), refetchPayments(), refetchSigUses(),
     ]);
-    setUsers(u.filter((x) => x.active).map(mapUser));
-    setProposals(p);
-    setClientsRaw(c);
-    setDuties(d.map(mapDuty));
-    setNotices(n.map((x) => ({ id: x.id, userId: me.id, at: ms(x.at), text: x.text, read: x.read })));
-    if (isAcct || isAdmin) setPaymentsRaw(await api.get("/payments").catch(() => []));
-    if (isAdmin) setSigUses((await api.get("/signature-uses").catch(() => [])).map(
-      (s) => ({ id: s.id, by: s.by, doc: s.document, pid: s.context, at: ms(s.at) })
-    ));
-    setReady(true);
-  }, [me.id]);
+    const coreOk = results[0] !== false && results[1] !== false;
+    if (coreOk) setReady(true);
+    return coreOk;
+  }, [refetchUsers, refetchProposals, refetchClients, refetchDuties, refetchNotices, refetchPayments, refetchSigUses]);
 
-  useEffect(() => { refetchAll(); }, [refetchAll]);
+  useEffect(() => {
+    let cancelled = false;
+    const boot = async () => {
+      const ok = await refetchAll();
+      if (!ok && !cancelled) setTimeout(boot, 5000); // retry until the core lists load
+    };
+    boot();
+    return () => { cancelled = true; };
+  }, [refetchAll]);
 
+  const lastDetailUuid = useRef(null);
   const refetchDetail = useCallback(async (uuid) => {
-    const [full, docs] = await Promise.all([
-      api.get(`/proposals/${uuid}`),
-      api.get(`/files?entity=proposal&entity_id=${uuid}`),
-    ]);
-    detailFull.current[uuid] = full;
-    detailDocs.current[uuid] = docs;
-    setProposals((ps) => ps.map((x) => (x.id === uuid ? full : x)));
+    lastDetailUuid.current = uuid;
+    try {
+      const [full, docs] = await Promise.all([
+        api.get(`/proposals/${uuid}`),
+        api.get(`/files?entity=proposal&entity_id=${uuid}`),
+      ]);
+      detailFull.current[uuid] = full;
+      detailDocs.current[uuid] = docs;
+      setProposals((ps) => ps.map((x) => (x.id === uuid ? full : x)));
+    } catch { /* next tick recovers */ }
   }, []);
+
+  /* ---------- freshness: 30s polling per screen + refetch on window focus ---------- */
+
+  const focusRef = useRef({ screen: "dashboard", detailRef: null });
+  const setFocus = useCallback((f) => { focusRef.current = f; }, []);
+
+  useEffect(() => {
+    const tick = () => {
+      if (document.hidden) return; // paused while the tab is hidden
+      const { screen } = focusRef.current;
+      const jobs = [refetchNotices()]; // notices always
+      if (screen === "dashboard") jobs.push(refetchProposals(), refetchDuties(), refetchPayments());
+      if (screen === "proposals") jobs.push(refetchProposals());
+      if (screen === "clients") jobs.push(refetchProposals(), refetchClients(), refetchPayments());
+      if (screen === "payments") jobs.push(refetchPayments(), refetchClients());
+      if (screen === "detail") {
+        jobs.push(refetchProposals());
+        if (lastDetailUuid.current) jobs.push(refetchDetail(lastDetailUuid.current));
+      }
+      if (screen === "employees" || screen === "signatures") jobs.push(refetchUsers(), refetchSigUses());
+      return Promise.all(jobs);
+    };
+    const interval = setInterval(tick, 30000);
+    const onFocus = () => refetchAll();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refetchAll, refetchNotices, refetchProposals, refetchDuties, refetchPayments, refetchClients, refetchUsers, refetchSigUses, refetchDetail]);
 
   /* proposals in prototype shape, detail-enriched where fetched */
   const proposalsMapped = proposals.map((a) =>
@@ -226,7 +281,9 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
         payment_terms_rough: form.paymentTerms || null,
       });
       for (const d of form.docs) await uploadRaw("proposal", created.id)(d);
-      pushToast(`Request ${created.ref} created · auto-email sent to the drafter`);
+      pushToast(created.previously_lost
+        ? `Request ${created.ref} created — note: this prospect was previously proposed and LOST (${created.prior_ref}); prior history retained.`
+        : `Request ${created.ref} created · auto-email sent to the drafter`);
       return created;
     }),
 
@@ -352,7 +409,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
   return (
     <DataCtx.Provider value={{
       ready, me, firm, users, proposals: proposalsMapped, clients, duties, payments,
-      notices, sigUses, toast, pushToast, refetchAll, refetchDetail, uuidOf,
+      notices, sigUses, toast, pushToast, refetchAll, refetchDetail, uuidOf, setFocus,
       actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
       setUsersShim, setFirmShim,
     }}>

@@ -342,13 +342,14 @@ function Shell() {
   const {
     ready, me, firm, users, proposals, clients, duties, payments, notices, sigUses, toast,
     actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
-    setUsersShim, setFirmShim, refetchDetail, uuidOf,
+    setUsersShim, setFirmShim, refetchDetail, uuidOf, setFocus,
   } = useData();
   const [route, setRoute] = useState({ screen: "dashboard" });
   const now = () => Date.now();
   const byId = (id) => users.find((u) => u.id === id) || { id, name: "—", role: "", designation: "", email: "", signatory: false };
 
   useEffect(() => {
+    setFocus({ screen: route.screen, detailRef: route.id || null }); // steers the 30s poll
     if (route.screen === "detail" && route.id) {
       const u = uuidOf(route.id);
       if (u) refetchDetail(u);

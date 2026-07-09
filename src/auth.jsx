@@ -22,9 +22,13 @@ export function AuthProvider({ children }) {
       setStatus(mine ? "authed" : "anon");
     } catch (e) {
       if (e.status === 403 && e.detail?.code === "MUST_RESET") setStatus("must_reset");
-      else {
+      else if (e.status === 401) {
         clearTokens();
         setStatus("anon");
+      } else {
+        // transient failure (network blip, API restarting) — keep the session, retry;
+        // dropping to anon here silently logged users out on hard refresh
+        setTimeout(loadSession, 3000);
       }
     }
   };
