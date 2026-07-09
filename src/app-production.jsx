@@ -395,6 +395,7 @@ function Shell() {
             {!isAcct && <NavBtn label="Proposals" active={["proposals", "detail"].includes(route.screen)} onClick={() => setRoute({ screen: "proposals" })} />}
             {isMgr && <NavBtn label="New proposal request" active={route.screen === "new"} onClick={() => setRoute({ screen: "new" })} />}
             {(isMgr || isAcct) && <NavBtn label="Clients" active={route.screen === "clients"} onClick={() => setRoute({ screen: "clients" })} />}
+            {isMgr && <NavBtn label="★ Performance" active={route.screen === "performance"} onClick={() => setRoute({ screen: "performance" })} />}
             {isAcct && <NavBtn label="Payments" active={route.screen === "payments"} onClick={() => setRoute({ screen: "payments" })} />}
             {me.role === "Admin" && (
               <>
@@ -428,7 +429,8 @@ function Shell() {
               <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} markInvoiceRaised={markInvoiceRaised} recordReceipt={recordReceipt} healthOf={healthOf} />
             )}
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
-            {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} />}
+            {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
+            {route.screen === "performance" && isMgr && <PerformanceScreen />}
             {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
             {route.screen === "detail" && (
               <Detail p={proposals.find((x) => x.id === route.id)} me={me} byId={byId} now={now} firm={firm} users={users} clients={clients} workloadOf={workloadOf}
@@ -912,7 +914,8 @@ function ProposalList({ proposals, byId, now, open }) {
 
 /* ================================================================== */
 
-function Clients({ clients, healthOf, byId, proposals, now, openP }) {
+function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
+  const [perfOpen, setPerfOpen] = useState(null);
   return (
     <div className="max-w-5xl mx-auto">
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Clients</h1>
@@ -927,7 +930,8 @@ function Clients({ clients, healthOf, byId, proposals, now, openP }) {
           const pr = proposals.find((p) => p.id === c.pid);
           const team = Object.entries(pr?.el?.assignments || {});
           return (
-            <button key={c.id} onClick={() => openP(c.pid)} className="w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left border-b last:border-0 hover:bg-gray-50 items-center" style={{ borderColor: "var(--line)" }}>
+            <div key={c.id} className="border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+            <div onClick={() => openP(c.pid)} role="button" tabIndex={0} className="w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left hover:bg-gray-50 items-center cursor-pointer">
             <span className="font-mono2 text-xs">{c.code}</span>
             <span className="font-medium truncate">{c.name}
               {c.confirmationBasis && c.confirmationBasis !== "signed_upload" && (
@@ -940,7 +944,16 @@ function Clients({ clients, healthOf, byId, proposals, now, openP }) {
             <span className="font-mono2 text-xs" style={{ color: h.outstanding > 0 ? "var(--red)" : "var(--mut)" }}>{h.outstanding > 0 ? money(h.outstanding) + " overdue" : "—"}</span>
             <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtD(c.engagedAt)}</span>
             <span className="text-[11px] px-2 py-0.5 rounded-full font-bold text-center" style={{ background: h.badge[1] + "18", color: h.badge[1] }}>{h.badge[0]}</span>
-            </button>
+            </div>
+            {canPerf && (
+              <div className="px-5 pb-2 -mt-1.5">
+                <button onClick={() => setPerfOpen(perfOpen === c.id ? null : c.id)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>
+                  {perfOpen === c.id ? "Hide performance & task history ▾" : "★ Performance & task history ▸"}
+                </button>
+              </div>
+            )}
+            {canPerf && perfOpen === c.id && <div className="px-5 pb-4"><ClientPerformance clientId={c.id} /></div>}
+            </div>
           );
         })}
       </div>
@@ -2259,6 +2272,117 @@ const Stars = ({ n }) => (
     <span className="ml-1.5 text-[11px]" style={{ color: "var(--mut)" }}>{n.toFixed(1)}</span>
   </span>
 );
+
+/* ---------- firm-wide performance (management only) ---------- */
+
+function PerformanceScreen() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [openU, setOpenU] = useState(null);
+  useEffect(() => {
+    api.get("/performance/employees").then(setData).catch((e) => setErr(e.message));
+  }, []);
+  if (err) return <div className="max-w-5xl mx-auto text-sm" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!data) return <div className="max-w-5xl mx-auto text-sm" style={{ color: "var(--mut)" }}>Loading performance…</div>;
+  const half = (n) => Math.round(n * 2) / 2;
+  const avgCell = (avg, count) =>
+    avg == null
+      ? <span className="text-xs" style={{ color: "var(--mut)" }}>—</span>
+      : <span className="flex items-center gap-1.5"><Stars n={half(avg)} /><span className="text-[10px]" style={{ color: "var(--mut)" }}>({count})</span></span>;
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Employee performance</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Firm-wide ratings computed from every completed proposal cycle and duty completion. Visible to management only. Click a row for the person's recent star events.</p>
+      <div className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+        <div className="grid grid-cols-[1fr_160px_160px_200px_110px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+          <div>Employee</div><div>Proposals</div><div>Duties</div><div>Overall</div><div>Open workload</div>
+        </div>
+        {data.employees.map((e) => {
+          const isOpen = openU === e.user_id;
+          return (
+            <div key={e.user_id} className="border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+              <button onClick={() => setOpenU(isOpen ? null : e.user_id)} className="w-full grid grid-cols-[1fr_160px_160px_200px_110px] gap-3 px-5 py-3.5 text-sm text-left items-center hover:bg-gray-50">
+                <span><b>{e.name}</b><div className="text-[11px] font-normal" style={{ color: "var(--mut)" }}>{e.designation} · {e.role}</div></span>
+                <span>{avgCell(e.proposal_avg_stars, e.proposal_count)}</span>
+                <span>{avgCell(e.duties_avg_stars, e.duty_count)}</span>
+                <span>
+                  {e.overall_avg == null
+                    ? <span className="text-xs" style={{ color: "var(--mut)" }}>no completed work yet</span>
+                    : <span className="flex items-center gap-2"><span className="font-mono2 text-lg font-bold" style={{ color: "var(--accent)" }}>{e.overall_avg.toFixed(2)}</span><Stars n={half(e.overall_avg)} /><span className="text-[10px]" style={{ color: "var(--mut)" }}>({e.event_count})</span></span>}
+                </span>
+                <span className="text-xs font-mono2" style={{ color: e.open_workload.total > 0 ? "var(--ink)" : "var(--mut)" }}>{e.open_workload.held_proposals} prop · {e.open_workload.open_duties} duty</span>
+              </button>
+              {isOpen && (
+                <div className="border-t px-5 py-3" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+                  <div className="text-[10px] uppercase tracking-wider font-bold mb-2" style={{ color: "var(--mut)" }}>Recent star events — newest first</div>
+                  {e.recent_events.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No completed work yet.</div>}
+                  {e.recent_events.map((ev, i) => (
+                    <div key={i} className="flex items-center gap-3 py-1.5 text-xs border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+                      <span className="w-16 text-[10px] uppercase font-bold" style={{ color: ev.source === "proposal" ? "var(--accent)" : "var(--amber)" }}>{ev.source}</span>
+                      <span className="flex-1">{ev.label}</span>
+                      <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(new Date(ev.at).getTime())}</span>
+                      <Stars n={ev.stars} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-3 text-[10px] space-y-0.5" style={{ color: "var(--mut)" }}>
+        <div>Proposal cycles: {data.proposal_stars_scale_text}</div>
+        <div>Duty completions: {data.duty_stars_scale_text}</div>
+      </div>
+    </div>
+  );
+}
+
+function ClientPerformance({ clientId }) {
+  const [r, setR] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    api.get(`/clients/${clientId}/performance`).then(setR).catch((e) => setErr(e.message));
+  }, [clientId]);
+  if (err) return <div className="text-xs" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!r) return <div className="text-xs" style={{ color: "var(--mut)" }}>Loading task history…</div>;
+  const t = (x) => new Date(x).getTime();
+  return (
+    <div className="rounded-lg border p-3 space-y-3" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+      {r.proposal_cycle && (
+        <div className="bg-white rounded-md border p-3" style={{ borderColor: "var(--line)" }}>
+          <div className="flex items-center justify-between flex-wrap gap-2 text-xs">
+            <b>Onboarding cycle — {r.proposal_cycle.ref}</b>
+            <span className="font-mono2 font-bold" style={{ color: "var(--accent)" }}>{fmtDur(r.proposal_cycle.total_ms)} request → EL sent</span>
+          </div>
+          <div className="mt-1.5 flex gap-4 flex-wrap text-xs">
+            {r.proposal_cycle.per_employee.map((e) => (
+              <span key={e.user_id} className="flex items-center gap-1.5">{e.name} <Stars n={e.stars} /></span>
+            ))}
+          </div>
+        </div>
+      )}
+      <div>
+        <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Task record — newest first ({r.tasks.length})</div>
+        {r.tasks.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No completed duties on record for this client yet.</div>}
+        {r.tasks.map((task, i) => (
+          <div key={i} className="bg-white border rounded-md px-3 py-2 mb-1.5 flex items-center gap-3 text-xs flex-wrap" style={{ borderColor: "var(--line)" }}>
+            <span className="flex-1 min-w-[160px]"><b>{task.service}</b>{task.period && <span style={{ color: "var(--mut)" }}> · {task.period}</span>}<div style={{ color: "var(--mut)" }}>{task.staff_name}</div></span>
+            <span className="font-mono2" style={{ color: "var(--mut)" }}>due {fmtD(t(task.due_at))} → done {fmtD(t(task.completed_at))}</span>
+            <span className="font-mono2 font-bold" style={{ color: task.late_ms > 0 ? "var(--red)" : "var(--accent)" }}>{task.timing}</span>
+            {task.method === "declared" ? (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>declared · capped — no proof</span>
+            ) : (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{task.method}</span>
+            )}
+            <Stars n={task.stars} />
+          </div>
+        ))}
+      </div>
+      <div className="text-[10px]" style={{ color: "var(--mut)" }}>{r.duty_stars_scale_text}</div>
+    </div>
+  );
+}
 
 /* Fetches the server-computed report (client-held time excluded server-side) and adapts it
    onto the verbatim PerfReport component's expected shape. */
