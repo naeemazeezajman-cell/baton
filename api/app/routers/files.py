@@ -23,6 +23,8 @@ class FileOut(BaseModel):
     entity_id: uuid.UUID
     name: str
     size: int | None
+    uploaded_by: uuid.UUID | None = None
+    at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -39,6 +41,21 @@ def store_upload(db: Session, user: User, entity: str, entity_id: uuid.UUID, upl
     db.add(row)
     db.flush()
     return row
+
+
+@router.get("", response_model=list[FileOut])
+def list_files(
+    entity: str,
+    entity_id: uuid.UUID,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import select
+    rows = db.scalars(
+        select(File).where(File.tenant_id == user.tenant_id, File.entity == entity,
+                           File.entity_id == entity_id).order_by(File.at)
+    ).all()
+    return rows
 
 
 @router.post("", response_model=FileOut, status_code=201)

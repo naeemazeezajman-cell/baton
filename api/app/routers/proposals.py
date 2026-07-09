@@ -54,6 +54,7 @@ class ProspectIn(BaseModel):
     email: EmailStr | None = None
     phone: str | None = None
     company: str | None = None
+    contactPerson: str | None = None  # prototype field name, stored verbatim in prospect JSONB
     notes: str | None = None
 
 
@@ -204,7 +205,7 @@ def _latest_version(p: Proposal) -> dict:
     return p.versions[-1]
 
 
-def _serialize(p: Proposal, db: Session | None = None) -> dict:
+def _serialize(p: Proposal, db: Session | None = None, include_events: bool = True) -> dict:
     out = {
         "id": p.id, "ref": p.ref, "status": p.status, "prospect": p.prospect,
         "services": p.services, "assigned_to": p.assigned_to, "requested_by": p.requested_by,
@@ -216,12 +217,13 @@ def _serialize(p: Proposal, db: Session | None = None) -> dict:
         "created_at": p.created_at, "proposal_sent_at": p.proposal_sent_at,
     }
     if db is not None:
-        events = db.scalars(
-            select(ProposalEvent).where(ProposalEvent.proposal_id == p.id).order_by(ProposalEvent.at, ProposalEvent.id)
-        ).all()
-        out["events"] = [
-            {"at": e.at, "by": e.by_user, "kind": e.kind, "text": e.text_, "meta": e.meta} for e in events
-        ]
+        if include_events:
+            events = db.scalars(
+                select(ProposalEvent).where(ProposalEvent.proposal_id == p.id).order_by(ProposalEvent.at, ProposalEvent.id)
+            ).all()
+            out["events"] = [
+                {"at": e.at, "by": e.by_user, "kind": e.kind, "text": e.text_, "meta": e.meta} for e in events
+            ]
         holder_log = db.scalars(
             select(HolderLog).where(HolderLog.proposal_id == p.id).order_by(HolderLog.started_at, HolderLog.id)
         ).all()
@@ -237,7 +239,7 @@ def _serialize(p: Proposal, db: Session | None = None) -> dict:
 @router.get("")
 def list_proposals(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.scalars(tenant_select(Proposal, user).order_by(Proposal.created_at)).all()
-    return [_serialize(p) for p in rows]
+    return [_serialize(p, db, include_events=False) for p in rows]
 
 
 @router.get("/{pid}")
@@ -696,7 +698,8 @@ def upload_signed(pid: uuid.UUID, file: UploadFile, user: User = Depends(current
     db.add(client)
     db.flush()
     p.client_id = client.id
-    p.el = {"note": "", "advance_pct": 0, "signatory_id": None, "signature": None, "sent_at": None, "assignments": {}}
+    p.el = {"note": "", "advance_pct": 0, "signatory_id": None, "signature": None, "sent_at": None,
+            "assignments": {}, "client_signed": {"file_id": str(f.id), "name": f.name, "at": iso(now())}}
     p.status = "el_staffing"
     log_event(db, p, user.id, f"Client-signed proposal uploaded: {f.name}. Client confirmation established — "
                               f"prospect converted to CLIENT {client.ref}.")

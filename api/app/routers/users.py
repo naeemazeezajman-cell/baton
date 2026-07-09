@@ -25,6 +25,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     signatory: bool
+    sig_specimen: dict | None = None
     must_reset: bool
     active: bool
 

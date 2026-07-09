@@ -9,3 +9,9 @@
 - Backups: Azure PG 7-day PITR; monthly manual restore drill to a scratch server.
 - PDPL: data resident in Azure UAE North; processors: Microsoft Azure, Anthropic (payment-terms text only — no client documents are sent to the AI), email provider (recipient addresses + message bodies). Document these in the client agreement.
 - Rate limiting: slowapi on /auth/* (5/min/IP) in v1.
+- Frontend token storage (Phase 4): the access token (30 min) is held in memory only; the
+  refresh token (14 days) is stored in localStorage so the session survives a page refresh.
+  httpOnly cookies are not available on static hosting, so an XSS compromise could read the
+  refresh token — mitigations: no third-party scripts, React's escaping, CSP at go-live,
+  short access-token life, and refresh rotation server-side. Revisit with a BFF/cookie
+  session if the frontend later moves behind the API's own origin.

@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
-from .routers import auth, duties, files, notices, payments, proposals, tenants, users
+from .routers import auth, clients, duties, files, notices, payments, proposals, tenants, users
 
 
 @asynccontextmanager
@@ -37,6 +37,7 @@ app.include_router(proposals.router)
 app.include_router(duties.router)
 app.include_router(payments.router)
 app.include_router(notices.router)
+app.include_router(clients.router)
 app.include_router(files.router)
 
 

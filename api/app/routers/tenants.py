@@ -43,6 +43,7 @@ class EmployeeIn(BaseModel):
     email: EmailStr
     role: str
     signatory: bool = False
+    sig: dict | None = None  # signature specimen: {type: "typed", text} or {type: "image", url: dataURL}
     duties: list[DutyIn] = Field(default_factory=list)
 
 
@@ -103,6 +104,7 @@ def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
             email=str(emp.email),
             role=emp.role,
             signatory=emp.signatory,
+            sig_specimen=emp.sig,
             password_hash=hash_password(temp_password),
             must_reset=True,
         )
@@ -129,3 +131,45 @@ def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
 
     db.commit()
     return BootstrapOut(tenant_id=tenant.id, users=out_users)
+
+
+# ---------- firm settings (STRUCTURE.md: tenants.py — bootstrap, firm settings, catalog) ----------
+
+from ..security import current_user, require_roles  # noqa: E402
+from ..tenancy import get_scoped_or_404  # noqa: E402
+
+
+class FirmUpdateIn(BaseModel):
+    name: str | None = None
+    short: str | None = None
+    address: str | None = None
+    trn: str | None = None
+    phone: str | None = None
+    email: EmailStr | None = None
+    accent: str | None = None
+    services: list[str] | None = None
+    templates: dict | None = None
+
+
+def _firm_out(t: Tenant) -> dict:
+    return {"id": t.id, "name": t.name, "short": t.short, "address": t.address, "trn": t.trn,
+            "phone": t.phone, "email": t.email, "accent": t.accent, "services": t.services,
+            "templates": t.templates, "created_at": t.created_at}
+
+
+@router.get("/me")
+def get_firm(user=Depends(current_user), db: Session = Depends(get_db)):
+    return _firm_out(db.get(Tenant, user.tenant_id))
+
+
+@router.patch("/me")
+def update_firm(body: FirmUpdateIn, user=Depends(require_roles("Admin")), db: Session = Depends(get_db)):
+    t = db.get(Tenant, user.tenant_id)
+    for field in ("name", "short", "address", "trn", "phone", "accent", "services", "templates"):
+        value = getattr(body, field)
+        if value is not None:
+            setattr(t, field, value)
+    if body.email is not None:
+        t.email = str(body.email)
+    db.commit()
+    return _firm_out(t)

@@ -24,7 +24,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build
+      - run: npm run build:demo # the public portfolio site keeps serving the in-memory demo
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

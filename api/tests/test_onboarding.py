@@ -223,8 +223,9 @@ def test_conversion_on_upload_signed(client):
     p = out["proposal"]
     assert p["status"] == "el_staffing"
     assert p["client_id"] == out["client"]["id"]
-    assert p["el"] == {"note": "", "advance_pct": 0, "signatory_id": None, "signature": None,
-                       "sent_at": None, "assignments": {}}
+    assert {k: p["el"][k] for k in ("note", "advance_pct", "signatory_id", "signature", "sent_at", "assignments")} == {
+        "note": "", "advance_pct": 0, "signatory_id": None, "signature": None, "sent_at": None, "assignments": {}}
+    assert p["el"]["client_signed"]["name"] == "Client Signed.pdf"
     # converting twice is refused
     act(client, ctx, "manager", pid, "upload-signed", expect=409,
         files={"file": ("dup.pdf", b"%PDF", "application/pdf")})
