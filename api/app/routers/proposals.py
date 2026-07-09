@@ -1070,13 +1070,34 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
                            f"Client documentation proceeds as a separate onboarding workflow per activity.")
     pass_holder(db, p, None, user, "")
 
-    accountant = db.scalar(tenant_select(User, user).where(User.role == "Accountant", User.active.is_(True)))
+    accountants = db.scalars(
+        tenant_select(User, user).where(User.role == "Accountant", User.active.is_(True))
+    ).all()
     client = db.get(Client, p.client_id)
-    if accountant:
-        plan = (f"Raise the first invoice (advance {advance_pct}%)." if advance_pct > 0
-                else "Raise first-period invoices per the proposal payment terms.")
-        _notify(db, p, accountant.id, f"Client {client.ref if client else ''} — {p.prospect.get('name')}: "
-                                      f"engagement letter sent. {plan} Reminders repeat daily until receipt status is updated.")
+    client_label = f"{client.ref} — {p.prospect.get('name')}" if client else p.prospect.get("name")
+    if accountants:
+        schedule = sorted(pays, key=lambda x: x.due_at)
+        first = schedule[0]
+        lines = [f"- {x.label}: AED {float(x.amount):,.0f} due {x.due_at:%d %b %Y}" for x in schedule]
+        for acct in accountants:
+            _notify(db, p, acct.id,
+                    f"Engagement live: {client_label}. {len(pays)} scheduled payment(s) — first: {first.label} "
+                    f"AED {float(first.amount):,.0f} due {first.due_at:%d %b %Y}. "
+                    f"Review the invoice timeline in Payments.")
+            emails._send(
+                acct.email,
+                f"Baton — engagement live: {p.prospect.get('name')} ({len(pays)} scheduled payment(s))",
+                f"Good morning {acct.name},\n\n"
+                f"The engagement letter for {client_label} was sent — the payment schedule is now live:\n\n"
+                + "\n".join(lines) +
+                "\n\nMark each invoice raised in the accounting software and record receipts as they arrive. "
+                "Daily reminders run until every receipt status is updated.\n\n— Baton",
+            )
+        names = ", ".join(a.name for a in accountants)
+        log_event(db, p, None, f"Accountant notification dispatched to {names} — invoice timeline "
+                               f"({len(pays)} payment(s)) delivered by email and in-system notice.")
+    else:
+        log_event(db, p, None, "No in-house accountant to notify — invoice timeline available in Payments.")
     for svc, staff_id in p.el.get("assignments", {}).items():
         _notify(db, p, uuid.UUID(staff_id), f'{p.prospect.get("name")}: engagement letter sent — your activity "{svc}" is live.')
     db.commit()

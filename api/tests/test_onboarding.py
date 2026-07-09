@@ -405,6 +405,64 @@ def test_confirm_unsigned_without_evidence_and_guards(client):
     assert clients_list[0]["confirmation_basis"] == "verbal_instruction"
 
 
+def test_el_send_notifies_accountant_with_invoice_timeline(client, caplog):
+    import logging
+
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_el_approved(client, ctx, pid, advance_pct=50)
+    with caplog.at_level(logging.INFO, logger="baton.emails"):
+        act(client, ctx, "manager", pid, "el-send", {"to": "a@b.ae", "subject": "EL", "body": "x"})
+
+    # (a) notices row for the accountant — first payment is the advance, due now
+    acct_notices = client.get("/notices", headers=ctx["accountant"]["headers"]).json()
+    live = [n["text"] for n in acct_notices if n["text"].startswith("Engagement live:")]
+    assert live, acct_notices
+    assert "CL-001 — Gulf Horizon Trading LLC" in live[0]
+    assert "4 scheduled payment(s)" in live[0]
+    assert "first: Advance (50%) — first billing period AED 4,000 due" in live[0]
+    assert "Review the invoice timeline in Payments." in live[0]
+    # only Accountant-role users get it
+    for who in ("manager", "staff", "admin"):
+        others = client.get("/notices", headers=ctx[who]["headers"]).json()
+        assert not any(n["text"].startswith("Engagement live:") for n in others), who
+
+    # (b) email lists the full schedule with the standing instruction
+    mail = caplog.text
+    assert "fatima@alphaledger.ae" in mail
+    assert "engagement live: Gulf Horizon Trading LLC (4 scheduled payment(s))" in mail
+    assert "Advance (50%) — first billing period: AED 4,000 due" in mail
+    assert "Balance (50%) — first billing period: AED 4,000 due" in mail
+    assert "Recurring — Bookkeeping (Monthly) (next month): AED 2,000 due" in mail
+    assert "Recurring — VAT Filing (next quarter): AED 6,000 due" in mail
+    assert "Mark each invoice raised in the accounting software and record receipts" in mail
+
+    # (c) proposal event records the dispatch
+    detail = client.get(f"/proposals/{pid}", headers=ctx["manager"]["headers"]).json()
+    texts = [e["text"] for e in detail["events"]]
+    assert any("Accountant notification dispatched to Fatima Zahran" in t and "4 payment(s)" in t for t in texts)
+
+
+def test_el_send_without_accountant_writes_event(client):
+    # firm with no Accountant-role user — el-send must not fail
+    payload = {**BOOTSTRAP_PAYLOAD, "employees": [u for u in FIRM_USERS if u["role"] != "Accountant"]}
+    r = client.post("/tenants/bootstrap", json=payload)
+    assert r.status_code == 201, r.text
+    ctx = {}
+    for u in r.json()["users"]:
+        tokens = login_after_reset(client, u["email"], u["temp_password"], f"Xx-{u['role']}-pass1!")
+        ctx[u["role"].lower()] = {"id": u["id"], "headers": {"Authorization": f"Bearer {tokens['access_token']}"}}
+
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_el_approved(client, ctx, pid, advance_pct=0)
+    p = act(client, ctx, "manager", pid, "el-send", {"to": "a@b.ae", "subject": "EL", "body": "x"})["proposal"]
+    assert p["status"] == "el_sent"
+    detail = client.get(f"/proposals/{pid}", headers=ctx["manager"]["headers"]).json()
+    texts = [e["text"] for e in detail["events"]]
+    assert any("No in-house accountant to notify" in t for t in texts)
+    assert not any("Accountant notification dispatched" in t for t in texts)
+
+
 def test_el_sent_closes_process_with_report(client):
     ctx = setup_firm(client)
     pid = create_proposal(client, ctx)["id"]
