@@ -8,3 +8,7 @@ Prereq: I have completed production/AZURE-PROVISIONING.md (resources exist; I wi
 4. Smoke-test script (scripts/smoke.sh): health, login with a seeded test user, create+advance a proposal one step, upload+link a file. Run it against production and show output.
 5. Data import: use POST /admin/import-baton-json with the client's exported prototype JSON if provided; otherwise I'll run the setup wizard live with the client.
 6. Write GO-LIVE-CHECKLIST.md: DNS/custom domain steps, first Admin login + forced resets, backup verification (restore drill note), the support/update loop (branch → preview → merge → deploy), and rollback (revert commit → redeploy; DB migrations require a down-revision).
+
+## Carry-overs
+
+- Gate or disable /tenants/bootstrap in production (env BOOTSTRAP_KEY check).
