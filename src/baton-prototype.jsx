@@ -1,0 +1,3004 @@
+import { useState, useMemo, useEffect } from "react";
+
+/* ------------------------------------------------------------------ */
+/*  Baton — CRM & employee performance tracker for bookkeeping firms    */
+/*  Scope: Module 1 + Client Onboarding Part 1 (full chain):           */
+/*  proposal → requirements loop → dual signatures → proposal email →  */
+/*  client-signed proposal upload (= confirmation & client conversion) */
+/*  → per-activity staffing (workload-aware) → EL senior signature →   */
+/*  EL email = Part 1 complete → accountant invoicing & receipts       */
+/* ------------------------------------------------------------------ */
+
+const DAY = 86400000;
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+const SERVICES = [
+  "Bookkeeping (Monthly)",
+  "VAT Filing",
+  "Corporate Tax Filing",
+  "Corporate Tax Planning & Consultation",
+  "ESR Filing",
+  "Audit Support",
+  "Financial Reporting (Quarterly)",
+  "Financial Reporting (Annual)",
+];
+
+const SEED_USERS = [
+  { id: "u1", name: "Khalid Al Nuaimi", role: "Admin", designation: "Managing Partner", email: "khalid@crescentbay.ae", signatory: true },
+  { id: "u2", name: "Mariam Al Suwaidi", role: "Admin", designation: "Partner — Tax & Compliance", email: "mariam@crescentbay.ae", signatory: true },
+  { id: "u3", name: "Imran Choudhury", role: "Manager", designation: "Engagement Manager", email: "imran@crescentbay.ae", signatory: true },
+  { id: "u4", name: "Layla Haddad", role: "Manager", designation: "Client Relations Manager", email: "layla@crescentbay.ae", signatory: true },
+  { id: "u5", name: "Vikram Menon", role: "Manager", designation: "Compliance Manager", email: "vikram@crescentbay.ae", signatory: true },
+  { id: "u6", name: "Priya Nair", role: "Staff", designation: "Senior Accountant", email: "priya@crescentbay.ae", signatory: false, existingActivities: [{ id: "a1", client: "Al Reem Foods Trading LLC", service: "Monthly bookkeeping & reporting", cadence: "monthly", dueInDays: 5, contact: { name: "Huda Al Marzooqi", email: "huda@alreemfoods.ae" } }, { id: "a2", client: "Zenith Marine Services FZE", service: "Quarterly VAT filing", cadence: "quarterly", dueInDays: 21, contact: { name: "Rajesh Kumar", email: "rajesh@zenithmarine.ae" } }] },
+  { id: "u7", name: "Omar Farouk", role: "Staff", designation: "Accountant", email: "omar@crescentbay.ae", signatory: false, existingActivities: [{ id: "a3", client: "Pearl Route Logistics LLC", service: "Monthly bookkeeping", cadence: "monthly", dueInDays: 12, contact: { name: "Tariq Aziz", email: "accounts@pearlroute.ae" } }] },
+  { id: "u8", name: "Sneha Pillai", role: "Staff", designation: "VAT Executive", email: "sneha@crescentbay.ae", signatory: false, existingActivities: [{ id: "a4", client: "Al Reem Foods Trading LLC", service: "Quarterly VAT filing", cadence: "quarterly", dueInDays: 21, contact: { name: "Huda Al Marzooqi", email: "huda@alreemfoods.ae" } }, { id: "a5", client: "Oasis Interiors Est.", service: "Quarterly VAT filing", cadence: "quarterly", dueInDays: 2, contact: { name: "Lina Qassem", email: "lina@oasisinteriors.ae" } }, { id: "a6", client: "Danat Auto Spares LLC", service: "VAT registration & filing", cadence: "quarterly", dueInDays: 40, contact: { name: "Yousef Darwish", email: "finance@danatauto.ae" } }] },
+  { id: "u9", name: "Ahmed Bassiouni", role: "Staff", designation: "Tax Associate", email: "ahmed@crescentbay.ae", signatory: false, existingActivities: [{ id: "a7", client: "Zenith Marine Services FZE", service: "Corporate Tax filing FY2025", cadence: "annual", dueInDays: 55, contact: { name: "Rajesh Kumar", email: "rajesh@zenithmarine.ae" } }] },
+  { id: "u10", name: "Grace Fernandes", role: "Staff", designation: "Bookkeeper", email: "grace@crescentbay.ae", signatory: false, existingActivities: [{ id: "a8", client: "Oasis Interiors Est.", service: "Monthly bookkeeping", cadence: "monthly", dueInDays: 8, contact: { name: "Lina Qassem", email: "lina@oasisinteriors.ae" } }, { id: "a9", client: "Danat Auto Spares LLC", service: "Monthly bookkeeping", cadence: "monthly", dueInDays: 15, contact: { name: "Yousef Darwish", email: "finance@danatauto.ae" } }] },
+  { id: "u11", name: "Noor Al Balushi", role: "Staff", designation: "Junior Accountant", email: "noor@crescentbay.ae", signatory: false },
+  { id: "u12", name: "Daniel Mathews", role: "Staff", designation: "Audit Support Executive", email: "daniel@crescentbay.ae", signatory: false },
+  { id: "u13", name: "Ritika Sharma", role: "Staff", designation: "Corporate Tax Analyst", email: "ritika@crescentbay.ae", signatory: false },
+  { id: "u14", name: "Fatima Zahran", role: "Accountant", designation: "Finance Executive (in-house)", email: "fatima@crescentbay.ae", signatory: false },
+];
+
+const SEED_FIRM = {
+  name: "Crescent Bay Accounting & Tax Consultants LLC",
+  short: "Crescent Bay",
+  address: "Suite 908, Amber Gem Tower, Sheikh Khalifa Bin Zayed St, Ajman, UAE",
+  trn: "TRN 100-4471-8820-553",
+  phone: "+971 6 748 2210",
+  email: "info@crescentbay.ae",
+  accent: "#14606B",
+  services: [...SERVICES],
+  templates: { letterhead: null, proposal: null, el: null },
+};
+
+const ROLE_MATRIX = [
+  ["Create proposal requests", true, true, false, false],
+  ["Assign technical staff / offer duties", true, true, false, false],
+  ["Draft & generate proposals", true, true, true, false],
+  ["Edit commercial terms (proposal)", true, true, false, false],
+  ["Sign documents (own signature only)", true, true, false, false],
+  ["Approve / reject engagement letters", true, false, false, false],
+  ["Send client emails (edit · confirm · send)", true, true, false, false],
+  ["Upload signed engagement letters", true, true, false, false],
+  ["Mark invoices raised / record receipts", true, false, false, true],
+  ["Manage employees, firm & letterhead", true, false, false, false],
+  ["View audit trails", true, true, true, true],
+];
+
+const BASIS = ["per month", "per quarter", "per annum", "one-time"];
+const CADENCES = ["monthly", "quarterly", "half-yearly", "annual", "one-time"];
+const dutyKind = (service) =>
+  /vat/i.test(service) ? "vat" : /corporate tax|\bct\b/i.test(service) ? "ct" : /bookkeep|report|account/i.test(service) ? "report" : "other";
+const EMIRATES = ["AUH", "DXB", "SHJ", "AJM", "UAQ", "RAK", "FUJ"];
+const addCadence = (t, cadence) => {
+  const d = new Date(t);
+  const m = { monthly: 1, quarterly: 3, "half-yearly": 6, annual: 12 }[cadence];
+  if (!m) return null; // one-time: no next occurrence
+  d.setMonth(d.getMonth() + m);
+  return d.getTime();
+};
+const defaultBasis = (svc) =>
+  /monthly/i.test(svc) ? "per month" : /quarterly/i.test(svc) ? "per quarter" : /annual|filing|audit|esr/i.test(svc) ? "per annum" : "one-time";
+
+const fmtDT = (t) => new Date(t).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+const fmtD = (t) => new Date(t).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+const days = (ms) => ms / DAY;
+const fmtDur = (ms) => {
+  const d = days(ms);
+  if (d >= 1) return `${d.toFixed(1)}d`;
+  const h = ms / 3600000;
+  if (h >= 1) return `${h.toFixed(1)}h`;
+  return `${Math.max(1, Math.round(ms / 60000))}m`;
+};
+const num = (x) => parseFloat(String(x).replace(/[^\d.]/g, "")) || 0;
+const money = (n) => "AED " + Math.round(n).toLocaleString();
+const fmtSize = (b) => (b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB");
+
+/* human-readable field-level diff between two generated versions — audit entries
+   must state exactly what changed, not merely that a change occurred */
+function diffDrafts(prev, next) {
+  const out = [];
+  const pl = Object.fromEntries(prev.lines.map((l) => [l.service, l]));
+  const nl = Object.fromEntries(next.lines.map((l) => [l.service, l]));
+  next.lines.forEach((l) => {
+    const o = pl[l.service];
+    if (!o) { out.push(`service added: ${l.service} at AED ${num(l.fee).toLocaleString()} ${l.basis || ""}`); return; }
+    if (num(o.fee) !== num(l.fee)) out.push(`${l.service}: fee AED ${num(o.fee).toLocaleString()} → AED ${num(l.fee).toLocaleString()}`);
+    if ((o.basis || defaultBasis(l.service)) !== (l.basis || defaultBasis(l.service))) out.push(`${l.service}: billing basis "${o.basis || defaultBasis(l.service)}" → "${l.basis || defaultBasis(l.service)}"`);
+  });
+  prev.lines.forEach((l) => { if (!nl[l.service]) out.push(`service removed: ${l.service}`); });
+  if ((prev.paymentTerms || "").trim() !== (next.paymentTerms || "").trim()) out.push(`payment terms: "${prev.paymentTerms}" → "${next.paymentTerms}"`);
+  if (String(prev.validityDays) !== String(next.validityDays)) out.push(`validity: ${prev.validityDays} → ${next.validityDays} days`);
+  if ((prev.scope || "").trim() !== (next.scope || "").trim()) out.push(`scope notes: "${prev.scope || "—"}" → "${next.scope || "—"}"`);
+  return out;
+}
+
+/* AI drafting assistant — rewrites rough commercial notes into client-ready wording.
+   Strict: preserves every figure/frequency/deadline; returns null on any failure. */
+async function polishPaymentTerms(rough) {
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        messages: [{
+          role: "user",
+          content: `You are drafting for a professional accounting & tax consultancy in the UAE. Rewrite the rough payment-terms note below into polished, client-ready wording for a services proposal.\n\nStrict rules:\n- Preserve EVERY amount, percentage, frequency, service name and deadline exactly as given — do not add, drop or change any commercial fact.\n- One short professional paragraph or clean semicolon-separated clauses. Formal but plain English. Fix all spelling and grammar (e.g. "quaterly" → "quarterly", "Ct filling" → "Corporate Tax filing").\n- If the note is already professional, return it unchanged.\n- Return ONLY the rewritten text, no preamble, no quotes.\n\nRough note: "${rough}"`
+        }],
+      }),
+    });
+    const data = await r.json();
+    const text = (data.content || []).filter((i) => i.type === "text").map((i) => i.text).join("").trim();
+    return text || null;
+  } catch { return null; }
+}
+
+/* real file picker — files kept in browser memory for the session */
+function FilePick({ label = "Choose file(s)", multiple = false, onFiles, small = false }) {
+  const id = useMemo(uid, []);
+  return (
+    <>
+      <input id={id} type="file" multiple={multiple} accept=".pdf,.png,.jpg,.jpeg,.xlsx,.docx,.csv" className="hidden"
+        onChange={(e) => {
+          const fs = Array.from(e.target.files || []).map((f) => ({ name: f.name, size: f.size, url: URL.createObjectURL(f) }));
+          if (fs.length) onFiles(fs);
+          e.target.value = "";
+        }} />
+      <label htmlFor={id} className={`inline-flex items-center gap-1.5 rounded-md border font-medium cursor-pointer hover:bg-gray-50 ${small ? "px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}`} style={{ borderColor: "var(--line)" }}>
+        📎 {label}
+      </label>
+    </>
+  );
+}
+
+const FileLink = ({ name, url, size }) => (
+  <a href={url} target="_blank" rel="noreferrer" className="underline decoration-dotted hover:decoration-solid" style={{ color: "var(--ink)" }} title="Open document">
+    📄 {name}{size ? <span style={{ color: "var(--mut)" }}> · {fmtSize(size)}</span> : null}
+  </a>
+);
+
+const SigBlock = ({ user, at, role }) => (
+  <div className="inline-block mr-10 align-top">
+    <div className="font-disp italic text-lg" style={{ color: "var(--ink)" }}>{user.name.split(" ").map((x) => x[0]).join(". ")}.</div>
+    <div className="border-t mt-1 pt-1 text-[11px]" style={{ borderColor: "var(--ink)", color: "var(--mut)" }}>
+      <b style={{ color: "var(--ink)" }}>{user.name}</b> · {role}<br />Digitally signed {fmtDT(at)}
+    </div>
+  </div>
+);
+
+/* ================================================================== */
+
+export default function App() {
+  const [clockDays, setClockDays] = useState(0);
+  const now = () => Date.now() + clockDays * DAY;
+
+  const [users, setUsers] = useState([]);
+  const [firm, setFirm] = useState(null); // null = not yet deployed — setup wizard is the only way in
+  const [proposals, setProposals] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [payments, setPayments] = useState([]);
+  const [sigUses, setSigUses] = useState([]);
+  const [duties, setDuties] = useState([]);
+  const [notices, setNotices] = useState([]);
+  const [me, setMe] = useState(null);
+  const [route, setRoute] = useState({ screen: "dashboard" });
+  const [toast, setToast] = useState(null);
+  const [setupMode, setSetupMode] = useState(false);
+
+  const byId = (id) => users.find((u) => u.id === id);
+  const pushToast = (t) => { setToast(t); setTimeout(() => setToast(null), 3000); };
+  const notify = (userId, text) => setNotices((n) => [{ id: uid(), userId, at: now(), text, read: false }, ...n]);
+
+  const update = (id, fn) => setProposals((ps) => ps.map((p) => (p.id === id ? fn(structuredClone(p)) : p)));
+  const log = (p, byUser, text) => { p.events.push({ id: uid(), at: now(), by: byUser, text }); return p; };
+  const passHolder = (p, toUserId, byUser, reason) => {
+    const open = p.holderLog.find((h) => !h.end);
+    if (open) open.end = now();
+    if (toUserId) p.holderLog.push({ userId: toUserId, start: now(), end: null, reason: reason || "responsibility held" });
+    p.holder = toUserId;
+    if (toUserId && reason) log(p, byUser, `Responsibility passed to ${byId(toUserId).name} — ${reason}`);
+    return p;
+  };
+  const useSig = (byUser, docLabel, pid) => setSigUses((s) => [{ id: uid(), by: byUser, doc: docLabel, pid, at: now() }, ...s]);
+
+  /* ---------------- proposal stage actions ---------------- */
+
+  const createRequest = (form) => {
+    const p = {
+      id: "P-" + String(proposals.length + 1).padStart(3, "0"),
+      createdAt: now(),
+      prospect: form.prospect,
+      services: form.services,
+      notes: form.notes,
+      docs: form.docs.map((d) => ({ id: uid(), name: d.name, url: d.url, size: d.size, by: me.id, at: now() })),
+      requestedBy: me.id,
+      assignedTo: form.assignedTo,
+      status: "assigned",
+      holder: null, holderLog: [], checklist: [], chat: [], events: [], versions: [],
+      draft: { lines: form.services.map((s) => ({ service: s.name, fee: s.fee || "", basis: s.basis || defaultBasis(s.name) })), paymentTerms: form.paymentTerms || "", validityDays: 30, scope: "" },
+      signatures: { manager: null, senior: null }, signatoryId: null,
+      el: null, clientId: null,
+    };
+    log(p, me.id, `Proposal request created for prospect "${form.prospect.name}"`);
+    log(p, me.id, `Services requested: ${form.services.map((s) => s.name + (s.custom ? " (custom)" : "")).join(", ")}`);
+    if (form.docs.length) log(p, me.id, `Documents attached at creation: ${form.docs.map((d) => d.name).join(", ")}`);
+    passHolder(p, form.assignedTo, me.id, "assigned to draft the proposal");
+    log(p, "system", `Auto-email sent to ${byId(form.assignedTo).email} — "You have been assigned proposal ${p.id}"`);
+    setProposals((ps) => [...ps, p]);
+    notify(form.assignedTo, `You were assigned ${p.id} — proposal for ${form.prospect.name}`);
+    pushToast(`Request ${p.id} created · auto-email sent to ${byId(form.assignedTo).name}`);
+    setRoute({ screen: "dashboard" });
+  };
+
+  const sendChecklist = (id, slots) =>
+    update(id, (p) => {
+      p.checklist.push(...slots.map((s) => ({ id: uid(), ...s, status: "pending", value: "", fileName: "", reason: "" })));
+      p.status = "docs_with_manager";
+      log(p, me.id, `Requirements requested from manager: ${slots.map((s) => s.label).join(", ")}`);
+      passHolder(p, p.requestedBy, me.id, "requirements checklist pending");
+      notify(p.requestedBy, `${byId(me.id).name} requested ${slots.length} item(s) on ${p.id}`);
+      return p;
+    });
+
+  const fulfillSlot = (id, slotId, patch, evtText) =>
+    update(id, (p) => {
+      const s = p.checklist.find((x) => x.id === slotId);
+      Object.assign(s, patch);
+      if (patch.fileUrl) p.docs.push({ id: uid(), name: patch.fileName, url: patch.fileUrl, size: patch.fileSize, by: me.id, at: now() });
+      log(p, me.id, evtText);
+      return p;
+    });
+
+  const withdrawSlot = (id, slotId, reason) =>
+    update(id, (p) => {
+      const s = p.checklist.find((x) => x.id === slotId);
+      s.status = "withdrawn";
+      s.reason = reason;
+      log(p, me.id, `Checklist item "${s.label}" WITHDRAWN by drafter — reason: "${reason}"`);
+      notify(p.requestedBy, `${p.id}: ${byId(me.id).name} withdrew the request "${s.label}"`);
+      return p;
+    });
+
+  const managerReturn = (id) =>
+    update(id, (p) => {
+      const waivers = p.checklist.some((s) => s.status === "waiver_requested");
+      p.status = waivers ? "waiver_review" : "drafting";
+      log(p, me.id, waivers ? "Responses submitted — waiver decision required" : "All requested items provided — returned for drafting");
+      passHolder(p, p.assignedTo, me.id, waivers ? "waiver review" : "checklist complete, drafting can proceed");
+      notify(p.assignedTo, `${p.id}: manager responded to your requirements checklist`);
+      return p;
+    });
+
+  const staffSendBack = (id) =>
+    update(id, (p) => {
+      p.status = "docs_with_manager";
+      log(p, me.id, "Outstanding checklist items returned to manager");
+      passHolder(p, p.requestedBy, me.id, "rejected / pending items outstanding");
+      notify(p.requestedBy, `${p.id}: items sent back — see rejection reasons`);
+      return p;
+    });
+
+  const startDrafting = (id) =>
+    update(id, (p) => { p.status = "drafting"; log(p, me.id, "Checklist satisfied — drafting started"); return p; });
+
+  const generateVersion = async (id, draft, note) => {
+    let finalDraft = draft;
+    let polishedFrom = null;
+    const rough = (draft.paymentTerms || "").trim();
+    if (rough) {
+      const polished = await polishPaymentTerms(rough);
+      if (polished && polished !== rough) { finalDraft = { ...draft, paymentTerms: polished }; polishedFrom = rough; }
+    }
+    update(id, (p) => {
+      const prevVersion = p.versions[p.versions.length - 1];
+      p.draft = finalDraft;
+      const v = p.versions.length + 1;
+      p.versions.push({ v, at: now(), by: me.id, data: structuredClone(finalDraft), note });
+      log(p, me.id, `Proposal document generated — version v${v} (${note})`);
+      if (prevVersion) {
+        const changes = diffDrafts(prevVersion.data, finalDraft);
+        if (changes.length) log(p, me.id, `Changes in v${v} vs v${prevVersion.v}: ${changes.join("; ")}`);
+        else log(p, "system", `v${v} is identical in commercial content to v${prevVersion.v}`);
+      }
+      if (polishedFrom) log(p, "system", `Payment terms professionalized by the CRM drafting assistant. Original wording preserved on record: "${polishedFrom}"`);
+      if (me.id === p.assignedTo) {
+        if (p.status === "assigned") p.status = "drafting";
+        log(p, "system", `v${v} is in drafter preview — not yet submitted to the manager`);
+      } else if (p.status === "senior_review") {
+        notify(p.requestedBy, `${p.id}: commercial terms revised by ${byId(me.id).name} at senior review — v${v}`);
+        notify(p.assignedTo, `${p.id}: commercial terms revised by ${byId(me.id).name} — v${v}`);
+        log(p, me.id, "Note: manager & drafter notified of senior revision");
+      } else {
+        notify(p.assignedTo, `${p.id}: commercial terms revised by ${byId(me.id).name} — v${v} generated`);
+      }
+      return p;
+    });
+  };
+
+  const submitToManager = (id) =>
+    update(id, (p) => {
+      p.status = "manager_review";
+      p.revisionNote = null;
+      log(p, me.id, `Proposal v${p.versions.length} reviewed by drafter and submitted to manager`);
+      passHolder(p, p.requestedBy, me.id, "proposal ready for review");
+      notify(p.requestedBy, `${p.id}: proposal v${p.versions.length} ready for your review`);
+      return p;
+    });
+
+  /* after client discussions, the manager can send the proposal back to the drafter
+     with an instruction — e.g. the client confirmed a different fee */
+  const sendForRevision = (id, comment) =>
+    update(id, (p) => {
+      p.status = "drafting";
+      p.revisionNote = { by: me.id, at: now(), text: comment };
+      p.lastRejection = null;
+      log(p, me.id, `Returned to drafter for revision — instruction: "${comment}"`);
+      passHolder(p, p.assignedTo, me.id, "revision instructed after client discussion");
+      notify(p.assignedTo, `${p.id}: revision requested by ${byId(me.id).name} — "${comment}"`);
+      return p;
+    });
+
+  /* signatures */
+  const managerSignRoute = (id, signatoryId, note) =>
+    update(id, (p) => {
+      p.signatures.manager = { by: me.id, at: now() };
+      p.signatoryId = signatoryId;
+      p.status = "senior_review";
+      p.lastRejection = null;
+      p.seniorNote = note ? { by: me.id, at: now(), text: note } : null;
+      useSig(me.id, `Proposal ${p.id} v${p.versions.length}`, p.id);
+      log(p, me.id, `Proposal approved & digitally signed by ${byId(me.id).name} (identity re-confirmed)`);
+      if (note) log(p, me.id, `Note to signatory: "${note}"`);
+      passHolder(p, signatoryId, me.id, "routed for senior review & counter-signature");
+      notify(signatoryId, `${p.id}: proposal awaiting your review & signature${note ? ` — note from ${byId(me.id).name}: "${note}"` : ""}`);
+      return p;
+    });
+
+  const seniorApprove = (id) =>
+    update(id, (p) => {
+      p.signatures.senior = { by: me.id, at: now() };
+      p.status = "signed";
+      useSig(me.id, `Proposal ${p.id} v${p.versions.length}`, p.id);
+      log(p, me.id, `Proposal approved & counter-signed by ${byId(me.id).name} (identity re-confirmed). Document locked.`);
+      passHolder(p, p.requestedBy, me.id, "signed proposal returned — ready to send to client");
+      notify(p.requestedBy, `${p.id}: proposal signed by ${byId(me.id).name} — ready to send to client`);
+      return p;
+    });
+
+  const seniorReject = (id, note) =>
+    update(id, (p) => {
+      p.signatures.manager = null;
+      p.status = "manager_review";
+      p.lastRejection = { by: me.id, at: now(), note, stage: "proposal" };
+      log(p, me.id, `Senior review REJECTED by ${byId(me.id).name} — note: "${note}". Manager signature voided; revision required.`);
+      passHolder(p, p.requestedBy, me.id, "senior rejection — revise and re-route");
+      notify(p.requestedBy, `${p.id}: rejected at senior review — "${note}"`);
+      return p;
+    });
+
+  /* client emails — sending the EL completes Onboarding Part 1 */
+  const sendClientEmail = (id, kind, mail) => {
+    if (kind === "proposal") {
+      update(id, (p) => {
+        p.status = "proposal_sent";
+        p.proposalSentAt = now();
+        log(p, me.id, `Email confirmed & sent to ${mail.to} — subject: "${mail.subject}" (signed proposal PDF attached)`);
+        log(p, "system", "Email delivery logged. Awaiting client confirmation — established by uploading the client-signed proposal.");
+        return p;
+      });
+      return;
+    }
+    // kind === "el": final step of Part 1
+    const src = proposals.find((x) => x.id === id);
+    if (!src) return;
+    const d = src.versions[src.versions.length - 1].data;
+    const firstBill = d.lines.reduce((a, l) => a + num(l.fee), 0);
+    const pays = [];
+    const mk = (label, amount, dueAt) => pays.push({ id: uid(), clientId: src.clientId, clientName: src.prospect.name, pid: src.id, label, amount, dueAt, invoiceRaised: false, invoiceRaisedAt: null, received: 0, evidence: [], done: false, events: [{ at: now(), by: "system", text: "Expected payment created from engagement terms" }] });
+    if (src.el.advancePct > 0) {
+      const adv = (src.el.advancePct / 100) * firstBill;
+      mk(`Advance (${src.el.advancePct}%) — first billing period`, adv, now());
+      if (src.el.advancePct < 100) mk(`Balance (${100 - src.el.advancePct}%) — first billing period`, firstBill - adv, now() + 14 * DAY);
+      d.lines.forEach((l) => {
+        const b = l.basis || defaultBasis(l.service);
+        if (b === "per month") mk(`Recurring — ${l.service} (next month)`, num(l.fee), now() + 30 * DAY);
+        if (b === "per quarter") mk(`Recurring — ${l.service} (next quarter)`, num(l.fee), now() + 90 * DAY);
+      });
+    } else {
+      // no advance: first period per service, honoring the billing basis —
+      // quarterly/annual/one-time fees billed in advance (due now), monthly in arrears (+30d)
+      d.lines.forEach((l) => {
+        const b = l.basis || defaultBasis(l.service);
+        mk(`First period — ${l.service} (${b})`, num(l.fee), b === "per month" ? now() + 30 * DAY : now());
+      });
+    }
+    setPayments((pp) => [...pp, ...pays]);
+    update(id, (p) => {
+      p.el.sentAt = now();
+      p.status = "el_sent";
+      log(p, me.id, `Email confirmed & sent to ${mail.to} — subject: "${mail.subject}" (signed engagement letter PDF attached)`);
+      log(p, "system", `ONBOARDING PART 1 COMPLETE. Payment schedule generated (${pays.length} expected payment(s)) — accountant notified; daily email + in-system reminders run until each receipt status is updated.`);
+      log(p, "system", `Part 1 milestone reached in ${fmtDur(now() - p.createdAt)}. The onboarding process and its audit trail REMAIN OPEN — they continue into Onboarding Part 2 (client documentation). Closure and the performance report follow only when both parts are complete.`);
+      const open = p.holderLog.find((h) => !h.end); if (open) open.end = now();
+      p.holder = null;
+      return p;
+    });
+    const acct = users.find((u) => u.role === "Accountant");
+    const cl = clients.find((c) => c.id === src.clientId);
+    if (acct) notify(acct.id, `Client ${cl?.code || ""} — ${src.prospect.name}: engagement letter sent. ${src.el.advancePct > 0 ? `Raise the first invoice (advance ${src.el.advancePct}%).` : "Raise first-period invoices per the proposal payment terms."} Reminders repeat daily until receipt status is updated.`);
+    Object.entries(src.el.assignments || {}).forEach(([svc, uId2]) => notify(uId2, `${src.prospect.name}: engagement letter sent — your activity "${svc}" is live.`));
+    pushToast(`EL sent — Onboarding Part 1 complete for ${src.prospect.name} 🎉`);
+  };
+
+  const markLost = (id, note) =>
+    update(id, (p) => {
+      p.status = "lost";
+      log(p, me.id, `Marked LOST — ${note || "client did not proceed"}`);
+      passHolder(p, null, me.id, "");
+      const open = p.holderLog.find((h) => !h.end); if (open) open.end = now();
+      return p;
+    });
+
+  /* client confirmation = uploading the client-signed proposal.
+     This is the conversion gate: prospect → client, EL auto-prepared, staffing begins. */
+  const uploadSignedProposal = (id, file) => {
+    const src = proposals.find((x) => x.id === id);
+    if (!src || src.clientId) return;
+    const code = "CL-" + String(clients.length + 1).padStart(3, "0");
+    const cid = uid();
+    const d = src.versions[src.versions.length - 1].data;
+    setClients((cs) => [...cs, { id: cid, code, name: src.prospect.name, contact: src.prospect, services: d.lines.map((l) => l.service), pid: src.id, engagedAt: now() }]);
+    update(id, (p) => {
+      p.clientSignedProposal = { ...file, at: now() };
+      p.clientId = cid;
+      p.el = { note: "", advancePct: 0, signatoryId: null, signature: null, sentAt: null, assignments: {} };
+      p.status = "el_staffing";
+      log(p, me.id, `Client-signed proposal uploaded: ${file.name}. Client confirmation established — prospect converted to CLIENT ${code}.`);
+      log(p, "system", "Engagement letter auto-prepared from the signed proposal. Next: assign technical staff per activity, then route for senior signature.");
+      return p;
+    });
+    pushToast(`${src.prospect.name} confirmed — now client ${code}. EL prepared; assign staff per activity.`);
+  };
+
+  /* per-activity staffing during EL prep */
+  const assignActivity = (id, service, staffId) =>
+    update(id, (p) => {
+      p.el.assignments = { ...(p.el.assignments || {}), [service]: staffId };
+      log(p, me.id, `Activity "${service}" assigned to ${byId(staffId).name} (workload reviewed at selection)`);
+      notify(staffId, `${p.id} · ${p.prospect.name}: you were assigned the activity "${service}"`);
+      return p;
+    });
+
+  const setELAdvance = (id, pct) =>
+    update(id, (p) => {
+      const old = p.el.advancePct;
+      if (old === pct) return p;
+      p.el.advancePct = pct;
+      const lbl = (x) => (x === 0 ? "no advance (bill per proposal terms)" : x + "% advance");
+      log(p, me.id, `Engagement letter payment plan changed: ${lbl(old)} → ${lbl(pct)}`);
+      return p;
+    });
+
+  const setELNote = (id, text) =>
+    update(id, (p) => {
+      const old = (p.el.note || "").trim();
+      const nw = (text || "").trim();
+      if (old === nw) return p;
+      p.el.note = text;
+      log(p, me.id, `Engagement letter special terms ${old ? "changed" : "added"}: ${old ? `"${old}" → ` : ""}"${nw || "—"}"`);
+      return p;
+    });
+
+  const routeEL = (id, signatoryId) =>
+    update(id, (p) => {
+      p.el.signatoryId = signatoryId;
+      p.status = "el_senior_review";
+      p.lastRejection = null;
+      log(p, me.id, `Engagement letter routed to ${byId(signatoryId).name} for signature (approve / reject only — no edits at this stage)`);
+      passHolder(p, signatoryId, me.id, "engagement letter pending approval & signature");
+      notify(signatoryId, `${p.id}: engagement letter awaiting your signature`);
+      return p;
+    });
+
+  const elApprove = (id) =>
+    update(id, (p) => {
+      p.el.signature = { by: me.id, at: now() };
+      p.status = "el_approved";
+      useSig(me.id, `Engagement Letter ${p.id}`, p.id);
+      log(p, me.id, `Engagement letter APPROVED & digitally signed by ${byId(me.id).name} (identity re-confirmed). Returned to manager to send to client.`);
+      passHolder(p, p.requestedBy, me.id, "signed EL returned — ready to email to client");
+      notify(p.requestedBy, `${p.id}: engagement letter signed by ${byId(me.id).name} — ready to send to client`);
+      return p;
+    });
+
+  const elReject = (id, note) =>
+    update(id, (p) => {
+      p.status = "el_staffing";
+      p.lastRejection = { by: me.id, at: now(), note, stage: "el" };
+      log(p, me.id, `Engagement letter REJECTED by ${byId(me.id).name} — note: "${note}"`);
+      passHolder(p, p.requestedBy, me.id, "EL rejected — revise and re-route");
+      notify(p.requestedBy, `${p.id}: engagement letter rejected — "${note}"`);
+      return p;
+    });
+
+  /* payments */
+  const updatePayment = (payId, fn) => setPayments((pp) => pp.map((x) => (x.id === payId ? fn(structuredClone(x)) : x)));
+  const markInvoiceRaised = (payId) =>
+    updatePayment(payId, (x) => { x.invoiceRaised = true; x.invoiceRaisedAt = now(); x.events.push({ at: now(), by: me.id, text: "Invoice raised in external accounting software" }); return x; });
+  const recordReceipt = (payId, amount, file) =>
+    updatePayment(payId, (x) => {
+      x.received += amount;
+      if (file) x.evidence.push({ ...file, amount, at: now() });
+      x.events.push({ at: now(), by: me.id, text: `Receipt recorded: ${money(amount)}${file ? " — evidence: " + file.name : ""}` });
+      if (x.received >= x.amount - 0.5) { x.done = true; x.events.push({ at: now(), by: "system", text: "Fully received — reminders stopped" }); }
+      return x;
+    });
+
+  const sendChat = (id, text) =>
+    update(id, (p) => {
+      p.chat.push({ id: uid(), by: me.id, at: now(), text });
+      log(p, me.id, `Chat: "${text}"`);
+      const other = me.id === p.assignedTo ? p.requestedBy : p.assignedTo;
+      notify(other, `${p.id}: new message from ${byId(me.id).name}`);
+      return p;
+    });
+
+  /* ---------------- derived ---------------- */
+
+  const TERMINAL = ["el_sent", "lost"];
+  const batonQueue = me
+    ? proposals.filter((p) => p.holder === me.id && !TERMINAL.includes(p.status))
+        .map((p) => ({ p, since: p.holderLog.find((h) => !h.end)?.start ?? p.createdAt }))
+        .sort((a, b) => a.since - b.since)
+    : [];
+  const myNotices = me ? notices.filter((n) => n.userId === me.id) : [];
+  const myOpenTasks = me ? proposals.filter((p) => p.assignedTo === me.id && !TERMINAL.includes(p.status)) : [];
+  const myActivities = me
+    ? [
+        ...proposals.flatMap((p) => Object.entries(p.el?.assignments || {}).filter(([, uId]) => uId === me.id).map(([svc]) => ({ pid: p.id, client: p.prospect.name, service: svc, live: p.status === "el_sent" }))),
+      ]
+    : [];
+  const duePayments = payments.filter((x) => !x.done && x.dueAt <= now());
+
+  const healthOf = (clientId) => {
+    const list = payments.filter((x) => x.clientId === clientId);
+    const overdue = list.filter((x) => !x.done && x.dueAt < now() && x.received < x.amount);
+    const outstanding = overdue.reduce((a, x) => a + (x.amount - x.received), 0);
+    const worst = overdue.reduce((a, x) => Math.max(a, days(now() - x.dueAt)), 0);
+    const badge = overdue.length === 0 ? ["Good", "var(--accent)"] : worst <= 30 ? ["Watch", "var(--amber)"] : ["At risk", "var(--red)"];
+    return { badge, outstanding, overdueCount: overdue.length };
+  };
+
+  const workloadOf = (uId) => ({
+    proposals: proposals.filter((p) => p.assignedTo === uId && !TERMINAL.includes(p.status)),
+    activities: [
+      ...proposals.flatMap((p) => Object.entries(p.el?.assignments || {}).filter(([, x]) => x === uId).map(([svc]) => ({ pid: p.id, client: p.prospect.name, service: svc }))),
+      ...duties.filter((dd) => dd.staffId === uId && !dd.closed).map((dd) => ({ pid: null, client: dd.client, service: dd.service, legacy: true })),
+    ],
+  });
+
+  /* ================================================================ */
+
+  const deploy = (newFirm, newUsers) => {
+    const t0 = Date.now(); // deployment moment (clock resets to 0)
+    const newDuties = newUsers.flatMap((u) =>
+      (u.existingActivities || []).map((a) => {
+        const nextDue = a.due ? new Date(a.due + "T12:00:00").getTime() : t0 + (a.dueInDays ?? 14) * DAY;
+        return {
+          id: uid(), staffId: u.id, client: a.client, service: a.service,
+          kind: dutyKind(a.service), contact: a.contact || { name: "", email: "" },
+          cadence: a.cadence || "monthly", nextDue, closed: false, history: [],
+          events: [{ at: t0, by: "system", text: `Duty registered at Baton deployment — ${a.cadence || "monthly"} · first tracked deadline ${fmtD(nextDue)}${a.contact?.email ? ` · client contact: ${a.contact.name} <${a.contact.email}>` : ""}. All future deadlines are computed automatically from this anchor. Completion requires proof of work (deliverables / filed returns) unless explicitly declared otherwise with a reason.` }],
+        };
+      })
+    );
+    setFirm(newFirm);
+    setUsers(newUsers);
+    setDuties(newDuties);
+    setProposals([]); setClients([]); setPayments([]); setNotices([]); setSigUses([]); setClockDays(0);
+    setMe(null); setSetupMode(false);
+    pushToast(`${newFirm.short} is live — ${newDuties.length} ongoing dut${newDuties.length === 1 ? "y" : "ies"} under deadline tracking`);
+  };
+
+  const markDutyDone = (dutyId, payload) =>
+    // payload: { method: 'sent'|'proof'|'declared', files:[], note, reason, emailedTo, record:{} }
+    setDuties((ds) => ds.map((x) => {
+      if (x.id !== dutyId) return x;
+      const d = structuredClone(x);
+      const doneAt = now();
+      const lateMs = Math.max(0, doneAt - d.nextDue);
+      const { method = "declared", files = [], note = "", reason = "", emailedTo = "", record = null } = payload || {};
+      d.history.push({ dueAt: d.nextDue, completedAt: doneAt, lateMs, method, note, reason, emailedTo, record, evidence: files });
+      const lateTxt = lateMs > 0 ? `${fmtDur(lateMs)} LATE` : "on time";
+      if (method === "sent") {
+        d.events.push({ at: doneAt, by: me.id, text: `Completed (${lateTxt}) — ${files.length} deliverable(s) uploaded and emailed to ${emailedTo}: ${files.map((f) => f.name).join(", ")}${note ? ` · note: "${note}"` : ""}. Due date was ${fmtD(d.nextDue)}.` });
+      } else if (method === "proof") {
+        const rec = record ? " Record: " + Object.entries(record).filter(([, v]) => v !== "" && v != null).map(([k, v]) => `${k}: ${v}`).join(" · ") + "." : "";
+        d.events.push({ at: doneAt, by: me.id, text: `Completed (${lateTxt}) — filing proof uploaded: ${files.map((f) => f.name).join(", ")}.${rec}${note ? ` Note: "${note}"` : ""} Due date was ${fmtD(d.nextDue)}.` });
+      } else {
+        d.events.push({ at: doneAt, by: me.id, text: `Completed (${lateTxt}) — DECLARED without document proof. Mandatory reason: "${reason}". Due date was ${fmtD(d.nextDue)}.` });
+      }
+      const nxt = addCadence(d.nextDue, d.cadence);
+      if (nxt) {
+        d.nextDue = nxt;
+        d.events.push({ at: doneAt, by: "system", text: `Next deadline auto-computed from the statutory schedule: ${fmtD(nxt)} (${d.cadence}). Late completion does not shift the schedule.` });
+      } else {
+        d.closed = true;
+        d.events.push({ at: doneAt, by: "system", text: "One-time duty closed." });
+      }
+      return d;
+    }));
+
+  if (setupMode)
+    return (
+      <Frame accent={firm?.accent || "#1E6E56"}>
+        <SetupWizard onCancel={() => setSetupMode(false)} onDone={deploy} />
+      </Frame>
+    );
+
+  if (!firm)
+    return (
+      <Frame accent="#1E6E56">
+        <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--ink)" }}>
+          <div className="w-full max-w-lg px-6 text-center">
+            <div className="font-disp text-white text-4xl tracking-tight">Baton</div>
+            <div className="mt-2 text-sm" style={{ color: "#8FA3B8" }}>CRM &amp; employee performance tracking for bookkeeping and tax firms</div>
+            <div className="mt-10 p-6 rounded-2xl bg-white/95 text-left">
+              <div className="font-disp font-bold text-lg" style={{ color: "var(--ink)" }}>Welcome — no firm is set up yet</div>
+              <p className="text-sm mt-2" style={{ color: "var(--mut)" }}>
+                Deployment starts here. The guided setup walks you through the five first jobs:
+                defining the firm, adding employees, assigning roles, issuing login credentials,
+                and capturing digital signatures for management.
+              </p>
+              <button onClick={() => setSetupMode(true)} className="mt-5 w-full px-4 py-3 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+                🏢 Set up your firm
+              </button>
+            </div>
+            <button onClick={() => deploy(SEED_FIRM, SEED_USERS)} className="mt-5 text-[11px] underline" style={{ color: "#5D7288" }}>
+              Prototype testing shortcut: load the Crescent Bay demo firm (2 partners · 3 managers · 8 technical staff · 1 accountant) — the prototype has no saved storage, so a page reload returns here
+            </button>
+          </div>
+        </div>
+      </Frame>
+    );
+
+  if (!me)
+    return (
+      <Frame accent={firm.accent}>
+        <Login users={users} firm={firm} onPick={(u) => { setMe(u); setRoute({ screen: "dashboard" }); }} onSetup={() => setSetupMode(true)} />
+      </Frame>
+    );
+
+  const isMgr = me.role === "Manager" || me.role === "Admin";
+  const isAcct = me.role === "Accountant";
+
+  return (
+    <Frame accent={firm.accent}>
+      <div className="flex h-screen overflow-hidden" style={{ background: "var(--paper)" }}>
+        <aside className="w-56 shrink-0 flex flex-col" style={{ background: "var(--ink)" }}>
+          <div className="px-5 pt-6 pb-5">
+            <div className="font-disp text-white text-lg leading-tight tracking-tight">{firm.short}</div>
+            <div className="text-[11px] mt-0.5" style={{ color: "#8FA3B8" }}>Practice control</div>
+          </div>
+          <nav className="flex-1 px-3 space-y-1 text-sm">
+            <NavBtn label="Dashboard" active={route.screen === "dashboard"} onClick={() => setRoute({ screen: "dashboard" })} />
+            {!isAcct && <NavBtn label="Proposals" active={["proposals", "detail"].includes(route.screen)} onClick={() => setRoute({ screen: "proposals" })} />}
+            {isMgr && <NavBtn label="New proposal request" active={route.screen === "new"} onClick={() => setRoute({ screen: "new" })} />}
+            {(isMgr || isAcct) && <NavBtn label="Clients" active={route.screen === "clients"} onClick={() => setRoute({ screen: "clients" })} />}
+            {isAcct && <NavBtn label="Payments" active={route.screen === "payments"} onClick={() => setRoute({ screen: "payments" })} />}
+            {me.role === "Admin" && (
+              <>
+                <div className="pt-4 pb-1 px-3 text-[10px] uppercase tracking-widest" style={{ color: "#5D7288" }}>Administration</div>
+                <NavBtn label="Employees & roles" active={route.screen === "employees"} onClick={() => setRoute({ screen: "employees" })} />
+                <NavBtn label="Firm & letterhead" active={route.screen === "firm"} onClick={() => setRoute({ screen: "firm" })} />
+                <NavBtn label="Signature vault" active={route.screen === "signatures"} onClick={() => setRoute({ screen: "signatures" })} />
+              </>
+            )}
+          </nav>
+          <div className="p-4 text-[11px]" style={{ color: "#5D7288" }}>Prototype · Onboarding Pt.1 — full chain</div>
+        </aside>
+
+        <div className="flex-1 flex flex-col min-w-0">
+          <header className="h-14 shrink-0 flex items-center justify-between px-6 border-b bg-white" style={{ borderColor: "var(--line)" }}>
+            <div className="text-sm" style={{ color: "var(--mut)" }}>
+              Signed in as <span className="font-semibold" style={{ color: "var(--ink)" }}>{me.name}</span>
+              <span className="ml-2 px-2 py-0.5 rounded-full text-[11px] font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{me.role}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={() => { setClockDays((d) => d + 1); pushToast("Clock advanced +1 day"); }} className="text-xs px-3 py-1.5 rounded-md border font-medium hover:bg-gray-50" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>⏩ +1 day</button>
+              <button onClick={() => { setClockDays((d) => d + 7); pushToast("Clock advanced +7 days"); }} className="text-xs px-3 py-1.5 rounded-md border font-medium hover:bg-gray-50" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>⏩⏩ +7 days{clockDays > 0 ? ` (Day ${clockDays})` : ""}</button>
+              <Bell notices={myNotices} onRead={() => setNotices((n) => n.map((x) => (x.userId === me.id ? { ...x, read: true } : x)))} />
+              <button onClick={() => setMe(null)} className="text-xs px-3 py-1.5 rounded-md text-white font-medium" style={{ background: "var(--ink)" }}>Switch user</button>
+            </div>
+          </header>
+
+          <main className="flex-1 overflow-y-auto p-6">
+            {route.screen === "dashboard" && !isAcct && (
+              <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} />
+            )}
+            {(route.screen === "payments" || (route.screen === "dashboard" && isAcct)) && (
+              <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} markInvoiceRaised={markInvoiceRaised} recordReceipt={recordReceipt} healthOf={healthOf} />
+            )}
+            {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
+            {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} />}
+            {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} onCreate={createRequest} />}
+            {route.screen === "detail" && (
+              <Detail p={proposals.find((x) => x.id === route.id)} me={me} byId={byId} now={now} firm={firm} users={users} clients={clients} workloadOf={workloadOf}
+                actions={{ sendChecklist, fulfillSlot, withdrawSlot, managerReturn, staffSendBack, startDrafting, generateVersion, submitToManager, sendForRevision, sendChat, managerSignRoute, seniorApprove, seniorReject, sendClientEmail, markLost, uploadSignedProposal, assignActivity, setELAdvance, setELNote, routeEL, elApprove, elReject }}
+                back={() => setRoute({ screen: "dashboard" })} />
+            )}
+            {route.screen === "employees" && me.role === "Admin" && <Employees users={users} setUsers={setUsers} />}
+            {route.screen === "firm" && me.role === "Admin" && <FirmSetup firm={firm} setFirm={setFirm} />}
+            {route.screen === "signatures" && me.role === "Admin" && <Signatures users={users} sigUses={sigUses} byId={byId} />}
+          </main>
+        </div>
+      </div>
+      {toast && <div className="fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg text-sm text-white shadow-lg z-50" style={{ background: "var(--ink)" }}>{toast}</div>}
+    </Frame>
+  );
+}
+
+/* ================================================================== */
+
+function Frame({ children, accent = "#1E6E56" }) {
+  return (
+    <div className="font-body antialiased" style={{ color: "#22303E" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@110,500..800&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        :root{--ink:#16233B;--paper:#F4F6F8;--line:#E2E7ED;--mut:#5C6B7A;--accent:${accent};--accent-soft:${accent}1A;--amber:#A8690F;--amber-soft:#A8690F14;--red:#A8332E;--red-soft:#A8332E12;}
+        .font-disp{font-family:'Archivo',sans-serif;font-variation-settings:'wdth' 110;}
+        .font-body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;}
+        .font-mono2{font-family:'IBM Plex Mono',monospace;}
+        ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#C9D2DB;border-radius:6px}
+        button{cursor:pointer} input,textarea,select{outline:none}
+        input:focus,textarea:focus,select:focus{box-shadow:0 0 0 2px var(--accent-soft);border-color:var(--accent)!important}
+      `}</style>
+      {children}
+    </div>
+  );
+}
+
+function NavBtn({ label, active, onClick }) {
+  return (
+    <button onClick={onClick} className="w-full text-left px-3 py-2 rounded-md transition-colors" style={active ? { background: "rgba(255,255,255,.12)", color: "#fff", fontWeight: 600 } : { color: "#A9BACB" }}>
+      {label}
+    </button>
+  );
+}
+
+function Bell({ notices, onRead }) {
+  const [open, setOpen] = useState(false);
+  const unread = notices.filter((n) => !n.read).length;
+  return (
+    <div className="relative">
+      <button onClick={() => { setOpen(!open); if (!open) onRead(); }} className="relative w-9 h-9 rounded-md border flex items-center justify-center hover:bg-gray-50" style={{ borderColor: "var(--line)" }}>
+        <span>🔔</span>
+        {unread > 0 && <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] text-white flex items-center justify-center font-bold" style={{ background: "var(--red)" }}>{unread}</span>}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-11 w-80 max-h-96 overflow-y-auto bg-white border rounded-lg shadow-xl z-20 p-2" style={{ borderColor: "var(--line)" }}>
+          {notices.length === 0 && <div className="p-3 text-sm" style={{ color: "var(--mut)" }}>No notifications yet.</div>}
+          {notices.map((n) => (
+            <div key={n.id} className="p-2.5 text-sm border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+              <div>{n.text}</div>
+              <div className="text-[11px] mt-0.5 font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(n.at)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Login({ users, firm, onPick, onSetup }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--ink)" }}>
+      <div className="w-full max-w-2xl px-6 py-10">
+        <div className="font-disp text-white text-3xl tracking-tight">{firm.short}</div>
+        <div className="mt-1 text-sm" style={{ color: "#8FA3B8" }}>{firm.name} · Sign in <span className="opacity-60">(prototype — pick a user to simulate their login)</span></div>
+        <div className="mt-8 grid grid-cols-2 gap-3">
+          {users.map((u) => (
+            <button key={u.id} onClick={() => onPick(u)} className="text-left p-4 rounded-xl bg-white/95 hover:bg-white transition group">
+              <div className="flex items-center justify-between">
+                <div className="font-semibold">{u.name}</div>
+                <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{u.role}</span>
+              </div>
+              <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>{u.designation} · {u.email}</div>
+              <div className="text-[11px] mt-3 font-medium opacity-0 group-hover:opacity-100 transition" style={{ color: "var(--accent)" }}>Sign in →</div>
+            </button>
+          ))}
+        </div>
+        <div className="mt-6 flex items-center justify-between text-[11px]" style={{ color: "#5D7288" }}>
+          <span>In production: email + password, forced reset on first login, optional 2FA, session timeout, full login audit.</span>
+          <button onClick={onSetup} className="underline whitespace-nowrap ml-4" style={{ color: "#5D7288" }}>Re-deploy: set up a different firm</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+const STATUS_MAP = {
+  assigned: ["Awaiting staff review", "var(--accent)"],
+  docs_with_manager: ["Requirements pending — manager", "var(--amber)"],
+  waiver_review: ["Waiver decision — staff", "var(--amber)"],
+  drafting: ["Drafting — staff", "var(--accent)"],
+  manager_review: ["Manager review", "var(--ink)"],
+  senior_review: ["Senior review & signature", "var(--amber)"],
+  signed: ["Signed — send to client", "var(--accent)"],
+  proposal_sent: ["Sent — awaiting client-signed proposal", "var(--mut)"],
+  el_staffing: ["Client confirmed — staffing & EL prep", "var(--ink)"],
+  el_senior_review: ["EL — senior signature", "var(--amber)"],
+  el_approved: ["EL signed — send to client", "var(--accent)"],
+  el_sent: ["Part 1 ✓ — awaiting Part 2", "var(--accent)"],
+  onboarding_complete: ["Onboarding complete ✓✓", "var(--accent)"],
+  lost: ["Lost", "var(--red)"],
+};
+function StatusChip({ s }) {
+  const [t, c] = STATUS_MAP[s] || [s, "var(--mut)"];
+  return <span className="text-[11px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap" style={{ background: c + "18", color: c }}>{t}</span>;
+}
+
+/* ================================================================== */
+
+function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals, duties, markDutyDone, byId, now, open, gotoNew }) {
+  const myDuties = duties.filter((d) => d.staffId === me.id && !d.closed).sort((a, b) => a.nextDue - b.nextDue);
+  const myOverdue = myDuties.filter((d) => d.nextDue < now());
+  const allOpenDuties = duties.filter((d) => !d.closed).sort((a, b) => a.nextDue - b.nextDue);
+  return (
+    <div className="max-w-5xl mx-auto">
+      {myOpenTasks.length > 0 && me.role === "Staff" && (
+        <div className="mb-5 rounded-xl border p-4 flex items-start gap-3" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A" }}>
+          <div className="text-xl">📌</div>
+          <div className="text-sm">
+            <div className="font-semibold" style={{ color: "var(--amber)" }}>Daily reminder — open proposals assigned to you</div>
+            <div className="mt-1" style={{ color: "#6B5A38" }}>
+              Reappears every day until each proposal is completed:{" "}
+              {myOpenTasks.map((p, i) => (
+                <span key={p.id}><button className="underline font-medium" onClick={() => open(p.id)}>{p.id} · {p.prospect.name}</button>{i < myOpenTasks.length - 1 ? ", " : ""}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {myOverdue.length > 0 && (
+        <div className="mb-5 rounded-xl border p-4" style={{ background: "var(--red-soft)", borderColor: "#DCA9A6" }}>
+          <div className="font-semibold text-sm" style={{ color: "var(--red)" }}>🔁 Daily reminder — {myOverdue.length} deadline{myOverdue.length > 1 ? "s" : ""} OVERDUE</div>
+          <div className="text-xs mt-1" style={{ color: "#7A4340" }}>
+            {myOverdue.map((d) => `${d.client} — ${d.service} (due ${fmtD(d.nextDue)})`).join(" · ")}. An email reminder is also sent daily until each is completed.
+          </div>
+        </div>
+      )}
+
+      {myDuties.length > 0 && (
+        <div className="mb-5">
+          <h2 className="font-disp text-lg font-bold" style={{ color: "var(--ink)" }}>My duties & deadlines</h2>
+          <p className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>Recurring compliance duties assigned to you. Deadlines are computed automatically from each duty's statutory schedule — completing late never shifts the next date. Every duty keeps its own audit trail; on-time history feeds your performance record.</p>
+          <div className="mt-2 space-y-2">
+            {myDuties.map((d) => <DutyCard key={d.id} d={d} now={now} byId={byId} onDone={(note) => markDutyDone(d.id, note)} mine />)}
+          </div>
+        </div>
+      )}
+
+      {myActivities.length > 0 && (
+        <div className="mb-5 rounded-xl border p-4" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}>
+          <div className="font-semibold text-sm" style={{ color: "var(--accent)" }}>🧾 Your client activities</div>
+          <div className="mt-2 space-y-1">
+            {myActivities.map((a, i) => (
+              <div key={i} className="bg-white rounded-lg px-3 py-2 text-sm flex items-center gap-3">
+                {a.pid ? <button className="font-medium underline decoration-dotted" onClick={() => open(a.pid)}>{a.client}</button> : <span className="font-medium">{a.client}</span>}
+                <span className="flex-1 text-xs" style={{ color: "var(--mut)" }}>{a.service}</span>
+                <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={a.legacy ? { background: "var(--paper)", color: "var(--mut)" } : a.live ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>{a.legacy ? "Ongoing — pre-Baton" : a.live ? "Live — EL sent" : "Pending EL"}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-end justify-between">
+        <div>
+          <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Baton with you</h1>
+          <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Everything waiting on <b>you</b>, oldest first — proposals, signatures, engagement letters. The baton stays with you until you pass it.</p>
+        </div>
+        {isMgr && <button onClick={gotoNew} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>+ New proposal request</button>}
+      </div>
+
+      <div className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+        {batonQueue.length === 0 ? (
+          <div className="p-10 text-center text-sm" style={{ color: "var(--mut)" }}>Nothing is waiting on you right now.</div>
+        ) : (
+          batonQueue.map(({ p, since }, i) => {
+            const age = now() - since;
+            const hot = days(age) >= 3;
+            return (
+              <button key={p.id} onClick={() => open(p.id)} className="w-full text-left flex items-center gap-4 px-5 py-4 border-b last:border-0 hover:bg-gray-50" style={{ borderColor: "var(--line)" }}>
+                <div className="font-mono2 text-xs w-6 text-right" style={{ color: "var(--mut)" }}>{i + 1}</div>
+                <div className="w-24 shrink-0">
+                  <div className="font-mono2 text-lg font-medium" style={{ color: hot ? "var(--red)" : "var(--amber)" }}>{fmtDur(age)}</div>
+                  <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--mut)" }}>waiting</div>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold truncate">{p.id} — {p.prospect.name}</div>
+                  <div className="text-xs mt-0.5 flex items-center gap-1.5 flex-wrap" style={{ color: "var(--mut)" }}><StatusChip s={p.status} /> requested by {byId(p.requestedBy).name} · drafter {byId(p.assignedTo).name}</div>
+                </div>
+                <div className="text-xs font-medium" style={{ color: "var(--accent)" }}>Open →</div>
+              </button>
+            );
+          })
+        )}
+      </div>
+
+      {isMgr && allOpenDuties.length > 0 && (
+        <>
+          <h2 className="font-disp text-lg font-bold mt-8" style={{ color: "var(--ink)" }}>Compliance deadlines — all staff</h2>
+          <p className="text-xs mt-1" style={{ color: "var(--mut)" }}>Every tracked duty across the firm, nearest deadline first. Red means the statutory date has passed and the assigned staff member is being reminded daily.</p>
+          <div className="mt-3 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+            {allOpenDuties.map((d) => {
+              const overdue = d.nextDue < now();
+              const daysLeft = Math.ceil(days(d.nextDue - now()));
+              return (
+                <div key={d.id} className="flex items-center gap-4 px-5 py-3 border-b last:border-0 text-sm" style={{ borderColor: "var(--line)" }}>
+                  <span className="w-32 shrink-0 font-medium truncate">{byId(d.staffId).name}</span>
+                  <span className="flex-1 truncate">{d.client} <span className="text-xs" style={{ color: "var(--mut)" }}>— {d.service} · {d.cadence}</span></span>
+                  <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtD(d.nextDue)}</span>
+                  <span className="text-[11px] px-2 py-0.5 rounded-full font-bold w-28 text-center" style={overdue ? { background: "var(--red-soft)", color: "var(--red)" } : daysLeft <= 7 ? { background: "var(--amber-soft)", color: "var(--amber)" } : { background: "var(--paper)", color: "var(--mut)" }}>
+                    {overdue ? `${Math.ceil(days(now() - d.nextDue))}d OVERDUE` : `in ${daysLeft}d`}
+                  </span>
+                  {d.history.length > 0 && <span className="font-mono2 text-[10px] w-20 text-right" style={{ color: "var(--mut)" }}>{d.history.filter((h) => !h.lateMs).length}/{d.history.length} on time</span>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {isMgr && proposals.some((p) => ["proposal_sent", "el_staffing", "el_senior_review", "el_approved", "el_sent"].includes(p.status)) && (
+        <>
+          <h2 className="font-disp text-lg font-bold mt-8" style={{ color: "var(--ink)" }}>Client-side tracker — sent vs confirmed</h2>
+          <p className="text-xs mt-1" style={{ color: "var(--mut)" }}>Every proposal that has left the building: what's with the client, what they've confirmed (client-signed proposal on file), and where the engagement letter stands.</p>
+          <div className="mt-3 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+            {proposals.filter((p) => ["proposal_sent", "el_staffing", "el_senior_review", "el_approved", "el_sent"].includes(p.status)).map((p) => {
+              const stage = {
+                proposal_sent: [`Sent ${p.proposalSentAt ? fmtD(p.proposalSentAt) : ""} — awaiting client-signed proposal`, "var(--amber)", p.proposalSentAt],
+                el_staffing: ["✓ Client confirmed — staffing & EL prep", "var(--accent)", p.clientSignedProposal?.at],
+                el_senior_review: ["✓ Client confirmed — EL at senior signature", "var(--accent)", p.clientSignedProposal?.at],
+                el_approved: ["✓ Client confirmed — EL signed, ready to send", "var(--accent)", p.clientSignedProposal?.at],
+                el_sent: ["✓✓ EL sent — Onboarding Part 1 complete", "var(--accent)", p.el?.sentAt],
+              }[p.status];
+              return (
+                <button key={p.id} onClick={() => open(p.id)} className="w-full text-left flex items-center gap-4 px-5 py-3 border-b last:border-0 hover:bg-gray-50 text-sm" style={{ borderColor: "var(--line)" }}>
+                  <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{p.id}</span>
+                  <span className="flex-1 truncate font-medium">{p.prospect.name}</span>
+                  <span className="text-xs font-medium" style={{ color: stage[1] }}>{stage[0]}</span>
+                  {p.status === "proposal_sent" && p.proposalSentAt && <span className="font-mono2 text-xs" style={{ color: days(now() - p.proposalSentAt) >= 7 ? "var(--red)" : "var(--mut)" }}>{fmtDur(now() - p.proposalSentAt)} with client</span>}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {isMgr && proposals.length > 0 && (
+        <>
+          <h2 className="font-disp text-lg font-bold mt-8" style={{ color: "var(--ink)" }}>All open matters — who holds the baton?</h2>
+          <div className="mt-3 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+            {proposals.filter((p) => !["el_sent", "lost"].includes(p.status)).map((p) => {
+              const since = p.holderLog.find((h) => !h.end)?.start ?? p.createdAt;
+              return (
+                <button key={p.id} onClick={() => open(p.id)} className="w-full text-left flex items-center gap-4 px-5 py-3 border-b last:border-0 hover:bg-gray-50 text-sm" style={{ borderColor: "var(--line)" }}>
+                  <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{p.id}</span>
+                  <span className="flex-1 truncate font-medium">{p.prospect.name}</span>
+                  <StatusChip s={p.status} />
+                  <span className="text-xs" style={{ color: "var(--mut)" }}>baton with <b style={{ color: "var(--ink)" }}>{p.holder ? byId(p.holder).name : "client / —"}</b> for <span className="font-mono2">{fmtDur(now() - since)}</span></span>
+                </button>
+              );
+            })}
+            {proposals.filter((p) => !["el_sent", "lost"].includes(p.status)).length === 0 && <div className="p-6 text-sm text-center" style={{ color: "var(--mut)" }}>No open matters.</div>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+function DutyCard({ d, now, byId, onDone, mine }) {
+  const [openTrail, setOpenTrail] = useState(false);
+  const [doneMode, setDoneMode] = useState(false);
+  const [declareMode, setDeclareMode] = useState(false);
+  const [files, setFiles] = useState([]);
+  const [note, setNote] = useState("");
+  const [reason, setReason] = useState("");
+  const [mail, setMail] = useState(null);
+  const [rec, setRec] = useState({});
+  const overdue = d.nextDue < now();
+  const daysLeft = Math.ceil(days(d.nextDue - now()));
+  const onTime = d.history.filter((h) => !h.lateMs).length;
+  const kind = d.kind || dutyKind(d.service);
+  const setR = (k, v) => setRec((r) => ({ ...r, [k]: v }));
+  const reset = () => { setDoneMode(false); setDeclareMode(false); setFiles([]); setNote(""); setReason(""); setRec({}); };
+
+  const vatOK = files.length > 0 && rec.period && rec.position;
+  const ctOK = files.length > 0 && rec["financial year"] && rec.position;
+
+  const openReportMail = () => setMail({
+    to: d.contact?.email || "",
+    subject: `${d.service} — ${d.client}`,
+    body: `Dear ${d.contact?.name || "Sir/Madam"},\n\nPlease find attached the following for ${d.client}: ${files.map((f) => f.name).join(", ")}.\n\nKindly let us know if you have any questions.\n\nBest regards`,
+  });
+
+  const smallInp = (ph, k, w = "w-full") => (
+    <input placeholder={ph} value={rec[k] || ""} onChange={(e) => setR(k, e.target.value)} className={`border rounded-md px-2 py-1.5 text-xs ${w}`} style={{ borderColor: "var(--line)" }} />
+  );
+
+  return (
+    <div className="bg-white border rounded-xl p-4" style={{ borderColor: overdue ? "#DCA9A6" : "var(--line)" }}>
+      <div className="flex items-center gap-3 flex-wrap text-sm">
+        <div className="flex-1 min-w-[220px]">
+          <b>{d.client}</b> <span className="text-xs" style={{ color: "var(--mut)" }}>— {d.service}</span>
+          <div className="text-[11px] mt-0.5" style={{ color: "var(--mut)" }}>
+            {d.cadence} · deadlines auto-computed{d.contact?.email && <> · contact: {d.contact.name} &lt;{d.contact.email}&gt;</>}{d.history.length > 0 && <> · <span className="font-mono2">{onTime}/{d.history.length} on time</span></>}
+          </div>
+        </div>
+        <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>due {fmtD(d.nextDue)}</span>
+        <span className="text-[11px] px-2 py-0.5 rounded-full font-bold" style={overdue ? { background: "var(--red-soft)", color: "var(--red)" } : daysLeft <= 7 ? { background: "var(--amber-soft)", color: "var(--amber)" } : { background: "var(--paper)", color: "var(--mut)" }}>
+          {overdue ? `${Math.ceil(days(now() - d.nextDue))}d OVERDUE` : `in ${daysLeft}d`}
+        </span>
+        {mine && !doneMode && <button onClick={() => setDoneMode(true)} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--accent)" }}>Complete…</button>}
+        <button onClick={() => setOpenTrail(!openTrail)} className="px-2.5 py-1.5 rounded-md border text-xs font-medium" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>Trail ({d.events.length}) {openTrail ? "▾" : "▸"}</button>
+      </div>
+
+      {doneMode && (
+        <div className="mt-3 pt-3 border-t space-y-2" style={{ borderColor: "var(--line)" }}>
+          {kind === "report" && !declareMode && (
+            <>
+              <div className="text-[11px] font-semibold" style={{ color: "var(--mut)" }}>Work is complete when the deliverables reach the client: upload the report(s), then the CRM drafts the email to {d.contact?.name || "the client contact"} — sending it records completion with proof.</div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <FilePick small multiple label="Upload report file(s)" onFiles={(fs) => setFiles([...files, ...fs])} />
+                {files.map((f, i) => <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}><FileLink {...f} /> <button onClick={() => setFiles(files.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button></span>)}
+              </div>
+              <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional) — e.g. May 2026 management accounts + VAT summary" className="w-full border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <div className="flex gap-2 items-center flex-wrap">
+                <button disabled={files.length === 0} onClick={openReportMail} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>✉️ Draft email to client & complete</button>
+                <button onClick={() => setDeclareMode(true)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>Complete without sending reports (client doesn't require them)…</button>
+                <button onClick={reset} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+              </div>
+            </>
+          )}
+
+          {kind === "vat" && !declareMode && (
+            <>
+              <div className="text-[11px] font-semibold" style={{ color: "var(--mut)" }}>Upload the filed VAT return / FTA acknowledgement as proof, and record the filing facts — Baton keeps the full filing history per client.</div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <FilePick small multiple label="Upload filed return / acknowledgement *" onFiles={(fs) => setFiles([...files, ...fs])} />
+                {files.map((f, i) => <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}><FileLink {...f} /> <button onClick={() => setFiles(files.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button></span>)}
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {smallInp("Tax period * — e.g. Q2 2026", "period", "w-40")}
+                <select value={rec.position || ""} onChange={(e) => setR("position", e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                  <option value="">Net position *</option><option>Payable</option><option>Refundable</option><option>Nil</option>
+                </select>
+                {smallInp("Net VAT amount (AED)", "net VAT (AED)", "w-36")}
+                {smallInp("Output VAT (AED)", "output VAT (AED)", "w-32")}
+                {smallInp("Input VAT (AED)", "input VAT (AED)", "w-32")}
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider font-bold mb-1" style={{ color: "var(--mut)" }}>Taxable sales per emirate (AED, optional)</div>
+                <div className="flex gap-1.5 flex-wrap">
+                  {EMIRATES.map((em) => (
+                    <span key={em} className="flex items-center gap-1 text-[10px]" style={{ color: "var(--mut)" }}>{em}
+                      <input value={rec["sales " + em] || ""} onChange={(e) => setR("sales " + em, e.target.value)} className="w-20 border rounded-md px-1.5 py-1 text-xs font-mono2" style={{ borderColor: "var(--line)" }} />
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="flex gap-2 items-center">
+                <button disabled={!vatOK} onClick={() => { onDone({ method: "proof", files, note, record: rec }); reset(); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Record filing & complete {overdue ? "(LATE)" : "(on time)"}</button>
+                <button onClick={() => setDeclareMode(true)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>Complete without proof…</button>
+                <button onClick={reset} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+              </div>
+            </>
+          )}
+
+          {kind === "ct" && !declareMode && (
+            <>
+              <div className="text-[11px] font-semibold" style={{ color: "var(--mut)" }}>Upload the filed Corporate Tax return / acknowledgement as proof, and record the filing facts.</div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <FilePick small multiple label="Upload filed return / acknowledgement *" onFiles={(fs) => setFiles([...files, ...fs])} />
+                {files.map((f, i) => <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}><FileLink {...f} /> <button onClick={() => setFiles(files.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button></span>)}
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {smallInp("Financial year * — e.g. FY2025", "financial year", "w-36")}
+                {smallInp("Taxable income (AED)", "taxable income (AED)", "w-40")}
+                {smallInp("CT payable (AED)", "CT payable (AED)", "w-36")}
+                <select value={rec.position || ""} onChange={(e) => setR("position", e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                  <option value="">Position *</option><option>Payable</option><option>Nil</option><option>Refund</option>
+                </select>
+                <select value={rec["small business relief"] || ""} onChange={(e) => setR("small business relief", e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                  <option value="">Small business relief?</option><option>Yes</option><option>No</option>
+                </select>
+              </div>
+              <div className="flex gap-2 items-center">
+                <button disabled={!ctOK} onClick={() => { onDone({ method: "proof", files, note, record: rec }); reset(); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Record filing & complete {overdue ? "(LATE)" : "(on time)"}</button>
+                <button onClick={() => setDeclareMode(true)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>Complete without proof…</button>
+                <button onClick={reset} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+              </div>
+            </>
+          )}
+
+          {kind === "other" && !declareMode && (
+            <div className="flex gap-2 items-center flex-wrap">
+              <FilePick small multiple label="Upload proof (optional)" onFiles={(fs) => setFiles([...files, ...fs])} />
+              {files.map((f, i) => <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}>{f.name}</span>)}
+              <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Completion note" className="flex-1 min-w-[180px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button onClick={() => { files.length ? onDone({ method: "proof", files, note, record: null }) : setDeclareMode(true); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--accent)" }}>Complete</button>
+              <button onClick={reset} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+            </div>
+          )}
+
+          {declareMode && (
+            <div className="flex gap-2 items-center">
+              <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Mandatory reason for completing without proof — recorded permanently in the duty trail" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button disabled={!reason.trim()} onClick={() => { onDone({ method: "declared", reason: reason.trim(), note }); reset(); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--amber)" }}>Confirm — declared complete</button>
+              <button onClick={() => setDeclareMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>back</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {openTrail && (
+        <div className="mt-3 pt-3 border-t" style={{ borderColor: "var(--line)" }}>
+          {d.history.some((h) => h.record || (h.evidence || []).length) && (
+            <div className="mb-3">
+              <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Filing / delivery records held by Baton</div>
+              {d.history.map((h, i) => (
+                <div key={i} className="text-xs border rounded-md p-2 mb-1.5" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+                  <div className="font-mono2" style={{ color: h.lateMs ? "var(--red)" : "var(--accent)" }}>due {fmtD(h.dueAt)} → done {fmtD(h.completedAt)} {h.lateMs ? `(${fmtDur(h.lateMs)} late)` : "(on time)"} · {h.method === "sent" ? `emailed to ${h.emailedTo}` : h.method === "proof" ? "proof on file" : "declared"}</div>
+                  {h.record && <div className="mt-1">{Object.entries(h.record).filter(([, v]) => v).map(([k, v]) => <span key={k} className="inline-block mr-3"><span style={{ color: "var(--mut)" }}>{k}:</span> <b className="font-mono2">{v}</b></span>)}</div>}
+                  {(h.evidence || []).length > 0 && <div className="mt-1 flex gap-2 flex-wrap">{h.evidence.map((f, j) => <FileLink key={j} {...f} />)}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Duty audit trail — append-only</div>
+          {[...d.events].reverse().map((e, i) => (
+            <div key={i} className="text-xs py-1 border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+              <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(e.at)} · {e.by === "system" ? "SYSTEM" : byId(e.by).name}</span> — {e.text}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mail && (
+        <EmailModal mail={mail} setMail={setMail} onSend={() => { onDone({ method: "sent", files, note, emailedTo: mail.to }); setMail(null); reset(); }} />
+      )}
+    </div>
+  );
+}
+
+function ProposalList({ proposals, byId, now, open }) {
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Proposals & engagements</h1>
+      <div className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+        <div className="grid grid-cols-[70px_1fr_200px_140px_100px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+          <div>Ref</div><div>Prospect / client</div><div>Status</div><div>Baton with</div><div>Total age</div>
+        </div>
+        {proposals.length === 0 && <div className="p-8 text-center text-sm" style={{ color: "var(--mut)" }}>No proposals yet.</div>}
+        {proposals.map((p) => (
+          <button key={p.id} onClick={() => open(p.id)} className="w-full grid grid-cols-[70px_1fr_200px_140px_100px] gap-3 px-5 py-3.5 text-sm text-left border-b last:border-0 hover:bg-gray-50 items-center" style={{ borderColor: "var(--line)" }}>
+            <span className="font-mono2 text-xs">{p.id}</span>
+            <span className="font-medium truncate">{p.prospect.name}</span>
+            <StatusChip s={p.status} />
+            <span className="text-xs" style={{ color: "var(--mut)" }}>{p.holder ? byId(p.holder).name : "—"}</span>
+            <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtDur(now() - p.createdAt)}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+function Clients({ clients, healthOf, byId, proposals, now, openP }) {
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Clients</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Created the moment the client-signed proposal is uploaded. Health reflects payment behaviour.</p>
+      <div className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+        <div className="grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+          <div>Code</div><div>Client</div><div>Team (per activity)</div><div>Outstanding</div><div>Since</div><div>Health</div>
+        </div>
+        {clients.length === 0 && <div className="p-8 text-center text-sm" style={{ color: "var(--mut)" }}>No clients yet — upload a client-signed proposal to convert a prospect.</div>}
+        {clients.map((c) => {
+          const h = healthOf(c.id);
+          const pr = proposals.find((p) => p.id === c.pid);
+          const team = Object.entries(pr?.el?.assignments || {});
+          return (
+            <button key={c.id} onClick={() => openP(c.pid)} className="w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left border-b last:border-0 hover:bg-gray-50 items-center" style={{ borderColor: "var(--line)" }}>
+            <span className="font-mono2 text-xs">{c.code}</span>
+            <span className="font-medium truncate">{c.name}<div className="text-[11px] font-normal truncate" style={{ color: "var(--mut)" }}>{c.services.join(" · ")}</div></span>
+            <span className="text-[11px]" style={{ color: "var(--mut)" }}>
+              {team.length === 0 ? "Unassigned" : team.map(([svc, uId]) => <div key={svc} className="truncate">{svc.split(" (")[0]}: <b style={{ color: "var(--ink)" }}>{byId(uId).name.split(" ")[0]}</b></div>)}
+            </span>
+            <span className="font-mono2 text-xs" style={{ color: h.outstanding > 0 ? "var(--red)" : "var(--mut)" }}>{h.outstanding > 0 ? money(h.outstanding) + " overdue" : "—"}</span>
+            <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtD(c.engagedAt)}</span>
+            <span className="text-[11px] px-2 py-0.5 rounded-full font-bold text-center" style={{ background: h.badge[1] + "18", color: h.badge[1] }}>{h.badge[0]}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+function Payments({ payments, duePayments, clients, now, byId, markInvoiceRaised, recordReceipt, healthOf }) {
+  return (
+    <div className="max-w-5xl mx-auto">
+      {duePayments.length > 0 && (
+        <div className="mb-5 rounded-xl border p-4" style={{ background: "var(--red-soft)", borderColor: "#DCA9A6" }}>
+          <div className="font-semibold text-sm" style={{ color: "var(--red)" }}>🔁 Daily reminder — receipts pending your update ({duePayments.length})</div>
+          <div className="text-xs mt-1" style={{ color: "#7A4340" }}>
+            An email reminder is also sent to you every day for each item below, and both continue until you update the receipt status. Nothing here can silently expire.
+          </div>
+        </div>
+      )}
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Payments & receipts</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Invoices are raised in your accounting software — this tracker only records that it happened, and what money actually arrived.</p>
+
+      <Section title={`Due now / overdue (${duePayments.length})`}>
+        {duePayments.length === 0 && <Empty t="Nothing due. Upcoming items will move here on their due date." />}
+        {duePayments.map((x) => <PayRow key={x.id} x={x} now={now} markInvoiceRaised={markInvoiceRaised} recordReceipt={recordReceipt} actionable />)}
+      </Section>
+
+      <Section title="Upcoming">
+        {payments.filter((x) => !x.done && x.dueAt > now()).length === 0 && <Empty t="No upcoming expected payments." />}
+        {payments.filter((x) => !x.done && x.dueAt > now()).sort((a, b) => a.dueAt - b.dueAt).map((x) => <PayRow key={x.id} x={x} now={now} />)}
+      </Section>
+
+      <Section title="Settled">
+        {payments.filter((x) => x.done).length === 0 && <Empty t="No settled payments yet." />}
+        {payments.filter((x) => x.done).map((x) => <PayRow key={x.id} x={x} now={now} />)}
+      </Section>
+    </div>
+  );
+}
+
+const Section = ({ title, children }) => (
+  <section className="mt-6">
+    <h2 className="font-disp text-lg font-bold" style={{ color: "var(--ink)" }}>{title}</h2>
+    <div className="mt-2 space-y-2">{children}</div>
+  </section>
+);
+const Empty = ({ t }) => <div className="bg-white border rounded-xl p-5 text-sm text-center" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>{t}</div>;
+
+function PayRow({ x, now, markInvoiceRaised, recordReceipt, actionable }) {
+  const [amt, setAmt] = useState("");
+  const overdueDays = Math.floor(days(now() - x.dueAt));
+  const remaining = x.amount - x.received;
+  return (
+    <div className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+      <div className="flex items-center gap-3 flex-wrap text-sm">
+        <div className="flex-1 min-w-[220px]">
+          <b>{x.clientName}</b> <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>({x.pid})</span>
+          <div className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>{x.label}</div>
+        </div>
+        <div className="font-mono2 text-sm">{money(x.amount)}{x.received > 0 && !x.done && <span className="text-xs" style={{ color: "var(--accent)" }}> · {money(x.received)} received</span>}</div>
+        <div className="text-xs font-mono2" style={{ color: x.done ? "var(--accent)" : x.dueAt <= now() ? "var(--red)" : "var(--mut)" }}>
+          {x.done ? "✓ settled" : x.dueAt <= now() ? `due ${fmtD(x.dueAt)} · ${overdueDays}d overdue` : `due ${fmtD(x.dueAt)}`}
+        </div>
+        <div className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={x.invoiceRaised ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
+          {x.invoiceRaised ? "Invoice raised" : "Invoice NOT raised"}
+        </div>
+      </div>
+      {actionable && !x.done && (
+        <div className="mt-3 pt-3 border-t flex items-center gap-2 flex-wrap" style={{ borderColor: "var(--line)" }}>
+          {!x.invoiceRaised && (
+            <button onClick={() => markInvoiceRaised(x.id)} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--ink)" }}>
+              Mark invoice raised (in accounting software)
+            </button>
+          )}
+          {x.invoiceRaised && (
+            <>
+              <input value={amt} onChange={(e) => setAmt(e.target.value)} placeholder={`Amount received (remaining ${money(remaining)})`} className="border rounded-md px-2.5 py-1.5 text-xs w-56 font-mono2" style={{ borderColor: "var(--line)" }} />
+              <FilePick small label="Upload transfer / receipt evidence & record" onFiles={(fs) => { const a = num(amt) || remaining; recordReceipt(x.id, Math.min(a, remaining), fs[0]); setAmt(""); }} />
+              <button onClick={() => { const a = num(amt); if (a > 0) { recordReceipt(x.id, Math.min(a, remaining), null); setAmt(""); } }} className="px-3 py-1.5 rounded-md border text-xs font-semibold" style={{ borderColor: "var(--line)" }}>Record without evidence</button>
+            </>
+          )}
+        </div>
+      )}
+      {x.evidence.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-2 text-xs">
+          {x.evidence.map((e, i) => <span key={i} className="px-2 py-1 rounded-md border font-mono2" style={{ borderColor: "var(--line)" }}><FileLink {...e} /> · {money(e.amount)}</span>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================================================================== */
+
+function NewRequest({ users, me, firm, onCreate }) {
+  const CATALOG = firm.services && firm.services.length ? firm.services : SERVICES;
+  const [prospect, setProspect] = useState({ name: "", contactPerson: "", email: "", phone: "" });
+  const [sel, setSel] = useState([]);
+  const [custom, setCustom] = useState("");
+  const [fees, setFees] = useState({});
+  const [paymentTerms, setPaymentTerms] = useState("");
+  const [notes, setNotes] = useState("");
+  const [docs, setDocs] = useState([]);
+  const [assignedTo, setAssignedTo] = useState("");
+  const staff = users.filter((u) => u.role === "Staff" || u.id === me.id);
+
+  const toggle = (s) => setSel((x) => (x.includes(s) ? x.filter((y) => y !== s) : [...x, s]));
+  const addCustom = () => { if (custom.trim()) { setSel((x) => [...x, custom.trim() + "‡"]); setCustom(""); } };
+  const services = sel.map((s) => ({ name: s.replace("‡", ""), custom: s.endsWith("‡"), fee: fees[s]?.amt || "", basis: fees[s]?.basis || defaultBasis(s) }));
+  const valid = prospect.name.trim() && prospect.email.trim() && sel.length > 0 && assignedTo;
+
+  return (
+    <div className="max-w-3xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>New proposal request</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Raised after a prospect meeting. Assignment sends an auto-email and starts the clock.</p>
+
+      <Card title="1 · Prospect details">
+        <div className="grid grid-cols-2 gap-3">
+          <Inp label="Prospect / company name *" v={prospect.name} set={(v) => setProspect({ ...prospect, name: v })} ph="e.g. Gulf Horizon Trading FZE" />
+          <Inp label="Contact person" v={prospect.contactPerson} set={(v) => setProspect({ ...prospect, contactPerson: v })} />
+          <Inp label="Contact email * (proposal & EL will be emailed here)" v={prospect.email} set={(v) => setProspect({ ...prospect, email: v })} />
+          <Inp label="Phone" v={prospect.phone} set={(v) => setProspect({ ...prospect, phone: v })} />
+        </div>
+      </Card>
+
+      <Card title="2 · Services to include *" sub="Pick from the firm's catalog, or type a custom service. Custom entries are flagged to Admin as catalog candidates.">
+        <div className="flex flex-wrap gap-2">
+          {CATALOG.map((s) => (
+            <button key={s} onClick={() => toggle(s)} className="px-3 py-1.5 rounded-full text-xs font-medium border transition" style={sel.includes(s) ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { borderColor: "var(--line)", color: "var(--mut)" }}>{s}</button>
+          ))}
+        </div>
+        <div className="flex gap-2 mt-3">
+          <input value={custom} onChange={(e) => setCustom(e.target.value)} placeholder="Custom service, e.g. Payroll & WPS processing" className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+          <button onClick={addCustom} className="px-3 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>Add custom</button>
+        </div>
+        {sel.filter((s) => s.endsWith("‡")).map((s) => (
+          <div key={s} className="mt-2 text-xs flex items-center gap-2">
+            <span className="px-2 py-1 rounded-full font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>{s.replace("‡", "")} · custom — flagged for catalog review</span>
+            <button className="underline" style={{ color: "var(--mut)" }} onClick={() => toggle(s)}>remove</button>
+          </div>
+        ))}
+        {sel.length > 0 && (
+          <div className="mt-4 space-y-2">
+            <div className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Indicative fee per service (optional — staff can request it later). Every fee carries a billing basis so nothing is ambiguous.</div>
+            {sel.map((s) => (
+              <div key={s} className="flex items-center gap-3 text-sm">
+                <span className="flex-1">{s.replace("‡", "")}</span>
+                <input value={fees[s]?.amt || ""} onChange={(e) => setFees({ ...fees, [s]: { amt: e.target.value, basis: fees[s]?.basis || defaultBasis(s) } })} placeholder="AED" className="w-28 border rounded-md px-2 py-1.5 text-sm font-mono2" style={{ borderColor: "var(--line)" }} />
+                <select value={fees[s]?.basis || defaultBasis(s)} onChange={(e) => setFees({ ...fees, [s]: { amt: fees[s]?.amt || "", basis: e.target.value } })} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                  {BASIS.map((b) => <option key={b}>{b}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card title="3 · Payment terms & meeting notes" sub="Optional at this stage — the drafter can request anything missing through the checklist.">
+        <Inp label="Payment terms" v={paymentTerms} set={setPaymentTerms} ph="e.g. 50% advance, balance on delivery; monthly retainer billed in advance" />
+        <div className="mt-3">
+          <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Notes from the meeting</label>
+          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} placeholder="Context the drafter should know…" />
+        </div>
+      </Card>
+
+      <Card title="4 · Documents received from the prospect" sub="Upload whatever you collected at the meeting — PDF, images, spreadsheets. Files open in a new tab so the drafter can inspect them.">
+        <FilePick label="Upload documents" multiple onFiles={(fs) => setDocs([...docs, ...fs])} />
+        <div className="mt-3 flex flex-wrap gap-2">
+          {docs.map((d, i) => (
+            <span key={i} className="text-xs px-2.5 py-1.5 rounded-md border font-mono2 flex items-center gap-2 bg-white" style={{ borderColor: "var(--line)" }}>
+              <FileLink {...d} /> <button onClick={() => setDocs(docs.filter((_, j) => j !== i))} style={{ color: "var(--red)" }} title="Remove">×</button>
+            </span>
+          ))}
+          {docs.length === 0 && <span className="text-xs" style={{ color: "var(--mut)" }}>No files attached yet.</span>}
+        </div>
+      </Card>
+
+      <Card title="5 · Assign technical staff *" sub="Assignment triggers an auto-email and a daily on-screen reminder for the assignee until the proposal is completed. No deadline — elapsed time is tracked instead.">
+        <div className="grid grid-cols-2 gap-2">
+          {staff.map((u) => (
+            <button key={u.id} onClick={() => setAssignedTo(u.id)} className="text-left p-3 rounded-lg border transition" style={assignedTo === u.id ? { borderColor: "var(--accent)", background: "var(--accent-soft)" } : { borderColor: "var(--line)" }}>
+              <div className="font-semibold text-sm">{u.name}{u.id === me.id ? " (me)" : ""}</div>
+              <div className="text-xs" style={{ color: "var(--mut)" }}>{u.designation}</div>
+            </button>
+          ))}
+        </div>
+      </Card>
+
+      <div className="mt-5 flex justify-end">
+        <button disabled={!valid} onClick={() => onCreate({ prospect, services, paymentTerms, notes, docs, assignedTo })} className="px-5 py-2.5 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+          Create request & assign
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const Card = ({ title, sub, children }) => (
+  <section className="mt-5 bg-white rounded-xl border p-5" style={{ borderColor: "var(--line)" }}>
+    <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>{title}</h3>
+    {sub && <p className="text-xs mt-0.5 mb-3" style={{ color: "var(--mut)" }}>{sub}</p>}
+    {!sub && <div className="mb-3" />}
+    {children}
+  </section>
+);
+const Inp = ({ label, v, set, ph }) => (
+  <div>
+    <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>{label}</label>
+    <input value={v} onChange={(e) => set(e.target.value)} placeholder={ph} className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+  </div>
+);
+
+/* ================================================================== */
+/*  Proposal detail                                                    */
+/* ================================================================== */
+
+function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, back }) {
+  const [tab, setTab] = useState("work");
+  const [wsDraft, setWsDraft] = useState(p ? p.draft : null);
+  useEffect(() => { if (p) setWsDraft(structuredClone(p.draft)); }, [p?.versions.length]);
+  if (!p) return <div>Not found.</div>;
+  const canon = (d) => JSON.stringify({ l: d.lines.map((x) => [x.service, String(x.fee).trim(), x.basis || defaultBasis(x.service)]), t: (d.paymentTerms || "").trim(), v: String(d.validityDays), s: (d.scope || "").trim() });
+  const formDirty = p.versions.length > 0 && wsDraft && canon(wsDraft) !== canon(p.draft);
+  const iAmDrafter = me.id === p.assignedTo;
+  const iAmRequester = me.id === p.requestedBy;
+  const iHoldBaton = p.holder === me.id;
+  const client = clients.find((c) => c.pid === p.id);
+  const showEngTab = ["signed", "proposal_sent", "el_staffing", "el_senior_review", "el_approved", "el_sent", "lost"].includes(p.status);
+
+  const attribution = useMemo(() => {
+    const tally = {};
+    p.holderLog.forEach((h) => { const end = h.end ?? now(); tally[h.userId] = (tally[h.userId] || 0) + (end - h.start); });
+    const total = Object.values(tally).reduce((a, b) => a + b, 0) || 1;
+    return { tally, total };
+  }, [p, now()]);
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <button onClick={back} className="text-xs font-medium mb-3" style={{ color: "var(--mut)" }}>← Back</button>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>
+            {p.id} — {p.prospect.name} {client && <span className="font-mono2 text-base" style={{ color: "var(--accent)" }}>· {client.code}</span>}
+          </h1>
+          <div className="text-sm mt-1 flex items-center gap-2 flex-wrap" style={{ color: "var(--mut)" }}>
+            <StatusChip s={p.status} />
+            <span>Requested by <b style={{ color: "var(--ink)" }}>{byId(p.requestedBy).name}</b></span>·
+            <span>Drafter <b style={{ color: "var(--ink)" }}>{byId(p.assignedTo).name}</b></span>·
+            {p.holder ? <span>baton with <b style={{ color: "var(--ink)" }}>{byId(p.holder).name}</b></span> : <span>{p.status === "proposal_sent" ? "awaiting client confirmation" : p.status === "el_sent" ? "Part 1 complete" : "closed"}</span>}
+          </div>
+        </div>
+      </div>
+
+      {p.revisionNote && ["drafting", "assigned", "docs_with_manager", "waiver_review"].includes(p.status) && (
+        <div className="mt-4 rounded-xl border p-4 flex items-start gap-3" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A" }}>
+          <div className="text-xl">🛠️</div>
+          <div className="text-sm flex-1">
+            <div className="font-semibold" style={{ color: "var(--amber)" }}>Revision instructed by {byId(p.revisionNote.by).name} · {fmtDT(p.revisionNote.at)}</div>
+            <div className="mt-1" style={{ color: "#6B5A38" }}>“{p.revisionNote.text}”</div>
+            <div className="text-[11px] mt-1.5" style={{ color: "#6B5A38" }}>Update the draft fields, regenerate, preview and re-submit — this banner clears when the revised version is sent to the manager.</div>
+          </div>
+        </div>
+      )}
+
+      {p.lastRejection && (
+        <div className="mt-4 rounded-xl border p-4 flex items-start gap-3" style={{ background: "var(--red-soft)", borderColor: "#DCA9A6" }}>
+          <div className="text-xl">↩️</div>
+          <div className="text-sm flex-1">
+            <div className="font-semibold" style={{ color: "var(--red)" }}>
+              {p.lastRejection.stage === "proposal" ? "Proposal rejected at senior review" : "Engagement letter rejected"} by {byId(p.lastRejection.by).name} · {fmtDT(p.lastRejection.at)}
+            </div>
+            <div className="mt-1" style={{ color: "#7A4340" }}>
+              Note: “{p.lastRejection.note}”
+            </div>
+            <div className="text-[11px] mt-1.5" style={{ color: "#7A4340" }}>
+              {p.lastRejection.stage === "proposal"
+                ? "Your signature was voided. Revise the terms on the Proposal tab and re-route for counter-signature — this banner clears when you do."
+                : "Revise on the Engagement tab and re-route for approval — this banner clears when you do."}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4 bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+        <div className="text-[11px] uppercase tracking-wider font-semibold mb-2" style={{ color: "var(--mut)" }}>Time attribution — who held the baton</div>
+        <div className="flex h-3 rounded-full overflow-hidden" style={{ background: "var(--line)" }}>
+          {Object.entries(attribution.tally).map(([u2, ms]) => (
+            <div key={u2} style={{ width: `${(ms / attribution.total) * 100}%`, background: byId(u2).role === "Staff" ? "var(--accent)" : byId(u2).signatory && u2 !== p.requestedBy ? "#5C4A8A" : "var(--amber)" }} title={byId(u2).name} />
+          ))}
+        </div>
+        <div className="flex gap-4 mt-2 text-xs flex-wrap">
+          {Object.entries(attribution.tally).map(([u2, ms]) => (
+            <span key={u2} className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm inline-block" style={{ background: byId(u2).role === "Staff" ? "var(--accent)" : byId(u2).signatory && u2 !== p.requestedBy ? "#5C4A8A" : "var(--amber)" }} />
+              {byId(u2).name} ({byId(u2).role}) — <span className="font-mono2">{fmtDur(ms)}</span>
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-5 flex gap-1 border-b overflow-x-auto" style={{ borderColor: "var(--line)" }}>
+        {[["work", "Workspace"], ["doc", `Proposal ${p.versions.length ? `(v${p.versions.length})` : ""}`], ...(showEngTab ? [["eng", "Engagement"]] : []), ...(p.status === "onboarding_complete" && (me.role === "Manager" || me.role === "Admin") ? [["report", "★ Performance report"]] : []), ["chat", `Chat (${p.chat.length})`], ["audit", `Audit trail (${p.events.length})`]].map(([k, l]) => (
+          <button key={k} onClick={() => setTab(k)} className="px-4 py-2.5 text-sm font-medium -mb-px border-b-2 transition whitespace-nowrap" style={tab === k ? { borderColor: "var(--accent)", color: "var(--accent)" } : { borderColor: "transparent", color: "var(--mut)" }}>{l}</button>
+        ))}
+      </div>
+
+      {tab === "work" && <Workspace p={p} me={me} byId={byId} actions={actions} iAmDrafter={iAmDrafter} iAmRequester={iAmRequester} iHoldBaton={iHoldBaton} gotoDoc={() => setTab("doc")} draft={wsDraft} setDraft={setWsDraft} dirty={formDirty} />}
+      {tab === "doc" && <DocTab p={p} byId={byId} firm={firm} me={me} users={users} actions={actions} iAmRequester={iAmRequester} formDirty={formDirty} />}
+      {tab === "eng" && showEngTab && <EngTab p={p} byId={byId} firm={firm} me={me} users={users} client={client} workloadOf={workloadOf} actions={actions} iAmRequester={iAmRequester} now={now} />}
+      {tab === "report" && p.status === "onboarding_complete" && (me.role === "Manager" || me.role === "Admin") && <PerfReport p={p} byId={byId} />}
+      {tab === "chat" && <ChatTab p={p} me={me} byId={byId} send={(t) => actions.sendChat(p.id, t)} closed={["onboarding_complete", "lost"].includes(p.status)} />}
+      {tab === "audit" && <AuditTab p={p} byId={byId} closed={p.status === "onboarding_complete"} />}
+    </div>
+  );
+}
+
+/* ---------- workspace (unchanged mechanics from v1) ---------- */
+
+function Workspace({ p, me, byId, actions, iAmDrafter, iAmRequester, iHoldBaton, gotoDoc, draft, setDraft, dirty }) {
+  const [slots, setSlots] = useState([]);
+  const [label, setLabel] = useState("");
+  const [kind, setKind] = useState("document");
+  const [genBusy, setGenBusy] = useState(false);
+
+  const outstanding = p.checklist.filter((s) => ["pending", "rejected"].includes(s.status));
+  const waivers = p.checklist.filter((s) => s.status === "waiver_requested");
+  const managerCanReturn = p.status === "docs_with_manager" && outstanding.length === 0;
+
+  return (
+    <div className="grid grid-cols-5 gap-5 mt-5">
+      <div className="col-span-2 space-y-5">
+        <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+          <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Documents on file ({p.docs.length})</h3>
+          <div className="mt-2 space-y-1.5">
+            {p.docs.map((d) => (
+              <div key={d.id} className="text-xs font-mono2 flex items-center gap-2 px-2.5 py-1.5 rounded-md border" style={{ borderColor: "var(--line)" }}>
+                <span className="flex-1 truncate"><FileLink name={d.name} url={d.url} size={d.size} /></span>
+                <span className="shrink-0" style={{ color: "var(--mut)" }}>{byId(d.by).name.split(" ")[0]} · {fmtDT(d.at)}</span>
+              </div>
+            ))}
+            {p.docs.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>Nothing attached yet.</div>}
+          </div>
+        </section>
+        <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+          <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Request brief</h3>
+          <div className="mt-2 text-sm space-y-1.5">
+            <div><span style={{ color: "var(--mut)" }}>Services: </span>{p.services.map((s) => s.name + (s.custom ? " (custom)" : "")).join(", ")}</div>
+            {p.prospect.contactPerson && <div><span style={{ color: "var(--mut)" }}>Contact: </span>{p.prospect.contactPerson} · {p.prospect.email} · {p.prospect.phone}</div>}
+            {p.notes && <div><span style={{ color: "var(--mut)" }}>Notes: </span>{p.notes}</div>}
+          </div>
+        </section>
+      </div>
+
+      <div className="col-span-3 space-y-5">
+        <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+          <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Requirements checklist</h3>
+          <p className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>The formal state machine: the baton cannot pass back until every slot is provided or waived. The system counts — not memory.</p>
+          <div className="mt-3 space-y-2">
+            {p.checklist.map((s) => <Slot key={s.id} s={s} p={p} me={me} byId={byId} actions={actions} iAmDrafter={iAmDrafter} iAmRequester={iAmRequester} />)}
+            {p.checklist.length === 0 && <div className="text-xs py-2" style={{ color: "var(--mut)" }}>No requirements raised{iAmDrafter && p.status === "assigned" ? " — review the documents; if anything is missing, build a request below." : "."}</div>}
+          </div>
+
+          {iAmDrafter && iHoldBaton && ["assigned", "drafting", "waiver_review"].includes(p.status) && (
+            <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
+              <div className="text-xs font-semibold mb-2" style={{ color: "var(--mut)" }}>Request more from the manager</div>
+              <div className="flex gap-2">
+                <select value={kind} onChange={(e) => setKind(e.target.value)} className="border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+                  <option value="document">Document</option><option value="data">Information</option>
+                </select>
+                <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder={kind === "document" ? "e.g. MOA copy / UBO details / Bank statements Jan–Mar" : "e.g. Confirm annual fee for VAT filing"} className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+                <button onClick={() => { if (label.trim()) { setSlots([...slots, { kind, label: label.trim() }]); setLabel(""); } }} className="px-3 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>Add</button>
+              </div>
+              {slots.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {slots.map((s, i) => (
+                    <div key={i} className="text-xs flex items-center gap-2 px-2.5 py-1.5 rounded-md" style={{ background: "var(--accent-soft)" }}>
+                      <span className="uppercase font-bold text-[9px] tracking-wider" style={{ color: "var(--accent)" }}>{s.kind}</span>
+                      <span className="flex-1">{s.label}</span>
+                      <button onClick={() => setSlots(slots.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button>
+                    </div>
+                  ))}
+                  <button onClick={() => { actions.sendChecklist(p.id, slots); setSlots([]); }} className="mt-2 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--amber)" }}>
+                    Send request to {byId(p.requestedBy).name} — baton passes to them
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {iAmRequester && p.status === "docs_with_manager" && iHoldBaton && (
+            <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
+              {managerCanReturn ? (
+                <button onClick={() => actions.managerReturn(p.id)} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+                  Return to {byId(p.assignedTo).name} — all items answered
+                </button>
+              ) : (
+                <div className="text-xs px-3 py-2.5 rounded-lg font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>
+                  🔒 {outstanding.length} item(s) still unanswered. This cannot return to the drafter until every requested item is attached, answered, or marked not-available with a reason. The baton — and the clock — stay with you.
+                </div>
+              )}
+            </div>
+          )}
+
+          {iAmDrafter && p.status === "waiver_review" && iHoldBaton && waivers.length === 0 && (
+            outstanding.length > 0 ? (
+              <button onClick={() => actions.staffSendBack(p.id)} className="mt-4 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--amber)" }}>
+                Send {outstanding.length} outstanding item(s) back to manager
+              </button>
+            ) : (
+              <button onClick={() => actions.startDrafting(p.id)} className="mt-4 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+                Checklist satisfied — start drafting
+              </button>
+            )
+          )}
+        </section>
+
+        {iAmDrafter && iHoldBaton && ["assigned", "drafting"].includes(p.status) && (
+          <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+            <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Draft the proposal</h3>
+            <p className="text-xs mt-0.5 mb-3" style={{ color: "var(--mut)" }}>Structured fields — the document is generated from these, never typed by hand.</p>
+            <DraftForm draft={draft} setDraft={setDraft} />
+            <div className="flex items-center gap-2 mt-3 flex-wrap">
+              <button onClick={async () => { setGenBusy(true); await actions.generateVersion(p.id, draft, p.versions.length ? `redrafted by ${me.name.split(" ")[0]}` : `drafted by ${me.name.split(" ")[0]}`); setGenBusy(false); gotoDoc(); }} disabled={genBusy || draft.lines.some((l) => !l.fee) || !draft.paymentTerms} className="px-4 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--ink)" }}>
+                {genBusy ? "Generating — professionalizing wording…" : `Generate proposal v${p.versions.length + 1} — preview first`}
+              </button>
+              {p.versions.length > 0 && !genBusy && (
+                <button disabled={dirty} onClick={() => actions.submitToManager(p.id)} className="px-4 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+                  Send v{p.versions.length} to {byId(p.requestedBy).name} →
+                </button>
+              )}
+            </div>
+            {dirty && (
+              <div className="mt-2 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>
+                🔒 Your form has edits that are NOT in v{p.versions.length}. Generate v{p.versions.length + 1} first — the system will not let an outdated document be sent.
+              </div>
+            )}
+            <p className="text-[11px] mt-2" style={{ color: "var(--mut)" }}>
+              On generation the CRM automatically rewrites rough payment-term notes into professional, client-ready language (figures untouched; the original stays in the audit trail). Review the document — nothing moves to the manager until you explicitly send it.
+            </p>
+            {(draft.lines.some((l) => !l.fee) || !draft.paymentTerms) && (
+              <div className="mt-2 p-3 rounded-lg" style={{ background: "var(--amber-soft)" }}>
+                <div className="text-[11px] font-medium" style={{ color: "var(--amber)" }}>
+                  Missing: {[...draft.lines.filter((l) => !l.fee).map((l) => `fee for ${l.service}`), ...(!draft.paymentTerms ? ["payment terms"] : [])].join(", ")}.
+                </div>
+                <button onClick={() => {
+                  const s2 = [...draft.lines.filter((l) => !l.fee).map((l) => ({ kind: "data", label: `Confirm fee for ${l.service} (${l.basis || defaultBasis(l.service)})` })), ...(!draft.paymentTerms ? [{ kind: "data", label: "Confirm payment terms" }] : [])];
+                  actions.sendChecklist(p.id, s2);
+                }} className="mt-2 px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--amber)" }}>
+                  Request missing items from {byId(p.requestedBy).name} — baton passes to them
+                </button>
+              </div>
+            )}
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Slot({ s, p, me, byId, actions, iAmDrafter, iAmRequester }) {
+  const [val, setVal] = useState("");
+  const [naReason, setNaReason] = useState("");
+  const [naMode, setNaMode] = useState(false);
+  const [rejReason, setRejReason] = useState("");
+  const [rejMode, setRejMode] = useState(false);
+  const [wdReason, setWdReason] = useState("");
+  const [wdMode, setWdMode] = useState(false);
+  const managerTurn = iAmRequester && p.status === "docs_with_manager" && p.holder === me.id;
+  const staffTurn = iAmDrafter && p.holder === me.id;
+  const canWithdraw = iAmDrafter && ["pending", "rejected", "waiver_requested"].includes(s.status) && !["el_sent", "lost"].includes(p.status);
+
+  const chip = {
+    pending: ["Pending", "var(--amber)"],
+    rejected: ["Rejected — redo", "var(--red)"],
+    provided: ["Provided", "var(--accent)"],
+    waiver_requested: ["Not available — waiver requested", "var(--amber)"],
+    waived: ["Waived", "var(--mut)"],
+    withdrawn: ["Withdrawn by drafter", "var(--mut)"],
+  }[s.status];
+
+  return (
+    <div className="border rounded-lg p-3" style={{ borderColor: "var(--line)" }}>
+      <div className="flex items-center gap-2 text-sm">
+        <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{s.kind}</span>
+        <span className="flex-1 font-medium">{s.label}</span>
+        <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: chip[1] + "18", color: chip[1] }}>{chip[0]}</span>
+      </div>
+      {(s.fileName || s.value) && (
+        <div className="text-xs mt-1.5 font-mono2" style={{ color: "var(--mut)" }}>
+          ↳ {s.fileName ? <FileLink name={s.fileName} url={s.fileUrl} size={s.fileSize} /> : s.value}
+        </div>
+      )}
+      {s.reason && <div className="text-xs mt-1" style={{ color: "var(--red)" }}>Reason: {s.reason}</div>}
+
+      {managerTurn && ["pending", "rejected"].includes(s.status) && (
+        <div className="mt-2.5">
+          {!naMode ? (
+            <div className="flex gap-2 items-center">
+              {s.kind === "document" ? (
+                <FilePick small label="Upload document" onFiles={(fs) => { const f = fs[0]; actions.fulfillSlot(p.id, s.id, { status: "provided", fileName: f.name, fileUrl: f.url, fileSize: f.size, reason: "" }, `Checklist item "${s.label}" attached: ${f.name}`); }} />
+              ) : (
+                <>
+                  <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="Type the information" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <button onClick={() => { if (!val.trim()) return; actions.fulfillSlot(p.id, s.id, { status: "provided", value: val.trim(), reason: "" }, `Checklist item "${s.label}" answered`); setVal(""); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--accent)" }}>Answer</button>
+                </>
+              )}
+              <button onClick={() => setNaMode(true)} className="px-2.5 py-1.5 rounded-md border text-xs" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>Not available</button>
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <input value={naReason} onChange={(e) => setNaReason(e.target.value)} placeholder="Mandatory reason — why can't this be obtained?" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button onClick={() => { if (!naReason.trim()) return; actions.fulfillSlot(p.id, s.id, { status: "waiver_requested", reason: naReason.trim() }, `Item "${s.label}" marked NOT AVAILABLE — reason: ${naReason.trim()} (waiver requested)`); setNaMode(false); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--amber)" }}>Request waiver</button>
+              <button onClick={() => setNaMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {staffTurn && s.status === "provided" && p.status === "waiver_review" && (
+        <div className="mt-2.5">
+          {!rejMode ? (
+            <button onClick={() => setRejMode(true)} className="text-xs underline" style={{ color: "var(--red)" }}>Reject this item (wrong / unusable)</button>
+          ) : (
+            <div className="flex gap-2">
+              <input value={rejReason} onChange={(e) => setRejReason(e.target.value)} placeholder="Why is it unusable?" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button onClick={() => { if (!rejReason.trim()) return; actions.fulfillSlot(p.id, s.id, { status: "rejected", reason: rejReason.trim() }, `Item "${s.label}" REJECTED by drafter — ${rejReason.trim()}`); setRejMode(false); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--red)" }}>Reject</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {staffTurn && s.status === "waiver_requested" && (
+        <div className="mt-2.5 flex gap-2">
+          <button onClick={() => actions.fulfillSlot(p.id, s.id, { status: "waived" }, `Waiver ACCEPTED for "${s.label}" — proceeding without it`)} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--accent)" }}>Accept waiver — proceed without it</button>
+          <button onClick={() => actions.fulfillSlot(p.id, s.id, { status: "pending", reason: "Waiver rejected — item is required to proceed" }, `Waiver REJECTED for "${s.label}" — item remains required`)} className="px-3 py-1.5 rounded-md border text-xs font-semibold" style={{ borderColor: "var(--red)", color: "var(--red)" }}>Reject — still required</button>
+        </div>
+      )}
+
+      {canWithdraw && (
+        <div className="mt-2">
+          {!wdMode ? (
+            <button onClick={() => setWdMode(true)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>Withdraw this request (no longer needed)</button>
+          ) : (
+            <div className="flex gap-2">
+              <input value={wdReason} onChange={(e) => setWdReason(e.target.value)} placeholder="Mandatory reason — e.g. manager confirmed in chat it's not required for this engagement" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button onClick={() => { if (!wdReason.trim()) return; actions.withdrawSlot(p.id, s.id, wdReason.trim()); setWdMode(false); setWdReason(""); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--mut)" }}>Withdraw</button>
+              <button onClick={() => setWdMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DraftForm({ draft, setDraft }) {
+  const [polishing, setPolishing] = useState(false);
+  const [suggest, setSuggest] = useState(null);
+
+  const polish = async () => {
+    setPolishing(true); setSuggest(null);
+    const text = await polishPaymentTerms(draft.paymentTerms);
+    setSuggest(text || "__err");
+    setPolishing(false);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="text-xs font-semibold mb-1.5" style={{ color: "var(--mut)" }}>Service lines & fees (AED)</div>
+        {draft.lines.map((l, i) => (
+          <div key={i} className="flex gap-2 mb-1.5 items-center text-sm">
+            <span className="flex-1">{l.service}</span>
+            <input value={l.fee} onChange={(e) => { const lines = [...draft.lines]; lines[i] = { ...l, fee: e.target.value }; setDraft({ ...draft, lines }); }} placeholder="AED" className="w-28 border rounded-md px-2.5 py-1.5 text-sm font-mono2" style={{ borderColor: "var(--line)" }} />
+            <select value={l.basis || defaultBasis(l.service)} onChange={(e) => { const lines = [...draft.lines]; lines[i] = { ...l, basis: e.target.value }; setDraft({ ...draft, lines }); }} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+              {BASIS.map((b) => <option key={b}>{b}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+      <div>
+        <div className="flex items-center justify-between">
+          <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Payment terms *</label>
+          <button onClick={polish} disabled={!draft.paymentTerms || polishing} className="text-[11px] px-2.5 py-1 rounded-md border font-semibold disabled:opacity-40" style={{ borderColor: "var(--line)", color: "var(--accent)" }}>
+            {polishing ? "Rewording…" : "✨ Reword professionally"}
+          </button>
+        </div>
+        <input value={draft.paymentTerms} onChange={(e) => setDraft({ ...draft, paymentTerms: e.target.value })} placeholder="Rough notes are fine — e.g. 'bookkeeping monthly last date of month, VAT quarterly in advance'" className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+        {suggest === "__err" && (
+          <div className="mt-1.5 text-[11px] px-2.5 py-2 rounded-md" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>
+            Couldn't reach the drafting assistant — keep your wording or edit it manually.
+          </div>
+        )}
+        {suggest && suggest !== "__err" && (
+          <div className="mt-1.5 border rounded-lg p-3" style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}>
+            <div className="text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--accent)" }}>Suggested wording — verify every figure before accepting</div>
+            <div className="text-sm mt-1.5">{suggest}</div>
+            <div className="flex gap-2 mt-2.5">
+              <button onClick={() => { setDraft({ ...draft, paymentTerms: suggest }); setSuggest(null); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--accent)" }}>Use this wording</button>
+              <button onClick={() => setSuggest(null)} className="px-3 py-1.5 rounded-md border text-xs font-semibold bg-white" style={{ borderColor: "var(--line)" }}>Keep mine</button>
+            </div>
+          </div>
+        )}
+      </div>
+      <div className="flex gap-3">
+        <div>
+          <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Validity (days)</label>
+          <input type="number" value={draft.validityDays} onChange={(e) => setDraft({ ...draft, validityDays: e.target.value })} className="mt-1 w-28 border rounded-md px-3 py-2 text-sm font-mono2" style={{ borderColor: "var(--line)" }} />
+        </div>
+        <div className="flex-1">
+          <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Scope notes (optional)</label>
+          <input value={draft.scope} onChange={(e) => setDraft({ ...draft, scope: e.target.value })} placeholder="Any scope clarifications to print" className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- proposal document tab with dual-signature flow ---------- */
+
+function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) {
+  const latest = p.versions[p.versions.length - 1];
+  const [edit, setEdit] = useState(false);
+  const [draft, setDraft] = useState(p.draft);
+  const [genBusy, setGenBusy] = useState(false);
+  const [revComment, setRevComment] = useState("");
+  const [seniorComment, setSeniorComment] = useState("");
+  const [signatoryPick, setSignatoryPick] = useState("");
+  const [confirmSig, setConfirmSig] = useState(false);
+  const [rejNote, setRejNote] = useState("");
+  const [rejMode, setRejMode] = useState(false);
+  const [viewV, setViewV] = useState(null);
+  const [cmp, setCmp] = useState(null);
+  const [cmpA, setCmpA] = useState(1);
+  const [cmpB, setCmpB] = useState(2);
+
+  const managerMayAct = iAmRequester && p.status === "manager_review";
+  const iAmSenior = me.id === p.signatoryId && p.status === "senior_review";
+  const signatories = users.filter((u) => u.role === "Admin" && u.signatory && u.id !== me.id); // counter-signature = senior management only
+  const canReview = me.role === "Manager" || me.role === "Admin";
+
+  if (!latest) return <div className="mt-8 text-sm text-center" style={{ color: "var(--mut)" }}>No document generated yet — the drafter generates v1 from the workspace once fees and terms are in place.</div>;
+
+  const shown = (viewV && p.versions.find((v) => v.v === viewV)) || latest;
+  const viewingOld = shown.v !== latest.v;
+  const d = edit ? draft : shown.data;
+  const totals = d.lines.reduce((acc, l) => { const b = l.basis || defaultBasis(l.service); acc[b] = (acc[b] || 0) + num(l.fee); return acc; }, {});
+  const locked = !!p.signatures.senior;
+
+  return (
+    <div className="grid grid-cols-3 gap-5 mt-5">
+      <div className="col-span-2">
+        {viewingOld && (
+          <div className="mb-3 rounded-xl border p-3 flex items-center gap-3 text-sm" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A" }}>
+            <span>📜</span>
+            <span className="flex-1" style={{ color: "#6B5A38" }}><b>Viewing superseded v{shown.v}</b> ({shown.note} — {byId(shown.by).name}, {fmtDT(shown.at)}). The current version is v{latest.v}. Superseded versions are immutable and shown unsigned.</span>
+            <button onClick={() => setViewV(null)} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold whitespace-nowrap" style={{ background: "var(--amber)" }}>Back to current v{latest.v}</button>
+          </div>
+        )}
+        <div className="bg-white border rounded-xl overflow-hidden shadow-sm" style={{ borderColor: "var(--line)", opacity: viewingOld ? 0.94 : 1 }}>
+          <div className="px-8 pt-7 pb-5 border-b-4" style={{ borderColor: firm.accent }}>
+            <div className="font-disp text-xl font-bold" style={{ color: "var(--ink)" }}>{firm.name}</div>
+            <div className="text-[11px] mt-1" style={{ color: "var(--mut)" }}>{firm.address} · {firm.phone} · {firm.email} · {firm.trn}</div>
+          </div>
+          <div className="px-8 py-6 text-sm leading-relaxed">
+            <div className="flex justify-between text-xs font-mono2" style={{ color: "var(--mut)" }}>
+              <span>Ref: {p.id}/v{shown.v}{viewingOld ? " · SUPERSEDED" : locked ? " · LOCKED" : ""}</span><span>{fmtD(shown.at)}</span>
+            </div>
+            <h2 className="font-disp text-lg font-bold mt-4" style={{ color: "var(--ink)" }}>Proposal for Professional Services</h2>
+            <p className="mt-3">To: <b>{p.prospect.name}</b>{p.prospect.contactPerson && <> — Attn: {p.prospect.contactPerson}</>}</p>
+            <p className="mt-2">We are pleased to submit our proposal for the following professional services:</p>
+            <table className="w-full mt-4 text-sm">
+              <thead><tr className="text-left text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}><th className="py-1.5">Service</th><th className="py-1.5 text-right">Professional fee (AED)</th></tr></thead>
+              <tbody>
+                {d.lines.map((l, i) => (
+                  <tr key={i} className="border-b" style={{ borderColor: "var(--line)" }}>
+                    <td className="py-2">{l.service}</td>
+                    <td className="py-2 text-right font-mono2">{l.fee ? <>{num(l.fee).toLocaleString()} <span className="text-[11px]" style={{ color: "var(--mut)" }}>{l.basis || defaultBasis(l.service)}</span></> : "—"}</td>
+                  </tr>
+                ))}
+                {Object.entries(totals).map(([b, t]) => (
+                  <tr key={b}><td className="py-1.5 font-bold text-xs pt-3">Total — {b === "one-time" ? "one-time fees" : "recurring, " + b}</td><td className="py-1.5 pt-3 text-right font-mono2 font-bold">{t.toLocaleString()} <span className="text-[11px] font-normal" style={{ color: "var(--mut)" }}>{b}</span></td></tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="mt-4"><b>Payment terms:</b> {d.paymentTerms}</p>
+            {d.scope && <p className="mt-2"><b>Scope notes:</b> {d.scope}</p>}
+            <p className="mt-2"><b>Validity:</b> This proposal is valid for {d.validityDays} days from the date above.</p>
+            <p className="mt-6" style={{ color: "var(--mut)" }}>For and on behalf of {firm.name}</p>
+            <div className="mt-3 min-h-[70px]">
+              {viewingOld ? <span className="text-xs italic" style={{ color: "var(--mut)" }}>— superseded version · signatures apply to the current version only —</span> : (
+                <>
+                  {p.signatures.manager && <SigBlock user={byId(p.signatures.manager.by)} at={p.signatures.manager.at} role="Engagement Manager" />}
+                  {p.signatures.senior && <SigBlock user={byId(p.signatures.senior.by)} at={p.signatures.senior.at} role="Senior Management" />}
+                  {!p.signatures.manager && !p.signatures.senior && <span className="text-xs italic" style={{ color: "var(--mut)" }}>— unsigned draft —</span>}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {!viewingOld && me.id === p.assignedTo && p.holder === me.id && ["assigned", "drafting"].includes(p.status) && (
+          <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+            <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Drafter preview — v{latest.v}</h3>
+            <p className="text-[11px] mt-0.5 mb-3" style={{ color: "var(--mut)" }}>This is exactly what the manager will see. If something's off, go back to the Workspace, fix the fields and regenerate. Nothing has been sent yet.</p>
+            {formDirty && (
+              <div className="mb-2 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>
+                🔒 Your Workspace form has edits that are NOT in this v{latest.v}. Regenerate first — the system won't send an outdated document.
+              </div>
+            )}
+            <button disabled={formDirty} onClick={() => actions.submitToManager(p.id)} className="w-full px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+              Looks right — send v{latest.v} to {byId(p.requestedBy).name} →
+            </button>
+          </section>
+        )}
+
+        {!viewingOld && managerMayAct && (
+          <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+            <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Manager review</h3>
+            <p className="text-[11px] mt-0.5 mb-3" style={{ color: "var(--mut)" }}>After client discussions you have three moves: adjust terms yourself, return to the drafter with an instruction, or route to the senior — with your comment travelling either way.</p>
+            {!edit ? (
+              <div className="flex flex-col gap-2">
+                <button onClick={() => { setDraft(structuredClone(latest.data)); setEdit(true); }} className="px-3 py-2 rounded-md border text-sm font-semibold" style={{ borderColor: "var(--line)" }}>Edit fees / terms myself</button>
+
+                <div className="pt-3 border-t" style={{ borderColor: "var(--line)" }}>
+                  <div className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--amber)" }}>Option 1 · Return to drafter</div>
+                  <textarea value={revComment} onChange={(e) => setRevComment(e.target.value)} rows={2} placeholder={`Instruction to ${byId(p.assignedTo).name} — e.g. "Spoke with client: bookkeeping confirmed at AED 3,000/month. Revise and regenerate."`} className="mt-1.5 w-full border rounded-md px-2.5 py-2 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <button disabled={!revComment.trim()} onClick={() => actions.sendForRevision(p.id, revComment.trim())} className="mt-1.5 w-full px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--amber)" }}>
+                    Send to {byId(p.assignedTo).name} for revision →
+                  </button>
+                  <div className="text-[10px] mt-1" style={{ color: "var(--mut)" }}>Comment is mandatory — the drafter must know what was agreed.</div>
+                </div>
+
+                <div className="pt-3 border-t" style={{ borderColor: "var(--line)" }}>
+                  <div className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--accent)" }}>Option 2 · Sign & route to senior</div>
+                  <textarea value={seniorComment} onChange={(e) => setSeniorComment(e.target.value)} rows={2} placeholder={`Note to the signatory (optional) — e.g. "Discussed with client: AED 2,500 is final for this engagement. Please proceed."`} className="mt-1.5 w-full border rounded-md px-2.5 py-2 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <select value={signatoryPick} onChange={(e) => setSignatoryPick(e.target.value)} className="mt-1.5 w-full border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+                    <option value="">Select senior signatory…</option>
+                    {signatories.map((u) => <option key={u.id} value={u.id}>{u.name} — {u.designation}</option>)}
+                  </select>
+                  <label className="flex items-start gap-2 mt-2 text-[11px]" style={{ color: "var(--mut)" }}>
+                    <input type="checkbox" checked={confirmSig} onChange={(e) => setConfirmSig(e.target.checked)} className="mt-0.5" />
+                    I re-confirm my identity and authorize applying <b>my own</b> signature to this document (in production: password / 2FA re-entry).
+                  </label>
+                  <button disabled={!signatoryPick || !confirmSig} onClick={() => actions.managerSignRoute(p.id, signatoryPick, seniorComment.trim())} className="mt-2 w-full px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+                    Approve, sign & route ✍️
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <DraftForm draft={draft} setDraft={setDraft} />
+                <div className="flex gap-2 mt-3">
+                  <button disabled={genBusy} onClick={async () => { setGenBusy(true); await actions.generateVersion(p.id, draft, `terms revised by ${me.name.split(" ")[0]}`); setGenBusy(false); setEdit(false); }} className="px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>{genBusy ? "Professionalizing…" : `Regenerate v${p.versions.length + 1}`}</button>
+                  <button onClick={() => setEdit(false)} className="px-3 py-2 rounded-md border text-sm" style={{ borderColor: "var(--line)" }}>Cancel</button>
+                </div>
+              </>
+            )}
+          </section>
+        )}
+
+        {!viewingOld && iAmSenior && (
+          <section className="bg-white border rounded-xl p-4" style={{ borderColor: "#D8CBEF", background: "#F8F5FE" }}>
+            <h3 className="font-disp font-bold text-sm" style={{ color: "#5C4A8A" }}>Senior review & counter-signature</h3>
+            {p.seniorNote && (
+              <div className="mt-2 rounded-lg p-2.5 text-xs bg-white border" style={{ borderColor: "#D8CBEF" }}>
+                <b style={{ color: "#5C4A8A" }}>Note from {byId(p.seniorNote.by).name}:</b> “{p.seniorNote.text}”
+              </div>
+            )}
+            <p className="text-[11px] mt-2 mb-3" style={{ color: "var(--mut)" }}>You may adjust pricing & payment terms before signing. Any edit regenerates the document and notifies the manager and drafter.</p>
+            {!edit ? (
+              <div className="flex flex-col gap-2">
+                <button onClick={() => { setDraft(structuredClone(latest.data)); setEdit(true); }} className="px-3 py-2 rounded-md border text-sm font-semibold bg-white" style={{ borderColor: "var(--line)" }}>Edit pricing / payment terms</button>
+                <label className="flex items-start gap-2 text-[11px]" style={{ color: "var(--mut)" }}>
+                  <input type="checkbox" checked={confirmSig} onChange={(e) => setConfirmSig(e.target.checked)} className="mt-0.5" />
+                  I re-confirm my identity and authorize applying <b>my own</b> signature (in production: password / 2FA re-entry).
+                </label>
+                <button disabled={!confirmSig} onClick={() => actions.seniorApprove(p.id)} className="px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "#5C4A8A" }}>
+                  Approve & counter-sign ✍️ — lock document
+                </button>
+                {!rejMode ? (
+                  <button onClick={() => setRejMode(true)} className="px-3 py-2 rounded-md border text-sm font-semibold bg-white" style={{ borderColor: "var(--red)", color: "var(--red)" }}>Reject with note…</button>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <input value={rejNote} onChange={(e) => setRejNote(e.target.value)} placeholder="Mandatory note — what must change?" className="border rounded-md px-2.5 py-2 text-xs bg-white" style={{ borderColor: "var(--line)" }} />
+                    <button onClick={() => { if (rejNote.trim()) actions.seniorReject(p.id, rejNote.trim()); }} className="px-3 py-2 rounded-md text-white text-xs font-semibold" style={{ background: "var(--red)" }}>Confirm rejection — back to manager (voids manager signature)</button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                <DraftForm draft={draft} setDraft={setDraft} />
+                <div className="flex gap-2 mt-3">
+                  <button disabled={genBusy} onClick={async () => { setGenBusy(true); await actions.generateVersion(p.id, draft, `revised at senior review by ${me.name.split(" ")[0]}`); setGenBusy(false); setEdit(false); }} className="px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "#5C4A8A" }}>{genBusy ? "Professionalizing…" : `Regenerate v${p.versions.length + 1}`}</button>
+                  <button onClick={() => setEdit(false)} className="px-3 py-2 rounded-md border text-sm bg-white" style={{ borderColor: "var(--line)" }}>Cancel</button>
+                </div>
+              </>
+            )}
+          </section>
+        )}
+
+        <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+          <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Version history</h3>
+          {canReview && p.versions.length > 1 && (
+            <div className="mt-2 pb-3 border-b flex items-center gap-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+              <span style={{ color: "var(--mut)" }}>Compare</span>
+              <select value={cmpA} onChange={(e) => setCmpA(Number(e.target.value))} className="border rounded-md px-1.5 py-1" style={{ borderColor: "var(--line)" }}>
+                {p.versions.map((v) => <option key={v.v} value={v.v}>v{v.v}</option>)}
+              </select>
+              <span style={{ color: "var(--mut)" }}>vs</span>
+              <select value={cmpB} onChange={(e) => setCmpB(Number(e.target.value))} className="border rounded-md px-1.5 py-1" style={{ borderColor: "var(--line)" }}>
+                {p.versions.map((v) => <option key={v.v} value={v.v}>v{v.v}</option>)}
+              </select>
+              <button disabled={cmpA === cmpB} onClick={() => setCmp({ a: p.versions.find((v) => v.v === cmpA), b: p.versions.find((v) => v.v === cmpB) })} className="ml-auto px-2.5 py-1 rounded-md text-white font-semibold disabled:opacity-40" style={{ background: "var(--ink)" }}>
+                Comparison report
+              </button>
+            </div>
+          )}
+          <div className="mt-2 space-y-2">
+            {[...p.versions].reverse().map((v) => (
+              <div key={v.v} className="text-xs border rounded-md p-2.5" style={{ borderColor: shown.v === v.v ? "var(--accent)" : "var(--line)", background: shown.v === v.v ? "var(--accent-soft)" : "#fff" }}>
+                <div className="flex justify-between items-center font-mono2">
+                  <b>v{v.v}{v.v === latest.v && <span className="ml-1.5 font-sans font-medium text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--accent)", color: "#fff" }}>current</span>}</b>
+                  <span style={{ color: "var(--mut)" }}>{fmtDT(v.at)}</span>
+                </div>
+                <div className="mt-0.5" style={{ color: "var(--mut)" }}>{v.note} — {byId(v.by).name}</div>
+                <div className="mt-0.5 font-mono2" style={{ color: "var(--mut)" }}>Σ line fees AED {v.data.lines.reduce((a, l) => a + num(l.fee), 0).toLocaleString()} (mixed basis)</div>
+                {canReview && (
+                  <div className="mt-1.5 flex gap-2">
+                    {v.v !== shown.v && <button onClick={() => setViewV(v.v === latest.v ? null : v.v)} className="underline font-medium" style={{ color: "var(--accent)" }}>View this version</button>}
+                    {v.v > 1 && <button onClick={() => setCmp({ a: p.versions.find((x) => x.v === v.v - 1), b: v })} className="underline font-medium" style={{ color: "var(--mut)" }}>Compare with v{v.v - 1}</button>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {cmp && <CompareModal a={cmp.a} b={cmp.b} byId={byId} onClose={() => setCmp(null)} />}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- engagement tab ---------- */
+
+function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequester, now }) {
+  const [mail, setMail] = useState(null);
+  const [rejNote, setRejNote] = useState("");
+  const [rejMode, setRejMode] = useState(false);
+  const [confirmSig, setConfirmSig] = useState(false);
+  const [signatoryPick, setSignatoryPick] = useState("");
+  const [lostMode, setLostMode] = useState(false);
+  const [lostNote, setLostNote] = useState("");
+  const [elNote, setElNote] = useState(p.el?.note || "");
+  useEffect(() => { setElNote(p.el?.note || ""); }, [p.id, p.status]);
+
+  const d = p.versions[p.versions.length - 1]?.data;
+  const iAmELSenior = p.el && me.id === p.el.signatoryId && p.status === "el_senior_review";
+  const signatories = users.filter((u) => u.role === "Admin" && u.signatory && u.id !== p.requestedBy); // EL signature = senior management only
+  const staff = users.filter((u) => u.role === "Staff");
+  const firstBill = d ? d.lines.reduce((a, l) => a + num(l.fee), 0) : 0;
+  const assignments = p.el?.assignments || {};
+  const unassigned = d ? d.lines.filter((l) => !assignments[l.service]) : [];
+
+  const openMail = (kind) => {
+    const isProp = kind === "proposal";
+    setMail({
+      kind,
+      to: p.prospect.email,
+      subject: isProp ? `Proposal for professional services — ${firm.short} (Ref ${p.id})` : `Engagement letter — ${firm.short} (Ref ${p.id})`,
+      body: isProp
+        ? `Dear ${p.prospect.contactPerson || "Sir/Madam"},\n\nThank you for meeting with us. Please find attached our signed proposal (Ref ${p.id}) covering: ${d.lines.map((l) => l.service).join(", ")}.\n\nThe proposal is valid for ${d.validityDays} days. To confirm your acceptance, kindly sign and return a copy of the proposal.\n\nKind regards,\n${byId(p.requestedBy).name}\n${firm.name}`
+        : `Dear ${p.prospect.contactPerson || "Sir/Madam"},\n\nFurther to your confirmation of our proposal (Ref ${p.id}), please find attached our signed engagement letter setting out the terms of our engagement. Our team has been assigned and work will commence per the letter.\n\nWe look forward to serving you.\n\nKind regards,\n${byId(p.requestedBy).name}\n${firm.name}`,
+    });
+  };
+
+  return (
+    <div className="mt-5 space-y-5">
+      {/* stage rail */}
+      <div className="bg-white border rounded-xl p-4 flex items-center gap-2 text-[11px] font-medium overflow-x-auto" style={{ borderColor: "var(--line)" }}>
+        {[["signed", "Proposal signed"], ["proposal_sent", "Sent to client"], ["el_staffing", "Client confirmed · staffing"], ["el_senior_review", "EL — senior signature"], ["el_approved", "EL signed"], ["el_sent", "EL sent — Part 1 complete"]].map(([k, l], i, arr) => {
+          const order = arr.findIndex(([kk]) => kk === p.status);
+          const done = i <= (order === -1 ? (p.status === "lost" ? -1 : 99) : order);
+          return (
+            <span key={k} className="flex items-center gap-2 whitespace-nowrap">
+              <span className="px-2 py-1 rounded-full" style={done ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--paper)", color: "var(--mut)" }}>{l}</span>
+              {i < arr.length - 1 && <span style={{ color: "var(--line)" }}>→</span>}
+            </span>
+          );
+        })}
+      </div>
+
+      {/* SIGNED: send proposal to client */}
+      {p.status === "signed" && iAmRequester && (
+        <ActionCard title="Send the signed proposal to the client" sub={`The CRM drafts the email to the defined contact (${p.prospect.email}) with the signed proposal PDF attached. Edit, then confirm — nothing goes without your approval.`}>
+          <button onClick={() => openMail("proposal")} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>✉️ Send to client</button>
+        </ActionCard>
+      )}
+
+      {/* PROPOSAL SENT: client confirmation via signed-proposal upload */}
+      {p.status === "proposal_sent" && iAmRequester && (
+        <ActionCard title="Awaiting client confirmation" sub={`Sent ${p.proposalSentAt ? fmtDT(p.proposalSentAt) : ""}. Client confirmation is established by uploading the client-signed proposal — that upload converts the prospect into a client and auto-prepares the engagement letter.`}>
+          <div className="flex gap-2 flex-wrap items-center">
+            <FilePick label="Upload client-signed proposal — confirm client" onFiles={(fs) => actions.uploadSignedProposal(p.id, fs[0])} />
+            {!lostMode ? (
+              <button onClick={() => setLostMode(true)} className="px-4 py-2 rounded-lg border text-sm font-semibold" style={{ borderColor: "var(--red)", color: "var(--red)" }}>Mark as lost…</button>
+            ) : (
+              <>
+                <input value={lostNote} onChange={(e) => setLostNote(e.target.value)} placeholder="Reason (kept in audit trail)" className="border rounded-md px-2.5 py-2 text-xs flex-1 min-w-[200px]" style={{ borderColor: "var(--line)" }} />
+                <button onClick={() => actions.markLost(p.id, lostNote.trim())} className="px-3 py-2 rounded-md text-white text-xs font-semibold" style={{ background: "var(--red)" }}>Confirm lost</button>
+              </>
+            )}
+          </div>
+        </ActionCard>
+      )}
+
+      {/* EL preview & stage actions */}
+      {p.el && p.status !== "lost" && (
+        <div className="grid grid-cols-3 gap-5">
+          <div className="col-span-2">
+            <div className="bg-white border rounded-xl overflow-hidden shadow-sm" style={{ borderColor: "var(--line)" }}>
+              <div className="px-8 pt-7 pb-5 border-b-4" style={{ borderColor: firm.accent }}>
+                <div className="font-disp text-xl font-bold" style={{ color: "var(--ink)" }}>{firm.name}</div>
+                <div className="text-[11px] mt-1" style={{ color: "var(--mut)" }}>{firm.address} · {firm.phone} · {firm.email} · {firm.trn}</div>
+              </div>
+              <div className="px-8 py-6 text-sm leading-relaxed">
+                <div className="flex justify-between text-xs font-mono2" style={{ color: "var(--mut)" }}><span>Engagement Letter · Ref {p.id}-EL</span><span>{fmtD(now())}</span></div>
+                <h2 className="font-disp text-lg font-bold mt-4" style={{ color: "var(--ink)" }}>Engagement Letter</h2>
+                <p className="mt-3">To: <b>{p.prospect.name}</b>{p.prospect.contactPerson && <> — Attn: {p.prospect.contactPerson}</>}</p>
+                <p className="mt-2">We refer to our proposal (Ref {p.id}) and your confirmation thereof by counter-signature. This letter confirms the terms of our engagement to provide the following professional services:</p>
+                <table className="w-full mt-3 text-sm">
+                  <tbody>
+                    {d.lines.map((l, i) => (
+                      <tr key={i} className="border-b" style={{ borderColor: "var(--line)" }}>
+                        <td className="py-1.5">{l.service}</td>
+                        <td className="py-1.5 text-right font-mono2">{num(l.fee).toLocaleString()} <span className="text-[11px]" style={{ color: "var(--mut)" }}>{l.basis || defaultBasis(l.service)}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="mt-3 text-xs" style={{ color: "var(--mut)" }}>Commercial terms above are locked to the client-confirmed proposal and cannot be edited on this letter.</p>
+                {p.el.advancePct === 0 ? (
+                  <p className="mt-3"><b>Payment plan:</b> Fees are billed in accordance with the payment terms of the confirmed proposal: {d.paymentTerms}</p>
+                ) : (
+                  <p className="mt-3"><b>Payment plan:</b> {p.el.advancePct}% advance ({money((p.el.advancePct / 100) * firstBill)}) payable on signing; balance {money(firstBill - (p.el.advancePct / 100) * firstBill)} within 14 days — computed on the first billing period of {money(firstBill)} ({d.lines.map((l) => `${l.service.split(" (")[0]} ${num(l.fee).toLocaleString()}`).join(" + ")}). Thereafter, fees are billed per the payment terms of the confirmed proposal: <span className="text-xs" style={{ color: "var(--mut)" }}>{d.paymentTerms}</span></p>
+                )}
+                {p.el.note && <p className="mt-2"><b>Special terms:</b> {p.el.note}</p>}
+                <p className="mt-6" style={{ color: "var(--mut)" }}>For and on behalf of {firm.name}</p>
+                <div className="mt-3 min-h-[70px]">
+                  {p.el.signature ? <SigBlock user={byId(p.el.signature.by)} at={p.el.signature.at} role="Senior Management" /> : <span className="text-xs italic" style={{ color: "var(--mut)" }}>— pending senior signature —</span>}
+                </div>
+                {p.clientSignedProposal && (
+                  <div className="mt-5 pt-4 border-t text-xs font-mono2" style={{ borderColor: "var(--line)", color: "var(--accent)" }}>
+                    ✓ Client-signed proposal on file: <FileLink {...p.clientSignedProposal} /> · uploaded {fmtDT(p.clientSignedProposal.at)}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            {p.status === "el_staffing" && iAmRequester && (
+              <>
+                <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+                  <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Assign technical staff — per activity</h3>
+                  <p className="text-[11px] mt-0.5 mb-3" style={{ color: "var(--mut)" }}>Every service needs an owner before the EL can route for signature. Each candidate's current duties are listed so the choice is informed, not blind. Staff are notified on assignment.</p>
+                  <div className="space-y-3">
+                    {d.lines.map((l) => (
+                      <div key={l.service} className="border rounded-lg p-3" style={{ borderColor: assignments[l.service] ? "var(--accent)" : "var(--line)", background: assignments[l.service] ? "var(--accent-soft)" : "#fff" }}>
+                        <div className="text-sm font-semibold flex items-center justify-between">
+                          <span>{l.service}</span>
+                          {assignments[l.service] && <span className="text-xs font-medium" style={{ color: "var(--accent)" }}>→ {byId(assignments[l.service]).name}</span>}
+                        </div>
+                        <div className="mt-2 space-y-1.5">
+                          {staff.map((u) => {
+                            const w = workloadOf(u.id);
+                            const sel = assignments[l.service] === u.id;
+                            return (
+                              <button key={u.id} onClick={() => actions.assignActivity(p.id, l.service, u.id)} className="w-full text-left border rounded-md p-2 bg-white hover:bg-gray-50" style={{ borderColor: sel ? "var(--accent)" : "var(--line)" }}>
+                                <div className="text-xs font-semibold flex items-center justify-between">
+                                  <span>{u.name} <span className="font-normal" style={{ color: "var(--mut)" }}>· {u.designation}</span></span>
+                                  {sel && <span style={{ color: "var(--accent)" }}>✓ assigned</span>}
+                                </div>
+                                <div className="text-[10px] mt-1" style={{ color: "var(--mut)" }}>
+                                  {w.proposals.length === 0 && w.activities.length === 0 ? "No current client work." : (
+                                    <>
+                                      {w.proposals.map((pp) => <div key={pp.id}>• {pp.id} {pp.prospect.name} — {STATUS_MAP[pp.status]?.[0] || pp.status}</div>)}
+                                      {w.activities.map((a, i2) => <div key={i2}>• {a.client} — {a.service}{a.legacy ? " (pre-existing)" : ""}</div>)}
+                                    </>
+                                  )}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+                  <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Payment plan, terms & routing</h3>
+                  <p className="text-[11px] mt-0.5 mb-3" style={{ color: "var(--mut)" }}>Fees are locked to the client-confirmed proposal. Set the plan, then route — the senior can only sign or reject with a note.</p>
+                  <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Advance on signing</label>
+                  <select value={p.el.advancePct} onChange={(e) => actions.setELAdvance(p.id, Number(e.target.value))} className="mt-1 w-full border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+                    <option value={0}>No advance — bill per the proposal payment terms (default)</option>
+                    {[25, 50, 75, 100].map((x) => <option key={x} value={x}>{x}% advance{x < 100 ? " · balance in 14 days" : " (full advance)"}</option>)}
+                  </select>
+                  {p.el.advancePct > 0 && (
+                    <div className="mt-1.5 text-[11px] px-2.5 py-2 rounded-md" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>
+                      ⚠️ This adds an advance the client did not sign in the proposal — computed on the first billing period: <b>{money(firstBill)}</b> ({d.lines.map((l) => `${l.service.split(" (")[0]} ${num(l.fee).toLocaleString()}`).join(" + ")}). Confirm the client has agreed, or use special terms to record the discussion.
+                    </div>
+                  )}
+                  <label className="text-xs font-semibold mt-3 block" style={{ color: "var(--mut)" }}>Special terms (optional — recorded in the audit trail on change)</label>
+                  <textarea value={elNote} onChange={(e) => setElNote(e.target.value)} onBlur={() => actions.setELNote(p.id, elNote)} rows={3} className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} placeholder="e.g. Engagement commences on receipt of advance; either party may terminate with 30 days' notice…" />
+                  <label className="text-xs font-semibold mt-3 block" style={{ color: "var(--mut)" }}>Route for signature to</label>
+                  <select value={signatoryPick} onChange={(e) => setSignatoryPick(e.target.value)} className="mt-1 w-full border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+                    <option value="">Select senior signatory…</option>
+                    {signatories.map((u) => <option key={u.id} value={u.id}>{u.name} — {u.designation}</option>)}
+                  </select>
+                  {unassigned.length > 0 && (
+                    <div className="mt-2 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>
+                      🔒 Cannot route yet — {unassigned.length} activit{unassigned.length === 1 ? "y" : "ies"} unassigned: {unassigned.map((l) => l.service).join(", ")}
+                    </div>
+                  )}
+                  <button disabled={!signatoryPick || unassigned.length > 0} onClick={() => actions.routeEL(p.id, signatoryPick)} className="mt-3 w-full px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+                    Route to senior management ✍️
+                  </button>
+                </section>
+              </>
+            )}
+
+            {p.el && Object.keys(assignments).length > 0 && p.status !== "el_staffing" && (
+              <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+                <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Assigned team</h3>
+                <div className="mt-2 space-y-1 text-xs">
+                  {Object.entries(assignments).map(([svc, uId]) => <div key={svc} className="flex justify-between"><span style={{ color: "var(--mut)" }}>{svc}</span><b>{byId(uId).name}</b></div>)}
+                </div>
+              </section>
+            )}
+
+            {iAmELSenior && (
+              <section className="bg-white border rounded-xl p-4" style={{ borderColor: "#D8CBEF", background: "#F8F5FE" }}>
+                <h3 className="font-disp font-bold text-sm" style={{ color: "#5C4A8A" }}>Sign engagement letter</h3>
+                <p className="text-[11px] mt-0.5 mb-3" style={{ color: "var(--mut)" }}>Sign and return to the manager, or reject with a note. No edits at this stage.</p>
+                <label className="flex items-start gap-2 text-[11px]" style={{ color: "var(--mut)" }}>
+                  <input type="checkbox" checked={confirmSig} onChange={(e) => setConfirmSig(e.target.checked)} className="mt-0.5" />
+                  I re-confirm my identity and authorize applying <b>my own</b> signature (in production: password / 2FA re-entry).
+                </label>
+                <button disabled={!confirmSig} onClick={() => actions.elApprove(p.id)} className="mt-2 w-full px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "#5C4A8A" }}>Sign & return to manager ✍️</button>
+                {!rejMode ? (
+                  <button onClick={() => setRejMode(true)} className="mt-2 w-full px-3 py-2 rounded-md border text-sm font-semibold bg-white" style={{ borderColor: "var(--red)", color: "var(--red)" }}>Reject with note…</button>
+                ) : (
+                  <div className="mt-2 flex flex-col gap-2">
+                    <input value={rejNote} onChange={(e) => setRejNote(e.target.value)} placeholder="Mandatory note — sent back to the manager" className="border rounded-md px-2.5 py-2 text-xs bg-white" style={{ borderColor: "var(--line)" }} />
+                    <button onClick={() => { if (rejNote.trim()) actions.elReject(p.id, rejNote.trim()); }} className="px-3 py-2 rounded-md text-white text-xs font-semibold" style={{ background: "var(--red)" }}>Confirm rejection</button>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {p.status === "el_approved" && iAmRequester && (
+              <ActionCard title="Send the signed engagement letter" sub={`Draft goes to ${p.prospect.email} with the signed EL PDF attached — check, edit if needed, and approve to send. This completes Onboarding Part 1.`}>
+                <button onClick={() => openMail("el")} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>✉️ Send to client</button>
+              </ActionCard>
+            )}
+
+            {p.status === "el_sent" && client && (
+              <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}>
+                <h3 className="font-disp font-bold text-sm" style={{ color: "var(--accent)" }}>🎉 Onboarding Part 1 complete — client {client.code}</h3>
+                <div className="text-xs mt-2 space-y-1" style={{ color: "var(--ink)" }}>
+                  <div>✓ Client-signed proposal on file</div>
+                  <div>✓ Engagement letter signed & sent {p.el.sentAt && fmtDT(p.el.sentAt)}</div>
+                  <div>✓ Team assigned per activity — staff notified their duties are live</div>
+                  <div>✓ Payment schedule with the accountant — daily reminders until each receipt is updated</div>
+                </div>
+                <p className="text-[11px] mt-3" style={{ color: "var(--mut)" }}>The onboarding process and audit trail remain open — next is Onboarding Part 2 (client documentation & master file). Closure + the management performance report are issued only when both parts finish.</p>
+              </section>
+            )}
+          </div>
+        </div>
+      )}
+
+      {mail && (
+        <EmailModal mail={mail} setMail={setMail} onSend={() => { actions.sendClientEmail(p.id, mail.kind, mail); setMail(null); }} />
+      )}
+    </div>
+  );
+}
+
+const ActionCard = ({ title, sub, children }) => (
+  <section className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--line)" }}>
+    <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>{title}</h3>
+    <p className="text-xs mt-0.5 mb-3" style={{ color: "var(--mut)" }}>{sub}</p>
+    {children}
+  </section>
+);
+
+function EmailModal({ mail, setMail, onSend }) {
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-40 p-4">
+      <div className="bg-white rounded-xl w-full max-w-xl p-5 shadow-2xl">
+        <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>Draft email — edit · confirm · send</h3>
+        <p className="text-[11px] mt-0.5 mb-3" style={{ color: "var(--mut)" }}>Prepared by the CRM. Nothing is sent without your confirmation. The send is logged in the audit trail.</p>
+        <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>To</label>
+        <input value={mail.to} onChange={(e) => setMail({ ...mail, to: e.target.value })} className="mt-1 w-full border rounded-md px-3 py-2 text-sm font-mono2" style={{ borderColor: "var(--line)" }} />
+        <label className="text-xs font-semibold mt-3 block" style={{ color: "var(--mut)" }}>Subject</label>
+        <input value={mail.subject} onChange={(e) => setMail({ ...mail, subject: e.target.value })} className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+        <label className="text-xs font-semibold mt-3 block" style={{ color: "var(--mut)" }}>Body <span className="font-normal">(attachment: {mail.kind === "proposal" ? "signed proposal PDF" : "signed engagement letter PDF"} — added automatically)</span></label>
+        <textarea value={mail.body} onChange={(e) => setMail({ ...mail, body: e.target.value })} rows={9} className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={() => setMail(null)} className="px-4 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>Cancel</button>
+          <button onClick={onSend} className="px-4 py-2 rounded-md text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>Confirm & send ✉️</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CompareModal({ a, b, byId, onClose }) {
+  // ensure a is the earlier version
+  const [va, vb] = a.v <= b.v ? [a, b] : [b, a];
+  const services = [...new Set([...va.data.lines.map((l) => l.service), ...vb.data.lines.map((l) => l.service)])];
+  const changes = diffDrafts(va.data, vb.data);
+  const cell = (val, changed) => (
+    <td className="py-2 px-3 font-mono2 text-right" style={changed ? { background: "var(--amber-soft)", color: "var(--amber)", fontWeight: 700 } : {}}>{val}</td>
+  );
+  const feeOf = (v, svc) => { const l = v.data.lines.find((x) => x.service === svc); return l ? `${num(l.fee).toLocaleString()} ${l.basis || defaultBasis(svc)}` : "— not included —"; };
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-40 p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl w-full max-w-3xl p-6 shadow-2xl max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between">
+          <div>
+            <h3 className="font-disp font-bold text-lg" style={{ color: "var(--ink)" }}>Comparison report — v{va.v} vs v{vb.v}</h3>
+            <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>
+              v{va.v}: {va.note} — {byId(va.by).name}, {fmtDT(va.at)} &nbsp;·&nbsp; v{vb.v}: {vb.note} — {byId(vb.by).name}, {fmtDT(vb.at)}
+            </div>
+          </div>
+          <button onClick={onClose} className="px-3 py-1.5 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>Close</button>
+        </div>
+
+        <table className="w-full mt-4 text-sm border rounded-lg overflow-hidden" style={{ borderColor: "var(--line)" }}>
+          <thead>
+            <tr className="text-left text-[11px] uppercase tracking-wider" style={{ background: "var(--paper)", color: "var(--mut)" }}>
+              <th className="py-2 px-3">Field</th><th className="py-2 px-3 text-right">v{va.v}</th><th className="py-2 px-3 text-right">v{vb.v}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {services.map((svc) => {
+              const changed = feeOf(va, svc) !== feeOf(vb, svc);
+              return (
+                <tr key={svc} className="border-t" style={{ borderColor: "var(--line)" }}>
+                  <td className="py-2 px-3">{svc}</td>
+                  {cell(feeOf(va, svc), changed)}{cell(feeOf(vb, svc), changed)}
+                </tr>
+              );
+            })}
+            <tr className="border-t" style={{ borderColor: "var(--line)" }}>
+              <td className="py-2 px-3">Payment terms</td>
+              <td className="py-2 px-3 text-xs" style={(va.data.paymentTerms || "").trim() !== (vb.data.paymentTerms || "").trim() ? { background: "var(--amber-soft)" } : {}}>{va.data.paymentTerms || "—"}</td>
+              <td className="py-2 px-3 text-xs" style={(va.data.paymentTerms || "").trim() !== (vb.data.paymentTerms || "").trim() ? { background: "var(--amber-soft)", fontWeight: 600 } : {}}>{vb.data.paymentTerms || "—"}</td>
+            </tr>
+            <tr className="border-t" style={{ borderColor: "var(--line)" }}>
+              <td className="py-2 px-3">Validity</td>
+              {cell(`${va.data.validityDays} days`, String(va.data.validityDays) !== String(vb.data.validityDays))}
+              {cell(`${vb.data.validityDays} days`, String(va.data.validityDays) !== String(vb.data.validityDays))}
+            </tr>
+            <tr className="border-t" style={{ borderColor: "var(--line)" }}>
+              <td className="py-2 px-3">Scope notes</td>
+              <td className="py-2 px-3 text-xs" style={(va.data.scope || "").trim() !== (vb.data.scope || "").trim() ? { background: "var(--amber-soft)" } : {}}>{va.data.scope || "—"}</td>
+              <td className="py-2 px-3 text-xs" style={(va.data.scope || "").trim() !== (vb.data.scope || "").trim() ? { background: "var(--amber-soft)", fontWeight: 600 } : {}}>{vb.data.scope || "—"}</td>
+            </tr>
+            <tr className="border-t font-bold" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+              <td className="py-2 px-3">Σ line fees (mixed basis)</td>
+              {cell(`AED ${va.data.lines.reduce((x, l) => x + num(l.fee), 0).toLocaleString()}`, va.data.lines.reduce((x, l) => x + num(l.fee), 0) !== vb.data.lines.reduce((x, l) => x + num(l.fee), 0))}
+              {cell(`AED ${vb.data.lines.reduce((x, l) => x + num(l.fee), 0).toLocaleString()}`, va.data.lines.reduce((x, l) => x + num(l.fee), 0) !== vb.data.lines.reduce((x, l) => x + num(l.fee), 0))}
+            </tr>
+          </tbody>
+        </table>
+
+        <div className="mt-4 rounded-lg border p-3" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+          <div className="text-[11px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Summary of changes ({changes.length})</div>
+          {changes.length === 0 ? (
+            <div className="text-sm mt-1.5" style={{ color: "var(--mut)" }}>No commercial differences between these versions.</div>
+          ) : (
+            <ul className="mt-1.5 space-y-1 text-sm">
+              {changes.map((c, i) => <li key={i} className="flex gap-2"><span style={{ color: "var(--amber)" }}>●</span><span>{c}</span></li>)}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- performance report (on module completion) ---------- */
+
+function starsFor(avgDays) {
+  if (avgDays <= 0.5) return 5;
+  if (avgDays <= 1) return 4.5;
+  if (avgDays <= 2) return 4;
+  if (avgDays <= 3) return 3.5;
+  if (avgDays <= 5) return 3;
+  if (avgDays <= 7) return 2;
+  return 1;
+}
+const Stars = ({ n }) => (
+  <span className="font-mono2 tracking-tight" style={{ color: "var(--amber)" }} title={`${n} / 5`}>
+    {"★".repeat(Math.floor(n))}{n % 1 ? "½" : ""}{"☆".repeat(5 - Math.ceil(n))}
+    <span className="ml-1.5 text-[11px]" style={{ color: "var(--mut)" }}>{n.toFixed(1)}</span>
+  </span>
+);
+
+function PerfReport({ p, byId }) {
+  const [openUser, setOpenUser] = useState(null);
+  const total = (p.onboardingCompletedAt || p.el?.sentAt || p.events[p.events.length - 1].at) - p.createdAt;
+
+  const perUser = {};
+  p.holderLog.forEach((h) => {
+    const dur = (h.end ?? h.start) - h.start;
+    (perUser[h.userId] ||= { periods: [], total: 0 }).periods.push({ ...h, dur });
+    perUser[h.userId].total += dur;
+  });
+  const rows = Object.entries(perUser).map(([uId, x]) => {
+    const avgD = days(x.total / x.periods.length);
+    return { uId, ...x, avgD, stars: starsFor(avgD), longest: Math.max(...x.periods.map((q) => q.dur)) };
+  }).sort((a, b) => b.stars - a.stars || a.total - b.total);
+
+  return (
+    <div className="max-w-4xl mt-5 space-y-5">
+      <section className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--accent)" }}>
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <h3 className="font-disp font-bold text-lg" style={{ color: "var(--ink)" }}>Client onboarding — performance report (Parts 1 & 2)</h3>
+            <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>Generated automatically at completion · audit trail closed · visible to management only</div>
+          </div>
+          <div className="text-right">
+            <div className="font-mono2 text-2xl font-bold" style={{ color: "var(--accent)" }}>{fmtDur(total)}</div>
+            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--mut)" }}>request → onboarding complete · {fmtD(p.createdAt)} → {fmtD(p.onboardingCompletedAt || p.el.sentAt)}</div>
+          </div>
+        </div>
+      </section>
+
+      <section className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--line)" }}>
+        <h4 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Employee performance — responsiveness ratings</h4>
+        <p className="text-[11px] mt-0.5" style={{ color: "var(--mut)" }}>Rating reflects average time to pass the baton while holding it (≤½ day ★5 · ≤1d ★4½ · ≤2d ★4 · ≤3d ★3½ · ≤5d ★3 · ≤7d ★2 · beyond ★1). Click an employee to see their tasks, longest first.</p>
+        <div className="mt-3 space-y-2">
+          {rows.map((r) => {
+            const u = byId(r.uId);
+            const isOpen = openUser === r.uId;
+            return (
+              <div key={r.uId} className="border rounded-lg overflow-hidden" style={{ borderColor: isOpen ? "var(--accent)" : "var(--line)" }}>
+                <button onClick={() => setOpenUser(isOpen ? null : r.uId)} className="w-full flex items-center gap-4 px-4 py-3 text-sm text-left hover:bg-gray-50">
+                  <div className="flex-1">
+                    <b>{u.name}</b> <span className="text-xs" style={{ color: "var(--mut)" }}>· {u.designation} · {u.role}</span>
+                  </div>
+                  <Stars n={r.stars} />
+                  <div className="text-xs font-mono2 text-right w-40" style={{ color: "var(--mut)" }}>
+                    held {fmtDur(r.total)} · {r.periods.length} task{r.periods.length !== 1 && "s"}<br />avg {r.avgD.toFixed(1)}d / task
+                  </div>
+                  <span style={{ color: "var(--mut)" }}>{isOpen ? "▾" : "▸"}</span>
+                </button>
+                {isOpen && (
+                  <div className="border-t px-4 py-3" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+                    <div className="text-[10px] uppercase tracking-wider font-bold mb-2" style={{ color: "var(--mut)" }}>Tasks held — most time taken first</div>
+                    {[...r.periods].sort((a, b) => b.dur - a.dur).map((q, i) => (
+                      <div key={i} className="flex items-center gap-3 py-1.5 text-xs border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+                        <span className="font-mono2 w-14 text-right font-bold" style={{ color: i === 0 && r.periods.length > 1 ? "var(--red)" : "var(--ink)" }}>{fmtDur(q.dur)}</span>
+                        <span className="flex-1">{q.reason || "responsibility held"}{i === 0 && r.periods.length > 1 && <span className="ml-2 px-1.5 py-0.5 rounded-full text-[9px] font-bold" style={{ background: "var(--red-soft)", color: "var(--red)" }}>LONGEST</span>}</span>
+                        <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(q.start)} → {fmtDT(q.end)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <p className="text-[10px] mt-3" style={{ color: "var(--mut)" }}>Note: time spent awaiting the client (proposal / EL with the client) is excluded from employee ratings — only internally-held periods count.</p>
+      </section>
+    </div>
+  );
+}
+
+/* ---------- chat & audit ---------- */
+
+function ChatTab({ p, me, byId, send, closed }) {
+  const [text, setText] = useState("");
+  const other = me.id === p.assignedTo ? p.requestedBy : p.assignedTo;
+  return (
+    <div className="max-w-2xl mt-5">
+      <div className="bg-white border rounded-xl p-4 min-h-[280px] flex flex-col" style={{ borderColor: "var(--line)" }}>
+        <div className="text-xs pb-3 border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+          Direct chat between {byId(p.requestedBy).name} and {byId(p.assignedTo).name} on {p.id}. Informal channel — never changes task state; fully captured in the audit trail.
+        </div>
+        <div className="flex-1 py-3 space-y-2.5 overflow-y-auto">
+          {p.chat.map((m) => (
+            <div key={m.id} className={`max-w-[75%] ${m.by === me.id ? "ml-auto" : ""}`}>
+              <div className="text-sm px-3 py-2 rounded-xl" style={m.by === me.id ? { background: "var(--accent)", color: "#fff" } : { background: "var(--paper)" }}>{m.text}</div>
+              <div className={`text-[10px] mt-0.5 font-mono2 ${m.by === me.id ? "text-right" : ""}`} style={{ color: "var(--mut)" }}>{byId(m.by).name.split(" ")[0]} · {fmtDT(m.at)}</div>
+            </div>
+          ))}
+          {p.chat.length === 0 && <div className="text-xs text-center py-8" style={{ color: "var(--mut)" }}>No messages yet.</div>}
+        </div>
+        {closed ? (
+          <div className="pt-2 border-t text-xs text-center py-2.5 rounded-md" style={{ borderColor: "var(--line)", color: "var(--mut)", background: "var(--paper)" }}>
+            🔒 Process closed — the audit trail is sealed and no further messages can be added.
+          </div>
+        ) : (
+          <div className="flex gap-2 pt-2 border-t" style={{ borderColor: "var(--line)" }}>
+            <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) { send(text.trim()); setText(""); } }} placeholder={`Message ${byId(other).name.split(" ")[0]}…`} className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+            <button onClick={() => { if (text.trim()) { send(text.trim()); setText(""); } }} className="px-4 py-2 rounded-md text-white text-sm font-semibold" style={{ background: "var(--ink)" }}>Send</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AuditTab({ p, byId, closed }) {
+  return (
+    <div className="max-w-3xl mt-5">
+      {closed && (
+        <div className="mb-3 rounded-xl border p-3 text-sm flex items-center gap-2" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)", color: "var(--accent)" }}>
+          🔒 <b>Trail closed</b> — client onboarding (Parts 1 & 2) completed; this record is sealed and final.
+        </div>
+      )}
+      <div className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--line)" }}>
+        <div className="text-xs mb-4" style={{ color: "var(--mut)" }}>
+          Append-only. Every state change, document event, signature application, email send, and chat message — timestamped and attributed. No role, including Admin, can edit or delete entries.
+        </div>
+        <div className="relative pl-5">
+          <div className="absolute left-1.5 top-1 bottom-1 w-px" style={{ background: "var(--line)" }} />
+          {p.events.map((e) => (
+            <div key={e.id} className="relative pb-4">
+              <div className="absolute -left-5 top-1 w-3 h-3 rounded-full border-2 bg-white" style={{ borderColor: e.by === "system" ? "var(--mut)" : "var(--accent)" }} />
+              <div className="text-[11px] font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(e.at)} · {e.by === "system" ? "SYSTEM" : byId(e.by).name}</div>
+              <div className="text-sm mt-0.5">{e.text}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+/*  First-deployment setup wizard                                      */
+/* ================================================================== */
+
+const genTempPw = () => Math.random().toString(36).slice(2, 6) + "-" + Math.random().toString(36).slice(2, 6);
+
+function ActAdder({ onAdd }) {
+  const [client, setClient] = useState("");
+  const [service, setService] = useState("");
+  const [cadence, setCadence] = useState("monthly");
+  const [due, setDue] = useState("");
+  const [cName, setCName] = useState("");
+  const [cEmail, setCEmail] = useState("");
+  return (
+    <div className="mt-1">
+      <div className="flex gap-1.5">
+        <input placeholder="Client name" value={client} onChange={(e) => setClient(e.target.value)} className="flex-1 border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+        <input placeholder="Duty, e.g. VAT filing" value={service} onChange={(e) => setService(e.target.value)} className="flex-1 border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+        <select value={cadence} onChange={(e) => setCadence(e.target.value)} className="border rounded-md px-1.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+          {CADENCES.map((c) => <option key={c}>{c}</option>)}
+        </select>
+        <input type="date" value={due} onChange={(e) => setDue(e.target.value)} title="Next due date from today — the anchor for all auto-computed future deadlines" className="border rounded-md px-1.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+      </div>
+      <div className="flex gap-1.5 mt-1.5">
+        <input placeholder="Client contact person" value={cName} onChange={(e) => setCName(e.target.value)} className="flex-1 border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+        <input placeholder="Contact email — deliverables & reports are emailed here" value={cEmail} onChange={(e) => setCEmail(e.target.value)} className="flex-1 border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+        <button onClick={() => { if (client.trim() && service.trim() && due) { onAdd({ client: client.trim(), service: service.trim(), cadence, due, contact: { name: cName.trim(), email: cEmail.trim() } }); setClient(""); setService(""); setDue(""); setCName(""); setCEmail(""); } }} className="px-2.5 py-1.5 rounded-md border text-xs font-medium" style={{ borderColor: "var(--line)" }}>Add</button>
+      </div>
+      <div className="text-[10px] mt-1" style={{ color: "var(--mut)" }}>Next due date (as of Baton implementation) is required — every subsequent deadline is computed from it per the cadence. The contact receives report deliveries; completion requires proof of work (or an explicit declared reason).</div>
+    </div>
+  );
+}
+
+function SetupWizard({ onCancel, onDone }) {
+  const [step, setStep] = useState(1);
+  const [f, setF] = useState({ name: "", short: "", address: "", trn: "", phone: "", email: "", accent: "#1E6E56" });
+  const [emps, setEmps] = useState([{ id: uid(), name: "", designation: "", email: "", role: "", tempPw: genTempPw(), signatory: false, sig: null, acts: [], actsOpen: false }]);
+  const [invitesSent, setInvitesSent] = useState(false);
+  const [services, setServices] = useState([...SERVICES]);
+  const [newSvc, setNewSvc] = useState("");
+  const [templates, setTemplates] = useState({ letterhead: null, proposal: null, el: null });
+
+  const setEmp = (id, patch) => setEmps((es) => es.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  const validEmp = (e) => e.name.trim() && e.email.trim();
+
+  const stepOK = {
+    1: f.name.trim() && f.short.trim() && f.email.trim(),
+    2: services.length > 0,
+    3: emps.length > 0 && emps.every(validEmp),
+    4: emps.every((e) => e.role) && emps.some((e) => e.role === "Admin"),
+    5: invitesSent,
+    6: emps.filter((e) => e.signatory).length >= 1 && emps.filter((e) => e.signatory).every((e) => e.sig),
+  }[step];
+
+  const finish = () => {
+    const newUsers = emps.map((e) => ({ id: e.id, name: e.name.trim(), designation: e.designation.trim() || e.role, email: e.email.trim(), role: e.role, signatory: e.signatory, sigSpecimen: e.sig, existingActivities: e.acts || [] }));
+    onDone({ ...f, name: f.name.trim(), short: f.short.trim(), services, templates }, newUsers);
+  };
+
+  const STEPS = ["Firm", "Activities", "Employees", "Roles", "Credentials", "Signatures"];
+
+  return (
+    <div className="min-h-screen py-10 px-6" style={{ background: "var(--paper)" }}>
+      <div className="max-w-3xl mx-auto">
+        <div className="flex items-center justify-between">
+          <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>First deployment — firm setup</h1>
+          <button onClick={onCancel} className="text-xs underline" style={{ color: "var(--mut)" }}>Cancel setup</button>
+        </div>
+        <div className="mt-4 flex items-center gap-2 text-[11px] font-medium">
+          {STEPS.map((s, i) => (
+            <span key={s} className="flex items-center gap-2">
+              <span className="px-2.5 py-1 rounded-full" style={i + 1 === step ? { background: "var(--accent)", color: "#fff" } : i + 1 < step ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "#fff", color: "var(--mut)", border: "1px solid var(--line)" }}>
+                {i + 1 < step ? "✓ " : `${i + 1} · `}{s}
+              </span>
+              {i < STEPS.length - 1 && <span style={{ color: "var(--line)" }}>—</span>}
+            </span>
+          ))}
+        </div>
+
+        {step === 1 && (
+          <Card title="1 · Define the firm" sub="These details drive the letterhead on every generated proposal and engagement letter, and the brand accent across the CRM.">
+            <div className="grid grid-cols-2 gap-3">
+              <Inp label="Registered name *" v={f.name} set={(v) => setF({ ...f, name: v })} ph="e.g. Emirates Ledger Consultancy LLC" />
+              <Inp label="Short name *" v={f.short} set={(v) => setF({ ...f, short: v })} ph="e.g. Emirates Ledger" />
+              <Inp label="Address" v={f.address} set={(v) => setF({ ...f, address: v })} ph="Office, building, emirate" />
+              <Inp label="TRN" v={f.trn} set={(v) => setF({ ...f, trn: v })} ph="TRN 100-XXXX-XXXX-XXX" />
+              <Inp label="Phone" v={f.phone} set={(v) => setF({ ...f, phone: v })} />
+              <Inp label="Firm email *" v={f.email} set={(v) => setF({ ...f, email: v })} />
+              <div>
+                <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Brand accent</label>
+                <input type="color" value={f.accent} onChange={(e) => setF({ ...f, accent: e.target.value })} className="mt-1 h-9 w-20 border rounded-md" style={{ borderColor: "var(--line)" }} />
+              </div>
+            </div>
+            <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
+              <div className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--mut)" }}>Document formats — optional</div>
+              <p className="text-[11px] mt-1 mb-2" style={{ color: "var(--mut)" }}>If the firm already has its own letterhead, proposal format, or engagement letter format, upload them here — generated documents will follow these templates. If skipped, Baton's standard layouts are used with your firm details and accent.</p>
+              {[["letterhead", "Letterhead"], ["proposal", "Proposal format"], ["el", "Engagement letter format"]].map(([k, label]) => (
+                <div key={k} className="flex items-center gap-3 text-sm py-1.5">
+                  <span className="w-48" style={{ color: "var(--mut)" }}>{label}</span>
+                  {templates[k] ? (
+                    <span className="flex items-center gap-2 text-xs">
+                      <FileLink {...templates[k]} />
+                      <button onClick={() => setTemplates({ ...templates, [k]: null })} className="underline" style={{ color: "var(--red)" }}>remove</button>
+                    </span>
+                  ) : (
+                    <FilePick small label={`Upload ${label.toLowerCase()} (optional)`} onFiles={(fs) => setTemplates({ ...templates, [k]: fs[0] })} />
+                  )}
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        {step === 2 && (
+          <Card title="2 · Define the firm's activities" sub="The service catalog — everything the firm offers to clients. This list drives proposal requests; managers can still type custom services, which get flagged back to Admin as catalog candidates.">
+            <div className="flex flex-wrap gap-2">
+              {services.map((sv) => (
+                <span key={sv} className="px-3 py-1.5 rounded-full text-xs font-medium border flex items-center gap-2" style={{ borderColor: "var(--accent)", color: "var(--accent)", background: "var(--accent-soft)" }}>
+                  {sv}
+                  <button onClick={() => setServices(services.filter((x) => x !== sv))} style={{ color: "var(--red)" }}>×</button>
+                </span>
+              ))}
+            </div>
+            <div className="flex gap-2 mt-3">
+              <input value={newSvc} onChange={(e) => setNewSvc(e.target.value)} placeholder="Add activity — e.g. Payroll & WPS Processing, ESR Filing, Company Liquidation" className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+              <button onClick={() => { const v = newSvc.trim(); if (v && !services.includes(v)) { setServices([...services, v]); setNewSvc(""); } }} className="px-3 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>Add</button>
+            </div>
+            {services.length === 0 && <div className="mt-3 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>At least one activity is required.</div>}
+          </Card>
+        )}
+
+        {step === 3 && (
+          <Card title="3 · Add the employees" sub="Everyone who will work in Baton — partners, managers, technical staff, in-house accountants. For a firm that's already running, record each person's ongoing client duties so workload visibility is accurate from day one.">
+            <div className="space-y-2">
+              {emps.map((e) => (
+                <div key={e.id} className="border rounded-lg p-2.5" style={{ borderColor: "var(--line)" }}>
+                  <div className="flex gap-2 items-center">
+                    <input placeholder="Full name *" value={e.name} onChange={(ev) => setEmp(e.id, { name: ev.target.value })} className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+                    <input placeholder="Designation" value={e.designation} onChange={(ev) => setEmp(e.id, { designation: ev.target.value })} className="w-40 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+                    <input placeholder="Work email *" value={e.email} onChange={(ev) => setEmp(e.id, { email: ev.target.value })} className="w-52 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+                    <button onClick={() => setEmp(e.id, { actsOpen: !e.actsOpen })} className="px-2.5 py-2 rounded-md border text-xs font-medium whitespace-nowrap" style={{ borderColor: (e.acts || []).length ? "var(--accent)" : "var(--line)", color: (e.acts || []).length ? "var(--accent)" : "var(--mut)" }}>
+                      Duties ({(e.acts || []).length}) {e.actsOpen ? "▾" : "▸"}
+                    </button>
+                    {emps.length > 1 && <button onClick={() => setEmps(emps.filter((x) => x.id !== e.id))} style={{ color: "var(--red)" }}>×</button>}
+                  </div>
+                  {e.actsOpen && (
+                    <div className="mt-2 pt-2 border-t" style={{ borderColor: "var(--line)" }}>
+                      <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Ongoing duties already assigned (pre-Baton)</div>
+                      {(e.acts || []).map((a) => (
+                        <div key={a.id} className="flex items-center gap-2 text-xs py-1">
+                          <span className="flex-1">{a.client} — {a.service} <span style={{ color: "var(--mut)" }}>· {a.cadence} · next due {a.due}</span></span>
+                          <button onClick={() => setEmp(e.id, { acts: e.acts.filter((x) => x.id !== a.id) })} style={{ color: "var(--red)" }}>×</button>
+                        </div>
+                      ))}
+                      <ActAdder onAdd={(act) => setEmp(e.id, { acts: [...(e.acts || []), { id: uid(), ...act }] })} />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            <button onClick={() => setEmps([...emps, { id: uid(), name: "", designation: "", email: "", role: "", tempPw: genTempPw(), signatory: false, sig: null, acts: [], actsOpen: false }])} className="mt-3 px-3 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>+ Add employee</button>
+          </Card>
+        )}
+
+        {step === 4 && (
+          <Card title="4 · Assign roles" sub="Roles set what each person can do. At least one Admin is required — they manage the firm, employees and signature vault.">
+            <div className="space-y-2">
+              {emps.map((e) => (
+                <div key={e.id} className="flex gap-3 items-center text-sm">
+                  <span className="flex-1 font-medium">{e.name || "—"} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>{e.email}</span></span>
+                  {["Admin", "Manager", "Staff", "Accountant"].map((r) => (
+                    <button key={r} onClick={() => setEmp(e.id, { role: r, signatory: r === "Admin" || r === "Manager" ? true : e.signatory })} className="px-2.5 py-1.5 rounded-full text-xs font-medium border" style={e.role === r ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { borderColor: "var(--line)", color: "var(--mut)" }}>{r}</button>
+                  ))}
+                </div>
+              ))}
+            </div>
+            {!emps.some((e) => e.role === "Admin") && <div className="mt-3 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>At least one Admin is required to proceed.</div>}
+            <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
+              <div className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--mut)" }}>Permission matrix applied</div>
+              <table className="w-full text-xs">
+                <thead><tr className="text-left" style={{ color: "var(--mut)" }}><th className="py-1">Permission</th><th className="text-center">Admin</th><th className="text-center">Manager</th><th className="text-center">Staff</th><th className="text-center">Acct</th></tr></thead>
+                <tbody>
+                  {ROLE_MATRIX.slice(0, 6).map(([perm, a, m, s2, ac], i) => (
+                    <tr key={i} className="border-t" style={{ borderColor: "var(--line)" }}>
+                      <td className="py-1">{perm}</td>
+                      {[a, m, s2, ac].map((x, j) => <td key={j} className="text-center">{x ? <span style={{ color: "var(--accent)" }}>✓</span> : <span style={{ color: "var(--line)" }}>—</span>}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+
+        {step === 5 && (
+          <Card title="5 · Login credentials" sub="Each employee gets a temporary password by invite email. First login forces a password reset; 2FA is available for signatories.">
+            <div className="space-y-1.5">
+              {emps.map((e) => (
+                <div key={e.id} className="flex gap-3 items-center text-sm border rounded-md px-3 py-2" style={{ borderColor: "var(--line)" }}>
+                  <span className="flex-1 font-medium">{e.name} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>{e.email} · {e.role}</span></span>
+                  <span className="font-mono2 text-xs px-2 py-1 rounded" style={{ background: "var(--paper)" }}>{e.tempPw}</span>
+                  <button onClick={() => setEmp(e.id, { tempPw: genTempPw() })} className="text-xs underline" style={{ color: "var(--mut)" }}>regenerate</button>
+                </div>
+              ))}
+            </div>
+            {!invitesSent ? (
+              <button onClick={() => setInvitesSent(true)} className="mt-4 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+                ✉️ Send invite emails with temporary credentials
+              </button>
+            ) : (
+              <div className="mt-4 text-sm px-3 py-2.5 rounded-lg font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                ✓ Invite emails sent to all {emps.length} employees (simulated). Passwords are stored hashed — visible here once, never again. Forced reset applies at first login.
+              </div>
+            )}
+          </Card>
+        )}
+
+        {step === 6 && (
+          <Card title="6 · Digital signatures — managers & senior management" sub="Signatories' specimens go into the encrypted vault: preview-only, never downloadable, applied exclusively via the signatory's own identity-confirmed approval, with every use logged.">
+            <div className="space-y-2">
+              {emps.map((e) => (
+                <div key={e.id} className="border rounded-lg p-3" style={{ borderColor: e.signatory ? "var(--accent)" : "var(--line)" }}>
+                  <div className="flex items-center gap-3 text-sm">
+                    <label className="flex items-center gap-2 flex-1">
+                      <input type="checkbox" checked={e.signatory} onChange={(ev) => setEmp(e.id, { signatory: ev.target.checked, sig: ev.target.checked ? e.sig : null })} />
+                      <span className="font-medium">{e.name}</span> <span className="text-xs" style={{ color: "var(--mut)" }}>· {e.role}</span>
+                    </label>
+                    {e.signatory && (
+                      e.sig ? (
+                        <span className="flex items-center gap-2">
+                          {e.sig.type === "image" ? <img src={e.sig.url} alt="specimen" className="h-9 border rounded px-1 bg-white" style={{ borderColor: "var(--line)" }} /> : <span className="font-disp italic text-lg">{e.sig.text}</span>}
+                          <button onClick={() => setEmp(e.id, { sig: null })} className="text-xs underline" style={{ color: "var(--red)" }}>replace</button>
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-2">
+                          <FilePick small label="Upload specimen" onFiles={(fs) => setEmp(e.id, { sig: { type: "image", url: fs[0].url, name: fs[0].name } })} />
+                          <button onClick={() => setEmp(e.id, { sig: { type: "typed", text: e.name.split(" ").map((x) => x[0]).join(". ") + "." } })} className="px-2.5 py-1.5 rounded-md border text-xs font-medium" style={{ borderColor: "var(--line)" }}>Type-to-sign (initials)</button>
+                        </span>
+                      )
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {emps.filter((e) => e.signatory).length === 0 && <div className="mt-3 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>At least one signatory is required — proposals and engagement letters cannot be signed otherwise.</div>}
+          </Card>
+        )}
+
+        <div className="mt-5 flex justify-between">
+          <button disabled={step === 1} onClick={() => setStep(step - 1)} className="px-4 py-2 rounded-lg border text-sm font-medium disabled:opacity-40" style={{ borderColor: "var(--line)" }}>← Back</button>
+          {step < 6 ? (
+            <button disabled={!stepOK} onClick={() => setStep(step + 1)} className="px-5 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Continue →</button>
+          ) : (
+            <button disabled={!stepOK} onClick={finish} className="px-5 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>🚀 Launch {f.short || "the firm"} — go to login</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+/*  Admin screens                                                      */
+/* ================================================================== */
+
+function Employees({ users, setUsers }) {
+  const [f, setF] = useState({ name: "", designation: "", email: "", role: "Staff" });
+  return (
+    <div className="max-w-4xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Employees & roles</h1>
+      <div className="mt-4 bg-white border rounded-xl overflow-hidden" style={{ borderColor: "var(--line)" }}>
+        {users.map((u) => (
+          <div key={u.id} className="flex items-center gap-4 px-5 py-3.5 border-b last:border-0 text-sm" style={{ borderColor: "var(--line)" }}>
+            <div className="flex-1"><b>{u.name}</b><span className="ml-2" style={{ color: "var(--mut)" }}>{u.designation}</span></div>
+            <span className="text-xs" style={{ color: "var(--mut)" }}>{u.email}</span>
+            <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{u.role}</span>
+            {u.signatory && <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>Signatory</span>}
+          </div>
+        ))}
+      </div>
+
+      <Card title="Add employee" sub="An invite email with a temporary password would be sent; forced reset on first login.">
+        <div className="grid grid-cols-4 gap-2">
+          <input placeholder="Full name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className="border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+          <input placeholder="Designation" value={f.designation} onChange={(e) => setF({ ...f, designation: e.target.value })} className="border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+          <input placeholder="Email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} className="border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+          <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} className="border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+            <option>Admin</option><option>Manager</option><option>Staff</option><option>Accountant</option>
+          </select>
+        </div>
+        <button onClick={() => { if (f.name && f.email) { setUsers([...users, { ...f, id: uid(), signatory: false }]); setF({ name: "", designation: "", email: "", role: "Staff" }); } }} className="mt-3 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+          Add & send invite
+        </button>
+      </Card>
+
+      <Card title="Role permission matrix" sub="Fixed roles in v1; the data model is role → permissions so custom roles can be exposed later.">
+        <table className="w-full text-sm">
+          <thead><tr className="text-left text-[11px] uppercase tracking-wider" style={{ color: "var(--mut)" }}><th className="py-2">Permission</th><th className="text-center">Admin</th><th className="text-center">Manager</th><th className="text-center">Staff</th><th className="text-center">Accountant</th></tr></thead>
+          <tbody>
+            {ROLE_MATRIX.map(([perm, a, m, s, ac], i) => (
+              <tr key={i} className="border-t" style={{ borderColor: "var(--line)" }}>
+                <td className="py-2">{perm}</td>
+                {[a, m, s, ac].map((x, j) => <td key={j} className="text-center">{x ? <span style={{ color: "var(--accent)" }}>✓</span> : <span style={{ color: "var(--line)" }}>—</span>}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+function CatalogEditor({ firm, setFirm }) {
+  const [v, setV] = useState("");
+  const list = firm.services || [];
+  return (
+    <>
+      <div className="flex flex-wrap gap-2">
+        {list.map((sv) => (
+          <span key={sv} className="px-3 py-1.5 rounded-full text-xs font-medium border flex items-center gap-2" style={{ borderColor: "var(--accent)", color: "var(--accent)", background: "var(--accent-soft)" }}>
+            {sv}
+            <button onClick={() => setFirm({ ...firm, services: list.filter((x) => x !== sv) })} style={{ color: "var(--red)" }}>×</button>
+          </span>
+        ))}
+      </div>
+      <div className="flex gap-2 mt-3">
+        <input value={v} onChange={(e) => setV(e.target.value)} placeholder="Add activity to the catalog" className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+        <button onClick={() => { const x = v.trim(); if (x && !list.includes(x)) { setFirm({ ...firm, services: [...list, x] }); setV(""); } }} className="px-3 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>Add</button>
+      </div>
+    </>
+  );
+}
+
+function FirmSetup({ firm, setFirm }) {
+  return (
+    <div className="max-w-3xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Firm & letterhead</h1>
+      <Card title="Firm details" sub="Used across all generated documents.">
+        <div className="grid grid-cols-2 gap-3">
+          <Inp label="Registered name" v={firm.name} set={(v) => setFirm({ ...firm, name: v })} />
+          <Inp label="Short name" v={firm.short} set={(v) => setFirm({ ...firm, short: v })} />
+          <Inp label="Address" v={firm.address} set={(v) => setFirm({ ...firm, address: v })} />
+          <Inp label="TRN" v={firm.trn} set={(v) => setFirm({ ...firm, trn: v })} />
+          <Inp label="Phone" v={firm.phone} set={(v) => setFirm({ ...firm, phone: v })} />
+          <Inp label="Email" v={firm.email} set={(v) => setFirm({ ...firm, email: v })} />
+          <div>
+            <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Brand accent</label>
+            <input type="color" value={firm.accent} onChange={(e) => setFirm({ ...firm, accent: e.target.value })} className="mt-1 h-9 w-20 border rounded-md" style={{ borderColor: "var(--line)" }} />
+          </div>
+        </div>
+      </Card>
+      <Card title="Firm activities — service catalog" sub="Drives proposal requests. Custom services typed by managers are flagged here as catalog candidates for you to promote.">
+        <CatalogEditor firm={firm} setFirm={setFirm} />
+      </Card>
+      <Card title="Document formats on file" sub="Optional uploaded templates from deployment — generated documents follow these; otherwise Baton's standard layout applies.">
+        {[["letterhead", "Letterhead"], ["proposal", "Proposal format"], ["el", "Engagement letter format"]].map(([k, label]) => (
+          <div key={k} className="flex items-center gap-3 text-sm py-1.5">
+            <span className="w-48" style={{ color: "var(--mut)" }}>{label}</span>
+            {firm.templates?.[k] ? (
+              <span className="flex items-center gap-2 text-xs">
+                <FileLink {...firm.templates[k]} />
+                <button onClick={() => setFirm({ ...firm, templates: { ...firm.templates, [k]: null } })} className="underline" style={{ color: "var(--red)" }}>remove</button>
+              </span>
+            ) : (
+              <FilePick small label={`Upload ${label.toLowerCase()}`} onFiles={(fs) => setFirm({ ...firm, templates: { ...(firm.templates || {}), [k]: fs[0] } })} />
+            )}
+          </div>
+        ))}
+      </Card>
+      <Card title="Letterhead preview" sub="Every generated proposal and engagement letter renders on this.">
+        <div className="border rounded-lg overflow-hidden" style={{ borderColor: "var(--line)" }}>
+          <div className="px-6 pt-5 pb-4 border-b-4 bg-white" style={{ borderColor: firm.accent }}>
+            <div className="font-disp text-lg font-bold" style={{ color: "var(--ink)" }}>{firm.name}</div>
+            <div className="text-[11px] mt-1" style={{ color: "var(--mut)" }}>{firm.address} · {firm.phone} · {firm.email} · {firm.trn}</div>
+          </div>
+          <div className="px-6 py-6 text-xs bg-white" style={{ color: "var(--line)" }}>— document body —</div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function Signatures({ users, sigUses, byId }) {
+  return (
+    <div className="max-w-3xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Signature vault</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>
+        Specimens are encrypted, never downloadable, and only ever applied through the signatory's own identity-confirmed approval. Every use is logged below.
+      </p>
+      <div className="mt-4 space-y-3">
+        {users.filter((u) => u.signatory).map((u) => {
+          const uses = sigUses.filter((s) => s.by === u.id);
+          return (
+            <div key={u.id} className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+              <div className="flex items-center gap-4">
+                <div className="w-28 h-14 border rounded-md flex items-center justify-center text-2xl italic font-disp select-none overflow-hidden" style={{ borderColor: "var(--line)", color: "var(--ink)", opacity: 0.65 }}>
+                  {u.sigSpecimen?.type === "image" ? <img src={u.sigSpecimen.url} alt="specimen" className="max-h-12 max-w-full" /> : u.sigSpecimen?.type === "typed" ? u.sigSpecimen.text : u.name.split(" ").map((x) => x[0]).join(". ") + "."}
+                </div>
+                <div className="flex-1">
+                  <div className="font-semibold text-sm">{u.name} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>· {u.designation}</span></div>
+                  <div className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>Specimen on file (low-res preview only) · identity re-confirmation required at each use</div>
+                </div>
+                <div className="text-xs px-2.5 py-1 rounded-full font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{uses.length} use{uses.length !== 1 && "s"} logged</div>
+              </div>
+              {uses.length > 0 && (
+                <div className="mt-3 pt-3 border-t space-y-1" style={{ borderColor: "var(--line)" }}>
+                  {uses.map((s) => (
+                    <div key={s.id} className="text-xs font-mono2 flex justify-between" style={{ color: "var(--mut)" }}>
+                      <span>✍️ {s.doc}</span><span>{fmtDT(s.at)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
