@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     AZURE_BLOB_CONN: str = ""  # empty = local filesystem fallback (FILES_DIR)
     FILES_DIR: str = "var/files"
     ANTHROPIC_API_KEY: str = ""  # server-side only; empty = payment-terms polish disabled
+    SCHEDULER_ENABLED: bool = True  # daily 07:00 Asia/Dubai digest (off in tests)
 
 
 @lru_cache

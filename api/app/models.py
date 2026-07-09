@@ -5,6 +5,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     ForeignKey,
     Index,
     Numeric,
@@ -227,6 +228,16 @@ class SignatureUse(Base):
     at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
     document: Mapped[str] = mapped_column(Text)
     context: Mapped[str | None] = mapped_column(Text)
+
+
+class DigestRun(Base):
+    """One row per completed daily-digest run — the idempotency record."""
+
+    __tablename__ = "digest_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_date: Mapped[str] = mapped_column(Date, unique=True)
+    at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
 
 
 class Notice(Base):

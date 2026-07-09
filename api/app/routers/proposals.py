@@ -883,6 +883,27 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
             "payments": [{"id": x.id, "label": x.label, "amount": float(x.amount), "due_at": x.due_at} for x in pays]}
 
 
+# ---------- chat ----------
+
+class ChatIn(BaseModel):
+    text: str = Field(min_length=1)
+
+
+@router.post("/{pid}/chat")
+def chat(pid: uuid.UUID, body: ChatIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Any tenant participant posts to the matter's chat (prototype sendChat) — stored as a
+    proposal_event kind=chat. Closed matters refuse new messages."""
+    p = _get(db, pid, user)
+    if p.status in ("onboarding_complete", "lost"):
+        raise conflict(f"Matter is closed ({p.status}) — the chat is read-only")
+    log_event(db, p, user.id, f'Chat: "{body.text}"', kind="chat")
+    other = p.requested_by if user.id == p.assigned_to else p.assigned_to
+    if other and other != user.id:
+        _notify(db, p, other, f"{p.ref}: new message from {user.name}")
+    db.commit()
+    return {"ok": True, "proposal": p.ref}
+
+
 # ---------- workload (GET /users/workload) ----------
 
 @workload_router.get("/workload")
