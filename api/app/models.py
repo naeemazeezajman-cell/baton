@@ -135,6 +135,61 @@ class Client(Base):
     created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
 
 
+class Onboarding(Base):
+    """One documentation relay per staffed activity, created automatically at EL send."""
+
+    __tablename__ = "onboardings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clients.id"))
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("proposals.id"))
+    service: Mapped[str] = mapped_column(Text)
+    staff_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(Text, server_default="in_progress")  # in_progress | complete
+    holder: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    holder_since: Mapped[datetime | None] = mapped_column(TS)
+    duty_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("duties.id"))
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    completed_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class OnboardingEvent(Base):
+    __tablename__ = "onboarding_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    onboarding_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("onboardings.id"))
+    at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    by_user: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    text_: Mapped[str] = mapped_column("text", Text)
+
+
+class OnboardingItem(Base):
+    __tablename__ = "onboarding_items"
+    __table_args__ = (
+        CheckConstraint("kind IN ('document','information','credential')", name="onboarding_items_kind_check"),
+        CheckConstraint("status IN ('requested','provided','answered','not_available','withdrawn')",
+                        name="onboarding_items_status_check"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    onboarding_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("onboardings.id"))
+    label: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default="requested")
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    note: Mapped[str | None] = mapped_column(Text)
+    answer_text: Mapped[str | None] = mapped_column(Text)  # credentials returned masked by default
+    qualifier: Mapped[str | None] = mapped_column(Text)  # null | audited | unaudited | draft | copy
+    files: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
+    reason: Mapped[str | None] = mapped_column(Text)
+    requested_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    resolved_at: Mapped[datetime | None] = mapped_column(TS)
+    accepted_at: Mapped[datetime | None] = mapped_column(TS)
+
+
 class Duty(Base):
     __tablename__ = "duties"
     __table_args__ = (

@@ -1067,8 +1067,16 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
     duration_ms = (t0 - (p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc))).total_seconds() * 1000
     log_event(db, p, None, f"PROCESS COMPLETE — proposal to engagement letter in {_fmt_dur(duration_ms)}. "
                            f"Audit trail sealed; performance report available to management. "
-                           f"Client documentation proceeds as a separate onboarding workflow per activity.")
+                           f"Client documentation proceeds in Onboarding.")
     pass_holder(db, p, None, user, "")
+
+    # the Onboarding module takes over: one documentation relay per staffed activity
+    from .onboardings import create_for_el_send
+    onboardings = create_for_el_send(db, p, user)
+    if onboardings:
+        log_event(db, p, None, f"Onboarding started for {len(onboardings)} activit"
+                               f"{'y' if len(onboardings) == 1 else 'ies'}: "
+                               f"{', '.join(ob.service for ob in onboardings)}.")
 
     accountants = db.scalars(
         tenant_select(User, user).where(User.role == "Accountant", User.active.is_(True))

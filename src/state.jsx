@@ -113,6 +113,15 @@ const mapPayment = (x, clientsById, refByProposalUuid) => ({
   events: (x.events || []).map((e, i) => ({ id: `${x.id}-e${i}`, at: ms(e.at), by: e.by, text: e.text })),
 });
 
+const mapOnboarding = (o) => ({
+  id: o.id, clientId: o.client_id, clientRef: o.client_ref, clientName: o.client_name,
+  clientContact: o.client_contact, proposalId: o.proposal_id, service: o.service,
+  staffId: o.staff_id, staffName: o.staff_name, managerId: o.manager_id,
+  status: o.status, holder: o.holder, holderSince: ms(o.holder_since),
+  dutyId: o.duty_id, createdAt: ms(o.created_at),
+  openItems: o.open_items, itemCount: o.item_count,
+});
+
 const mapFirm = (t) => ({
   id: t.id, name: t.name, short: t.short, address: t.address || "", trn: t.trn || "",
   phone: t.phone || "", email: t.email, accent: t.accent || "#1E6E56",
@@ -131,6 +140,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
   const [duties, setDuties] = useState([]);
   const [paymentsRaw, setPaymentsRaw] = useState([]);
   const [notices, setNotices] = useState([]);
+  const [onboardingsRaw, setOnboardingsRaw] = useState([]);
   const [sigUses, setSigUses] = useState([]);
   const [toast, setToast] = useState(null);
   const [ready, setReady] = useState(false);
@@ -152,6 +162,8 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     () => api.get("/clients").then(setClientsRaw).catch(() => false), []);
   const refetchDuties = useCallback(
     () => api.get("/duties").then((d) => setDuties(d.map(mapDuty))).catch(() => false), []);
+  const refetchOnboardings = useCallback(
+    () => api.get("/onboardings").then(setOnboardingsRaw).catch(() => false), []);
   const refetchNotices = useCallback(
     () => api.get("/notices").then((n) => setNotices(n.map((x) => ({ id: x.id, userId: me.id, at: ms(x.at), text: x.text, read: x.read })))).catch(() => false),
     [me.id]);
@@ -169,12 +181,12 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     // used to leave the app on the loading screen after a hard refresh)
     const results = await Promise.all([
       refetchUsers(), refetchProposals(), refetchClients(), refetchDuties(),
-      refetchNotices(), refetchPayments(), refetchSigUses(),
+      refetchNotices(), refetchPayments(), refetchSigUses(), refetchOnboardings(),
     ]);
     const coreOk = results[0] !== false && results[1] !== false;
     if (coreOk) setReady(true);
     return coreOk;
-  }, [refetchUsers, refetchProposals, refetchClients, refetchDuties, refetchNotices, refetchPayments, refetchSigUses]);
+  }, [refetchUsers, refetchProposals, refetchClients, refetchDuties, refetchNotices, refetchPayments, refetchSigUses, refetchOnboardings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -210,7 +222,8 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
       if (document.hidden) return; // paused while the tab is hidden
       const { screen } = focusRef.current;
       const jobs = [refetchNotices()]; // notices always
-      if (screen === "dashboard") jobs.push(refetchProposals(), refetchDuties(), refetchPayments());
+      if (screen === "dashboard") jobs.push(refetchProposals(), refetchDuties(), refetchPayments(), refetchOnboardings());
+      if (screen === "onboarding") jobs.push(refetchOnboardings());
       if (screen === "proposals") jobs.push(refetchProposals());
       if (screen === "clients") jobs.push(refetchProposals(), refetchClients(), refetchPayments());
       if (screen === "payments") jobs.push(refetchPayments(), refetchClients());
@@ -245,6 +258,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
       id: c.id, code: c.ref, name: c.name, contact: c.contact,
       pid: pr?.id || null, engagedAt: ms(c.created_at),
       confirmationBasis: c.confirmation_basis || null,
+      unauditedOnFile: !!c.unaudited_on_file,
       services: pr ? (pr.versions.at(-1)?.data.lines || []).map((l) => l.service) : [],
     };
   });
@@ -338,7 +352,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     sendClientEmail: act(async (ref, kind, mail) => {
       const path = kind === "el" ? "el-send" : "send-client";
       const out = await api.post(`/proposals/${uuidOf(ref)}/${path}`, { to: mail.to, subject: mail.subject, body: mail.body });
-      if (kind === "el") pushToast(`EL sent — Onboarding Part 1 complete 🎉`);
+      if (kind === "el") pushToast(`EL sent — Proposal & Engagement complete; documentation continues in Onboarding 🎉`);
       return out;
     }, onRef),
 
@@ -438,6 +452,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
   return (
     <DataCtx.Provider value={{
       ready, me, firm, users, proposals: proposalsMapped, clients, duties, payments,
+      onboardings: onboardingsRaw.map(mapOnboarding),
       notices, sigUses, toast, pushToast, refetchAll, refetchDetail, uuidOf, setFocus,
       actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
       setUsersShim, setFirmShim,

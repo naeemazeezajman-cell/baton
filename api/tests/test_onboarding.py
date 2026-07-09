@@ -477,7 +477,7 @@ def test_el_sent_closes_process_with_report(client):
     texts = [e["text"] for e in detail["events"]]
     assert any("PROCESS COMPLETE — proposal to engagement letter in" in t
                and "Audit trail sealed" in t
-               and "separate onboarding workflow" in t for t in texts)
+               and "Client documentation proceeds in Onboarding." in t for t in texts)
     # closed: chat is read-only after el_sent
     r = act(client, ctx, "manager", pid, "chat", {"text": "too late"}, expect=409)
     assert "read-only" in r["detail"]["reason"]

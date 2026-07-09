@@ -1,26 +1,82 @@
 """Read endpoints backing the production frontend: clients, signature vault, admin export."""
 
+import uuid
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Client, Duty, Payment, Proposal, SignatureUse, User
+from ..models import Client, Duty, File, Onboarding, OnboardingItem, Payment, Proposal, SignatureUse, User
 from ..security import current_user, require_roles
-from ..tenancy import tenant_select
+from ..tenancy import get_scoped_or_404, tenant_select
 
 router = APIRouter(tags=["clients"])
+
+
+def _unaudited_client_ids(db: Session, tenant_id) -> set:
+    rows = db.execute(
+        select(Onboarding.client_id).join(OnboardingItem, OnboardingItem.onboarding_id == Onboarding.id)
+        .where(Onboarding.tenant_id == tenant_id, OnboardingItem.qualifier == "unaudited")
+    ).all()
+    return {r[0] for r in rows}
 
 
 @router.get("/clients")
 def list_clients(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.scalars(tenant_select(Client, user).order_by(Client.created_at)).all()
+    unaudited = _unaudited_client_ids(db, user.tenant_id)
     return [
         {"id": c.id, "ref": c.ref, "name": c.name, "contact": c.contact,
          "from_proposal": c.from_proposal, "confirmation_basis": c.confirmation_basis,
+         "unaudited_on_file": c.id in unaudited,
          "created_at": c.created_at}
         for c in rows
     ]
+
+
+@router.get("/clients/{client_id}/documents")
+def client_documents(client_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Everything on file for a client — proposal-stage uploads plus every onboarding item
+    document — each with source, uploader, date, and qualifier."""
+    client = get_scoped_or_404(db, Client, client_id, user)
+    users_by_id = {u.id: u for u in db.scalars(tenant_select(User, user)).all()}
+    docs = []
+
+    proposal_ids = {p.id: p.ref for p in db.scalars(
+        tenant_select(Proposal, user).where((Proposal.client_id == client.id) | (Proposal.id == client.from_proposal))
+    ).all()}
+    if proposal_ids:
+        for f in db.scalars(select(File).where(File.tenant_id == user.tenant_id, File.entity == "proposal",
+                                               File.entity_id.in_(list(proposal_ids))).order_by(File.at)).all():
+            uploader = users_by_id.get(f.uploaded_by)
+            docs.append({"file_id": f.id, "name": f.name, "size": f.size,
+                         "source": f"Proposal & Engagement ({proposal_ids[f.entity_id]})",
+                         "uploaded_by": uploader.name if uploader else "—",
+                         "at": f.at, "qualifier": None})
+
+    obs = db.scalars(tenant_select(Onboarding, user).where(Onboarding.client_id == client.id)).all()
+    for ob in obs:
+        items = db.scalars(select(OnboardingItem).where(OnboardingItem.onboarding_id == ob.id)).all()
+        for it in items:
+            for fref in it.files:
+                docs.append({"file_id": fref["file_id"], "name": fref["name"], "size": fref.get("size"),
+                             "source": f"Onboarding — {ob.service}", "uploaded_by": "—",
+                             "at": it.resolved_at, "qualifier": it.qualifier})
+    # resolve onboarding uploader names via the files table
+    file_ids = [d["file_id"] for d in docs if d["uploaded_by"] == "—"]
+    if file_ids:
+        frows = {str(f.id): f for f in db.scalars(select(File).where(File.id.in_(file_ids))).all()}
+        for d in docs:
+            f = frows.get(str(d["file_id"]))
+            if f:
+                uploader = users_by_id.get(f.uploaded_by)
+                d["uploaded_by"] = uploader.name if uploader else "—"
+                d["at"] = d["at"] or f.at
+    docs.sort(key=lambda d: (d["at"] is None, d["at"]), reverse=True)
+    return {"client": {"id": client.id, "ref": client.ref, "name": client.name},
+            "unaudited_on_file": any(d["qualifier"] == "unaudited" for d in docs),
+            "documents": docs}
 
 
 @router.get("/signature-uses")

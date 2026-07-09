@@ -321,7 +321,7 @@ function Shell() {
   const auth = useAuth();
   const {
     ready, me, firm, users, proposals, clients, duties, payments, notices, sigUses, toast,
-    actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
+    onboardings, actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
     setUsersShim, setFirmShim, refetchDetail, uuidOf, setFocus,
   } = useData();
   const [route, setRoute] = useState({ screen: "dashboard" });
@@ -348,8 +348,16 @@ function Shell() {
   const myOpenTasks = me ? proposals.filter((p) => p.assignedTo === me.id && !TERMINAL.includes(p.status)) : [];
   const myActivities = me
     ? [
-        ...proposals.flatMap((p) => Object.entries(p.el?.assignments || {}).filter(([, uId]) => uId === me.id).map(([svc]) => ({ pid: p.id, client: p.prospect.name, service: svc, live: p.status === "el_sent" }))),
+        ...proposals.flatMap((p) => Object.entries(p.el?.assignments || {}).filter(([, uId]) => uId === me.id).map(([svc]) => {
+          const ob = onboardings.find((o) => o.proposalId === p.uuid && o.service === svc && o.staffId === me.id);
+          return { pid: p.id, client: p.prospect.name, service: svc, live: p.status === "el_sent",
+                   onboardingId: ob?.id || null, onboardingComplete: ob?.status === "complete" };
+        })),
       ]
+    : [];
+  const onbQueue = me
+    ? onboardings.filter((o) => o.holder === me.id && o.status === "in_progress")
+        .sort((a, b) => (a.holderSince || 0) - (b.holderSince || 0))
     : [];
   const duePayments = payments.filter((x) => !x.done && x.dueAt <= now());
 
@@ -423,7 +431,7 @@ function Shell() {
 
           <main className="flex-1 overflow-y-auto p-6">
             {route.screen === "dashboard" && !isAcct && (
-              <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} />
+              <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} onbQueue={onbQueue} openOnb={(id) => setRoute({ screen: "onboarding", id })} />
             )}
             {(route.screen === "payments" || (route.screen === "dashboard" && isAcct)) && (
               <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} markInvoiceRaised={markInvoiceRaised} recordReceipt={recordReceipt} healthOf={healthOf} />
@@ -431,6 +439,7 @@ function Shell() {
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
             {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
             {route.screen === "performance" && isMgr && <PerformanceScreen />}
+            {route.screen === "onboarding" && route.id && <OnboardingView oid={route.id} me={me} byId={byId} back={() => setRoute({ screen: "dashboard" })} />}
             {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
             {route.screen === "detail" && (
               <Detail p={proposals.find((x) => x.id === route.id)} me={me} byId={byId} now={now} firm={firm} users={users} clients={clients} workloadOf={workloadOf}
@@ -541,7 +550,7 @@ const STATUS_MAP = {
   el_staffing: ["Client confirmed — staffing & EL prep", "var(--ink)"],
   el_senior_review: ["EL — senior signature", "var(--amber)"],
   el_approved: ["EL signed — send to client", "var(--accent)"],
-  el_sent: ["Part 1 ✓ — awaiting Part 2", "var(--accent)"],
+  el_sent: ["Proposal & Engagement ✓ — onboarding underway", "var(--accent)"],
   onboarding_complete: ["Onboarding complete ✓✓", "var(--accent)"],
   lost: ["Lost", "var(--red)"],
 };
@@ -552,7 +561,7 @@ function StatusChip({ s }) {
 
 /* ================================================================== */
 
-function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals, duties, markDutyDone, byId, now, open, gotoNew }) {
+function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals, duties, markDutyDone, byId, now, open, gotoNew, onbQueue = [], openOnb = () => {} }) {
   const myDuties = duties.filter((d) => d.staffId === me.id && !d.closed).sort((a, b) => a.nextDue - b.nextDue);
   const myOverdue = myDuties.filter((d) => d.nextDue < now());
   const allOpenDuties = duties.filter((d) => !d.closed).sort((a, b) => a.nextDue - b.nextDue);
@@ -598,12 +607,36 @@ function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals
           <div className="mt-2 space-y-1">
             {myActivities.map((a, i) => (
               <div key={i} className="bg-white rounded-lg px-3 py-2 text-sm flex items-center gap-3">
-                {a.pid ? <button className="font-medium underline decoration-dotted" onClick={() => open(a.pid)}>{a.client}</button> : <span className="font-medium">{a.client}</span>}
+                {a.pid ? <button className="font-medium underline decoration-dotted" onClick={() => (a.onboardingId ? openOnb(a.onboardingId) : open(a.pid))}>{a.client}</button> : <span className="font-medium">{a.client}</span>}
                 <span className="flex-1 text-xs" style={{ color: "var(--mut)" }}>{a.service}</span>
+                {a.onboardingId && <button onClick={() => openOnb(a.onboardingId)} className="text-[11px] font-semibold underline" style={{ color: "var(--accent)" }}>{a.onboardingComplete ? "Onboarding ✓" : "Open onboarding →"}</button>}
                 <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={a.legacy ? { background: "var(--paper)", color: "var(--mut)" } : a.live ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>{a.legacy ? "Ongoing — pre-Baton" : a.live ? "Live — EL sent" : "Pending EL"}</span>
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {isMgr && onbQueue.length > 0 && (
+        <div className="mb-5 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+          <div className="px-5 pt-4 pb-2">
+            <h2 className="font-disp text-lg font-bold" style={{ color: "var(--ink)" }}>Onboarding requests — baton with you</h2>
+            <p className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>Staff are waiting on these documentation requests, oldest first. The clock runs until every open item is resolved.</p>
+          </div>
+          {onbQueue.map((o, i) => (
+            <button key={o.id} onClick={() => openOnb(o.id)} className="w-full text-left flex items-center gap-4 px-5 py-3.5 border-t hover:bg-gray-50 text-sm" style={{ borderColor: "var(--line)" }}>
+              <div className="font-mono2 text-xs w-6 text-right" style={{ color: "var(--mut)" }}>{i + 1}</div>
+              <div className="w-20 shrink-0">
+                <div className="font-mono2 font-medium" style={{ color: days(now() - (o.holderSince || now())) >= 3 ? "var(--red)" : "var(--amber)" }}>{fmtDur(now() - (o.holderSince || now()))}</div>
+                <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--mut)" }}>waiting</div>
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold truncate">{o.clientName} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>· {o.service}</span></div>
+                <div className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>requested by {o.staffName} · {o.openItems} open item{o.openItems !== 1 && "s"}</div>
+              </div>
+              <div className="text-xs font-medium" style={{ color: "var(--accent)" }}>Open →</div>
+            </button>
+          ))}
         </div>
       )}
 
@@ -675,7 +708,7 @@ function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals
                 el_staffing: ["✓ Client confirmed — staffing & EL prep", "var(--accent)", p.clientSignedProposal?.at],
                 el_senior_review: ["✓ Client confirmed — EL at senior signature", "var(--accent)", p.clientSignedProposal?.at],
                 el_approved: ["✓ Client confirmed — EL signed, ready to send", "var(--accent)", p.clientSignedProposal?.at],
-                el_sent: ["✓✓ EL sent — Onboarding Part 1 complete", "var(--accent)", p.el?.sentAt],
+                el_sent: ["✓✓ EL sent — Proposal & Engagement complete", "var(--accent)", p.el?.sentAt],
               }[p.status];
               return (
                 <button key={p.id} onClick={() => open(p.id)} className="w-full text-left flex items-center gap-4 px-5 py-3 border-b last:border-0 hover:bg-gray-50 text-sm" style={{ borderColor: "var(--line)" }}>
@@ -916,6 +949,7 @@ function ProposalList({ proposals, byId, now, open }) {
 
 function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
   const [perfOpen, setPerfOpen] = useState(null);
+  const [docsOpen, setDocsOpen] = useState(null);
   return (
     <div className="max-w-5xl mx-auto">
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Clients</h1>
@@ -937,6 +971,9 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
               {c.confirmationBasis && c.confirmationBasis !== "signed_upload" && (
                 <span className="ml-1.5 text-[10px] font-normal px-1.5 py-0.5 rounded-full align-middle whitespace-nowrap" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>confirmed without signed proposal</span>
               )}
+              {c.unauditedOnFile && (
+                <span className="ml-1.5 text-[10px] font-bold px-1.5 py-0.5 rounded-full align-middle whitespace-nowrap" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>unaudited financials on file</span>
+              )}
               <div className="text-[11px] font-normal truncate" style={{ color: "var(--mut)" }}>{c.services.join(" · ")}</div></span>
             <span className="text-[11px]" style={{ color: "var(--mut)" }}>
               {team.length === 0 ? "Unassigned" : team.map(([svc, uId]) => <div key={svc} className="truncate">{svc.split(" (")[0]}: <b style={{ color: "var(--ink)" }}>{byId(uId).name.split(" ")[0]}</b></div>)}
@@ -945,14 +982,18 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
             <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtD(c.engagedAt)}</span>
             <span className="text-[11px] px-2 py-0.5 rounded-full font-bold text-center" style={{ background: h.badge[1] + "18", color: h.badge[1] }}>{h.badge[0]}</span>
             </div>
-            {canPerf && (
-              <div className="px-5 pb-2 -mt-1.5">
+            <div className="px-5 pb-2 -mt-1.5 flex gap-4">
+              {canPerf && (
                 <button onClick={() => setPerfOpen(perfOpen === c.id ? null : c.id)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>
                   {perfOpen === c.id ? "Hide performance & task history ▾" : "★ Performance & task history ▸"}
                 </button>
-              </div>
-            )}
+              )}
+              <button onClick={() => setDocsOpen(docsOpen === c.id ? null : c.id)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>
+                {docsOpen === c.id ? "Hide documents ▾" : "📁 Documents ▸"}
+              </button>
+            </div>
             {canPerf && perfOpen === c.id && <div className="px-5 pb-4"><ClientPerformance clientId={c.id} /></div>}
+            {docsOpen === c.id && <div className="px-5 pb-4"><ClientDocuments clientId={c.id} /></div>}
             </div>
           );
         })}
@@ -1203,7 +1244,7 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
             <StatusChip s={p.status} />
             <span>Requested by <b style={{ color: "var(--ink)" }}>{byId(p.requestedBy).name}</b></span>·
             <span>Drafter <b style={{ color: "var(--ink)" }}>{byId(p.assignedTo).name}</b></span>·
-            {p.holder ? <span>baton with <b style={{ color: "var(--ink)" }}>{byId(p.holder).name}</b></span> : <span>{p.status === "proposal_sent" ? "awaiting client confirmation" : p.status === "el_sent" ? "Part 1 complete" : "closed"}</span>}
+            {p.holder ? <span>baton with <b style={{ color: "var(--ink)" }}>{byId(p.holder).name}</b></span> : <span>{p.status === "proposal_sent" ? "awaiting client confirmation" : p.status === "el_sent" ? "Proposal & Engagement complete" : "closed"}</span>}
           </div>
         </div>
       </div>
@@ -1901,7 +1942,7 @@ function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequ
     <div className="mt-5 space-y-5">
       {/* stage rail */}
       <div className="bg-white border rounded-xl p-4 flex items-center gap-2 text-[11px] font-medium overflow-x-auto" style={{ borderColor: "var(--line)" }}>
-        {[["signed", "Proposal signed"], ["proposal_sent", "Sent to client"], ["el_staffing", "Client confirmed · staffing"], ["el_senior_review", "EL — senior signature"], ["el_approved", "EL signed"], ["el_sent", "EL sent — Part 1 complete"]].map(([k, l], i, arr) => {
+        {[["signed", "Proposal signed"], ["proposal_sent", "Sent to client"], ["el_staffing", "Client confirmed · staffing"], ["el_senior_review", "EL — senior signature"], ["el_approved", "EL signed"], ["el_sent", "EL sent — complete"]].map(([k, l], i, arr) => {
           const order = arr.findIndex(([kk]) => kk === p.status);
           const done = i <= (order === -1 ? (p.status === "lost" ? -1 : 99) : order);
           return (
@@ -2122,21 +2163,21 @@ function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequ
             )}
 
             {p.status === "el_approved" && iAmRequester && (
-              <ActionCard title="Send the signed engagement letter" sub={`Draft goes to ${p.prospect.email} with the signed EL PDF attached — check, edit if needed, and approve to send. This completes Onboarding Part 1.`}>
+              <ActionCard title="Send the signed engagement letter" sub={`Draft goes to ${p.prospect.email} with the signed EL PDF attached — check, edit if needed, and approve to send. This completes Proposal & Engagement.`}>
                 <button onClick={() => openMail("el")} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>✉️ Send to client</button>
               </ActionCard>
             )}
 
             {p.status === "el_sent" && client && (
               <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}>
-                <h3 className="font-disp font-bold text-sm" style={{ color: "var(--accent)" }}>🎉 Onboarding Part 1 complete — client {client.code}</h3>
+                <h3 className="font-disp font-bold text-sm" style={{ color: "var(--accent)" }}>🎉 Proposal & Engagement complete — client {client.code}</h3>
                 <div className="text-xs mt-2 space-y-1" style={{ color: "var(--ink)" }}>
                   <div>✓ Client-signed proposal on file</div>
                   <div>✓ Engagement letter signed & sent {p.el.sentAt && fmtDT(p.el.sentAt)}</div>
                   <div>✓ Team assigned per activity — staff notified their duties are live</div>
                   <div>✓ Payment schedule with the accountant — daily reminders until each receipt is updated</div>
                 </div>
-                <p className="text-[11px] mt-3" style={{ color: "var(--mut)" }}>The onboarding process and audit trail remain open — next is Onboarding Part 2 (client documentation & master file). Closure + the management performance report are issued only when both parts finish.</p>
+                <p className="text-[11px] mt-3" style={{ color: "var(--mut)" }}>This trail is sealed and the performance report is available to management. Client documentation proceeds in Onboarding — each staffed activity now runs its own documentation relay from the dashboard.</p>
               </section>
             )}
           </div>
@@ -2272,6 +2313,335 @@ const Stars = ({ n }) => (
     <span className="ml-1.5 text-[11px]" style={{ color: "var(--mut)" }}>{n.toFixed(1)}</span>
   </span>
 );
+
+/* ---------- Onboarding module: per-activity documentation relay ---------- */
+
+const QUAL_STYLE = {
+  audited: { background: "var(--accent-soft)", color: "var(--accent)" },
+  unaudited: { background: "var(--amber-soft)", color: "var(--amber)" },
+  draft: { background: "var(--amber-soft)", color: "var(--amber)" },
+  copy: { background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" },
+};
+const OB_CHIP = {
+  requested: ["Requested", "var(--amber)"],
+  provided: ["Provided", "var(--accent)"],
+  answered: ["Answered", "var(--accent)"],
+  not_available: ["Not available", "var(--red)"],
+  withdrawn: ["Withdrawn", "var(--mut)"],
+};
+
+function ClientDocuments({ clientId }) {
+  const [r, setR] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    api.get(`/clients/${clientId}/documents`).then(setR).catch((e) => setErr(e.message));
+  }, [clientId]);
+  if (err) return <div className="text-xs" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!r) return <div className="text-xs" style={{ color: "var(--mut)" }}>Loading documents…</div>;
+  return (
+    <div className="rounded-lg border p-3" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+      <div className="flex items-center gap-2 mb-1.5">
+        <div className="text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Documents on file ({r.documents.length})</div>
+        {r.unaudited_on_file && <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>unaudited financials on file</span>}
+      </div>
+      {r.documents.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>Nothing on file yet.</div>}
+      {r.documents.map((d, i) => (
+        <div key={i} className="bg-white border rounded-md px-3 py-2 mb-1.5 flex items-center gap-3 text-xs flex-wrap" style={{ borderColor: "var(--line)" }}>
+          <span className="flex-1 min-w-[160px]"><FileLink name={d.name} url={`api://file/${d.file_id}`} size={d.size} /></span>
+          <span style={{ color: "var(--mut)" }}>{d.source}</span>
+          <span style={{ color: "var(--mut)" }}>{d.uploaded_by}{d.at ? ` · ${fmtD(new Date(d.at).getTime())}` : ""}</span>
+          {d.qualifier && <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={QUAL_STYLE[d.qualifier] || {}}>{d.qualifier}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
+  const iAmStaff = me.id === ob.staff_id;
+  const iAmManager = me.id === ob.manager_id;
+  const managerTurn = iAmManager && ob.holder === me.id && it.status === "requested" && ob.status === "in_progress";
+  const [val, setVal] = useState("");
+  const [qual, setQual] = useState("");
+  const [files, setFiles] = useState([]);
+  const [naMode, setNaMode] = useState(false);
+  const [naReason, setNaReason] = useState("");
+  const [rrMode, setRrMode] = useState(false);
+  const [rrReason, setRrReason] = useState("");
+  const [wdMode, setWdMode] = useState(false);
+  const [wdReason, setWdReason] = useState("");
+  const chip = OB_CHIP[it.status] || [it.status, "var(--mut)"];
+
+  const provide = () => run(async () => {
+    const fd = new FormData();
+    if (val.trim()) fd.append("answer_text", val.trim());
+    if (qual) fd.append("qualifier", qual);
+    for (const f of files) {
+      const raw = rawFromUrl(f.url);
+      if (raw) fd.append("evidence", raw, f.name);
+    }
+    await api.postForm(`/onboardings/${oid}/items/${it.id}/provide`, fd);
+  });
+
+  return (
+    <div className="border rounded-lg p-3" style={{ borderColor: "var(--line)" }}>
+      <div className="flex items-center gap-2 text-sm flex-wrap">
+        <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{it.kind}</span>
+        <span className="flex-1 font-medium">{it.label}</span>
+        {it.accepted_at && <span className="text-[10px] font-bold" style={{ color: "var(--accent)" }}>✓ accepted</span>}
+        <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: chip[1] + "18", color: chip[1] }}>{chip[0]}</span>
+      </div>
+      {it.note && <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>Note: {it.note}</div>}
+      {it.reason && <div className="text-xs mt-1" style={{ color: "var(--red)" }}>Reason: {it.reason}</div>}
+      {it.files.length > 0 && (
+        <div className="text-xs mt-1.5 flex gap-2 flex-wrap items-center">
+          {it.files.map((f, i) => <FileLink key={i} name={f.name} url={`api://file/${f.file_id}`} size={f.size} />)}
+          {it.qualifier && <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={QUAL_STYLE[it.qualifier] || {}}>{it.qualifier}</span>}
+        </div>
+      )}
+      {it.kind !== "credential" && it.answer_text && <div className="text-xs mt-1.5 font-mono2">↳ {it.answer_text}</div>}
+      {it.kind === "credential" && it.answer_text && (
+        <div className="text-xs mt-1.5 font-mono2 flex items-center gap-2">
+          ↳ {revealed[it.id] || it.answer_text}
+          {!revealed[it.id] && (
+            <button onClick={() => run(async () => {
+              const r = await api.get(`/onboardings/${oid}/items/${it.id}/reveal`);
+              setRevealed((m) => ({ ...m, [it.id]: r.value }));
+            })} className="underline font-sans" style={{ color: "var(--amber)" }}>Reveal — viewing is logged</button>
+          )}
+        </div>
+      )}
+
+      {managerTurn && (
+        <div className="mt-2.5 space-y-1.5">
+          {!naMode ? (
+            <div className="flex gap-2 items-center flex-wrap">
+              {it.kind === "document" ? (
+                <>
+                  <FilePick small multiple label="Upload document(s)" onFiles={(fs) => setFiles([...files, ...fs])} />
+                  {files.map((f, i) => <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}>{f.name} <button onClick={() => setFiles(files.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button></span>)}
+                  <select value={qual} onChange={(e) => setQual(e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                    <option value="">No qualifier</option><option value="audited">Audited</option><option value="unaudited">Unaudited</option><option value="draft">Draft</option><option value="copy">Copy</option>
+                  </select>
+                  <button disabled={files.length === 0} onClick={provide} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Provide</button>
+                </>
+              ) : (
+                <>
+                  <input value={val} onChange={(e) => setVal(e.target.value)} type={it.kind === "credential" ? "password" : "text"} placeholder={it.kind === "credential" ? "Credential — stored server-side, returned masked" : "Type the information"} className="flex-1 min-w-[220px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <button disabled={!val.trim()} onClick={provide} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Answer</button>
+                </>
+              )}
+              <button onClick={() => setNaMode(true)} className="px-2.5 py-1.5 rounded-md border text-xs" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>Not available</button>
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <input value={naReason} onChange={(e) => setNaReason(e.target.value)} placeholder="Mandatory reason — why can't this be obtained?" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button disabled={!naReason.trim()} onClick={() => { run(() => api.post(`/onboardings/${oid}/items/${it.id}/not-available`, { reason: naReason.trim() })); setNaMode(false); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--amber)" }}>Mark not available</button>
+              <button onClick={() => setNaMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {iAmStaff && ob.status === "in_progress" && ["provided", "answered", "not_available"].includes(it.status) && (
+        <div className="mt-2 flex gap-3 items-center flex-wrap text-xs">
+          {!it.accepted_at && <button onClick={() => run(() => api.post(`/onboardings/${oid}/items/${it.id}/accept`))} className="underline font-medium" style={{ color: "var(--accent)" }}>Accept</button>}
+          {!rrMode ? (
+            <button onClick={() => setRrMode(true)} className="underline" style={{ color: "var(--amber)" }}>Re-request…</button>
+          ) : (
+            <span className="flex gap-2 flex-1 min-w-[240px]">
+              <input value={rrReason} onChange={(e) => setRrReason(e.target.value)} placeholder="Why is this insufficient?" className="flex-1 border rounded-md px-2 py-1 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button disabled={!rrReason.trim()} onClick={() => { run(() => api.post(`/onboardings/${oid}/items/${it.id}/re-request`, { reason: rrReason.trim() })); setRrMode(false); }} className="px-2.5 py-1 rounded-md text-white font-semibold disabled:opacity-40" style={{ background: "var(--amber)" }}>Re-request</button>
+            </span>
+          )}
+        </div>
+      )}
+      {iAmStaff && ob.status === "in_progress" && ["requested", "provided", "answered", "not_available"].includes(it.status) && (
+        <div className="mt-1.5">
+          {!wdMode ? (
+            <button onClick={() => setWdMode(true)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>Withdraw this request (no longer needed)</button>
+          ) : (
+            <div className="flex gap-2">
+              <input value={wdReason} onChange={(e) => setWdReason(e.target.value)} placeholder="Mandatory reason" className="flex-1 border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button disabled={!wdReason.trim()} onClick={() => { run(() => api.post(`/onboardings/${oid}/items/${it.id}/withdraw`, { reason: wdReason.trim() })); setWdMode(false); }} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--mut)" }}>Withdraw</button>
+              <button onClick={() => setWdMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OnboardingView({ oid, me, byId, back }) {
+  const { pushToast, refetchAll } = useData();
+  const [ob, setOb] = useState(null);
+  const [err, setErr] = useState(null);
+  const [docs, setDocs] = useState(null);
+  const [newLabel, setNewLabel] = useState("");
+  const [newKind, setNewKind] = useState("document");
+  const [trailOpen, setTrailOpen] = useState(false);
+  const [completeMode, setCompleteMode] = useState(false);
+  const [cadence, setCadence] = useState("monthly");
+  const [firstDue, setFirstDue] = useState("");
+  const [cName, setCName] = useState("");
+  const [cEmail, setCEmail] = useState("");
+  const [revealed, setRevealed] = useState({});
+
+  const load = async () => {
+    try {
+      const o = await api.get(`/onboardings/${oid}`);
+      setOb(o);
+      setCName((v) => v || o.client_contact?.contactPerson || o.client_contact?.name || "");
+      setCEmail((v) => v || o.client_contact?.email || "");
+      api.get(`/clients/${o.client_id}/documents`).then(setDocs).catch(() => setDocs({ documents: [], unaudited_on_file: false }));
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+  useEffect(() => { load(); }, [oid]); // eslint-disable-line react-hooks/exhaustive-deps
+  const run = async (fn) => {
+    try {
+      await fn();
+      await load();
+      refetchAll();
+    } catch (e) {
+      pushToast(`⚠️ ${e.message}`);
+    }
+  };
+
+  if (err) return <div className="max-w-4xl mx-auto text-sm" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!ob) return <div className="max-w-4xl mx-auto text-sm" style={{ color: "var(--mut)" }}>Loading onboarding…</div>;
+
+  const iAmStaff = me.id === ob.staff_id;
+  const iHold = ob.holder === me.id;
+  const openItems = (ob.items || []).filter((i) => i.status === "requested");
+  const proposalDocs = (docs?.documents || []).filter((d) => d.source.startsWith("Proposal & Engagement"));
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      <button onClick={back} className="text-xs font-medium mb-3" style={{ color: "var(--mut)" }}>← Back to dashboard</button>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>
+            {ob.client_name} <span className="font-mono2 text-base" style={{ color: "var(--accent)" }}>· {ob.client_ref}</span>
+          </h1>
+          <div className="text-sm mt-1 flex items-center gap-2 flex-wrap" style={{ color: "var(--mut)" }}>
+            <span className="font-medium" style={{ color: "var(--ink)" }}>Onboarding — {ob.service}</span>
+            {ob.status === "complete"
+              ? <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>Complete ✓</span>
+              : <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>In progress</span>}
+            {docs?.unaudited_on_file && <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>unaudited financials on file</span>}
+            <span>staff <b style={{ color: "var(--ink)" }}>{ob.staff_name}</b></span>·
+            <span>manager <b style={{ color: "var(--ink)" }}>{byId(ob.manager_id).name}</b></span>
+            {ob.status === "in_progress" && ob.holder && (
+              <span>· baton with <b style={{ color: "var(--ink)" }}>{byId(ob.holder).name}</b> for <span className="font-mono2">{fmtDur(Date.now() - new Date(ob.holder_since).getTime())}</span></span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <section className="mt-4 bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+        <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Already on file from Proposal & Engagement ({proposalDocs.length})</h3>
+        <div className="mt-2 space-y-1.5">
+          {proposalDocs.map((d, i) => (
+            <div key={i} className="text-xs font-mono2 flex items-center gap-2 px-2.5 py-1.5 rounded-md border" style={{ borderColor: "var(--line)" }}>
+              <span className="flex-1 truncate"><FileLink name={d.name} url={`api://file/${d.file_id}`} size={d.size} /></span>
+              <span className="shrink-0" style={{ color: "var(--mut)" }}>{d.uploaded_by}{d.at ? ` · ${fmtDT(new Date(d.at).getTime())}` : ""}</span>
+            </div>
+          ))}
+          {proposalDocs.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>Nothing carried over.</div>}
+        </div>
+      </section>
+
+      <section className="mt-4 bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+        <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Documentation checklist</h3>
+        <p className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>The same relay discipline as the proposal: requests pass the baton to the manager; when every open item is resolved it returns automatically. Every step is on the trail.</p>
+        <div className="mt-3 space-y-2">
+          {(ob.items || []).map((it) => (
+            <ObItem key={it.id} it={it} ob={ob} me={me} byId={byId} run={run} oid={oid} revealed={revealed} setRevealed={setRevealed} />
+          ))}
+          {(ob.items || []).length === 0 && <div className="text-xs py-2" style={{ color: "var(--mut)" }}>No items requested yet{iAmStaff ? " — build your first request round below." : "."}</div>}
+        </div>
+
+        {iAmStaff && iHold && ob.status === "in_progress" && (
+          <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
+            <div className="text-xs font-semibold mb-2" style={{ color: "var(--mut)" }}>Request from {byId(ob.manager_id).name}</div>
+            <div className="flex gap-2">
+              <select value={newKind} onChange={(e) => setNewKind(e.target.value)} className="border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+                <option value="document">Document</option><option value="information">Information</option><option value="credential">Credential</option>
+              </select>
+              <input value={newLabel} onChange={(e) => setNewLabel(e.target.value)} placeholder={newKind === "credential" ? "e.g. FTA portal login" : newKind === "document" ? "e.g. Trade license copy / FY2025 financials" : "e.g. Confirm VAT registration date"} className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+              <button disabled={!newLabel.trim()} onClick={() => { run(() => api.post(`/onboardings/${oid}/items`, { items: [{ label: newLabel.trim(), kind: newKind }] })); setNewLabel(""); }} className="px-3 py-2 rounded-md border text-sm font-medium disabled:opacity-40" style={{ borderColor: "var(--line)" }}>Add</button>
+            </div>
+            {openItems.length > 0 && (
+              <button onClick={() => run(() => api.post(`/onboardings/${oid}/send-requests`))} className="mt-3 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--amber)" }}>
+                Send {openItems.length} request{openItems.length !== 1 && "s"} to {byId(ob.manager_id).name} — baton passes to them
+              </button>
+            )}
+          </div>
+        )}
+
+        {iAmStaff && ob.status === "in_progress" && openItems.length === 0 && (ob.items || []).length > 0 && (
+          <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
+            {!completeMode ? (
+              <button onClick={() => setCompleteMode(true)} className="px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+                Documentation complete — start recurring work
+              </button>
+            ) : (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Create the recurring duty — deadlines are computed automatically from the first statutory due date. One-off services use cadence "one-time".</div>
+                <div className="flex gap-2 flex-wrap items-center">
+                  <select value={cadence} onChange={(e) => setCadence(e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                    {["monthly", "quarterly", "half-yearly", "annual", "one-time"].map((c) => <option key={c}>{c}</option>)}
+                  </select>
+                  <input type="date" value={firstDue} onChange={(e) => setFirstDue(e.target.value)} title="First statutory due date" className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <input value={cName} onChange={(e) => setCName(e.target.value)} placeholder="Client contact person" className="border rounded-md px-2 py-1.5 text-xs w-44" style={{ borderColor: "var(--line)" }} />
+                  <input value={cEmail} onChange={(e) => setCEmail(e.target.value)} placeholder="Contact email" className="border rounded-md px-2 py-1.5 text-xs w-52" style={{ borderColor: "var(--line)" }} />
+                </div>
+                <div className="flex gap-2 items-center">
+                  <button disabled={!firstDue || !cEmail.trim()} onClick={() => run(async () => {
+                    await api.post(`/onboardings/${oid}/complete`, {
+                      cadence, first_due: new Date(firstDue + "T12:00:00").toISOString(),
+                      contact_name: cName.trim(), contact_email: cEmail.trim(),
+                    });
+                    pushToast(`Onboarding complete — ${ob.service} is now under deadline tracking`);
+                    setCompleteMode(false);
+                  })} className="px-4 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+                    Complete & create duty
+                  </button>
+                  <button onClick={() => setCompleteMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {ob.status === "complete" && (
+          <div className="mt-4 text-sm px-3 py-2.5 rounded-lg font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+            ✓ Onboarding complete — the recurring duty is live in the deadline engine. Trail sealed below.
+          </div>
+        )}
+      </section>
+
+      <section className="mt-4 bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+        <button onClick={() => setTrailOpen(!trailOpen)} className="w-full text-left flex items-center justify-between">
+          <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Trail ({(ob.events || []).length})</h3>
+          <span style={{ color: "var(--mut)" }}>{trailOpen ? "▾" : "▸"}</span>
+        </button>
+        {trailOpen && (
+          <div className="mt-3">
+            {(ob.events || []).map((e, i) => (
+              <div key={i} className="text-xs py-1.5 border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+                <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(new Date(e.at).getTime())} · {e.by ? byId(e.by).name : "SYSTEM"}</span> — {e.text}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
 
 /* ---------- firm-wide performance (management only) ---------- */
 

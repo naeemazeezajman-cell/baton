@@ -6,17 +6,19 @@ Idempotent per day — a digest_runs row records the last run (unique on run_dat
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import emails
 from .db import SessionLocal
-from .models import DigestRun, Duty, Notice, Payment, Tenant, User
+from .models import Client, DigestRun, Duty, Notice, Onboarding, OnboardingItem, Payment, Tenant, User
 from .workflow import now
+
+ONBOARDING_AGING_DAYS = 3  # baton held this long without movement joins the daily digest
 
 log = logging.getLogger("baton.scheduler")
 
@@ -44,30 +46,65 @@ def run_daily_digest(db: Session, force: bool = False) -> dict:
     for tenant in db.scalars(select(Tenant)).all():
         users = {u.id: u for u in db.scalars(select(User).where(User.tenant_id == tenant.id, User.active.is_(True)))}
 
-        # per-user overdue duties
+        # per-user overdue duties + aging onboarding requests (whoever holds the baton)
         overdue = db.scalars(select(Duty).where(
             Duty.tenant_id == tenant.id, Duty.closed.is_(False), Duty.next_due < t
         ).order_by(Duty.next_due)).all()
         by_staff: dict = {}
         for d in overdue:
             by_staff.setdefault(d.staff_id, []).append(d)
-        for staff_id, duties in by_staff.items():
-            u = users.get(staff_id)
+
+        aging = db.scalars(select(Onboarding).where(
+            Onboarding.tenant_id == tenant.id, Onboarding.status == "in_progress",
+            Onboarding.holder.is_not(None),
+            Onboarding.holder_since < t - timedelta(days=ONBOARDING_AGING_DAYS),
+        ).order_by(Onboarding.holder_since)).all()
+        by_holder: dict = {}
+        for ob in aging:
+            by_holder.setdefault(ob.holder, []).append(ob)
+        clients_by_id = {c.id: c for c in db.scalars(select(Client).where(Client.tenant_id == tenant.id))}
+        open_counts = dict(db.execute(
+            select(OnboardingItem.onboarding_id, func.count()).where(
+                OnboardingItem.tenant_id == tenant.id, OnboardingItem.status == "requested"
+            ).group_by(OnboardingItem.onboarding_id)
+        ).all()) if aging else {}
+
+        for uid_ in set(by_staff) | set(by_holder):
+            u = users.get(uid_)
             if not u:
                 continue
-            lines = [
-                f"- {d.client_name} — {d.service}: due {d.next_due:%d %b %Y} "
-                f"({max(1, round((t - d.next_due).total_seconds() / 86400))}d overdue)"
-                for d in duties
-            ]
-            body = (f"Good morning {u.name},\n\n"
-                    f"You have {len(duties)} overdue dut{'y' if len(duties) == 1 else 'ies'} on Baton:\n\n"
-                    + "\n".join(lines) +
-                    "\n\nComplete each with proof of work (deliverables / filed returns), or declare "
-                    "completion with a reason. Reminders repeat daily until the deadline is met.\n\n— Baton")
-            emails._send(u.email, f"Baton — {len(duties)} overdue deadline(s)", body)
+            duties = by_staff.get(uid_, [])
+            obs = by_holder.get(uid_, [])
+            sections, notice_bits = [], []
+            if duties:
+                lines = [
+                    f"- {d.client_name} — {d.service}: due {d.next_due:%d %b %Y} "
+                    f"({max(1, round((t - d.next_due).total_seconds() / 86400))}d overdue)"
+                    for d in duties
+                ]
+                sections.append(f"You have {len(duties)} overdue dut{'y' if len(duties) == 1 else 'ies'}:\n\n"
+                                + "\n".join(lines) +
+                                "\n\nComplete each with proof of work (deliverables / filed returns), or declare "
+                                "completion with a reason.")
+                notice_bits.append(f"{len(duties)} overdue dut{'y' if len(duties) == 1 else 'ies'}")
+            if obs:
+                lines = [
+                    f"- {clients_by_id.get(ob.client_id).name if clients_by_id.get(ob.client_id) else '—'} — "
+                    f"{ob.service}: baton with you for "
+                    f"{max(1, round((t - ob.holder_since).total_seconds() / 86400))}d"
+                    f"{f' ({open_counts[ob.id]} open item(s))' if open_counts.get(ob.id) else ''}"
+                    for ob in obs
+                ]
+                sections.append(f"{len(obs)} onboarding request(s) are aging with you:\n\n" + "\n".join(lines) +
+                                "\n\nPass the baton — provide or resolve the open items, or send your requests.")
+                notice_bits.append(f"{len(obs)} aging onboarding request(s)")
+            body = (f"Good morning {u.name},\n\n" + "\n\n".join(sections) +
+                    "\n\nReminders repeat daily until each item moves.\n\n— Baton")
+            subject_bits = ([f"{len(duties)} overdue deadline(s)"] if duties else []) + \
+                           ([f"{len(obs)} aging onboarding(s)"] if obs else [])
+            emails._send(u.email, "Baton — " + ", ".join(subject_bits), body)
             db.add(Notice(tenant_id=tenant.id, user_id=u.id,
-                          text_=f"Daily digest: {len(duties)} overdue dut{'y' if len(duties) == 1 else 'ies'} need your action"))
+                          text_=f"Daily digest: {' and '.join(notice_bits)} need your action"))
             sent_duty += 1
 
         # per-accountant receivables
