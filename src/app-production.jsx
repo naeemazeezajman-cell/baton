@@ -117,28 +117,8 @@ function diffDrafts(prev, next) {
   return out;
 }
 
-/* AI drafting assistant — rewrites rough commercial notes into client-ready wording.
-   Strict: preserves every figure/frequency/deadline; returns null on any failure. */
-async function polishPaymentTerms(rough) {
-  try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        messages: [{
-          role: "user",
-          content: `You are drafting for a professional accounting & tax consultancy in the UAE. Rewrite the rough payment-terms note below into polished, client-ready wording for a services proposal.\n\nStrict rules:\n- Preserve EVERY amount, percentage, frequency, service name and deadline exactly as given — do not add, drop or change any commercial fact.\n- One short professional paragraph or clean semicolon-separated clauses. Formal but plain English. Fix all spelling and grammar (e.g. "quaterly" → "quarterly", "Ct filling" → "Corporate Tax filing").\n- If the note is already professional, return it unchanged.\n- Return ONLY the rewritten text, no preamble, no quotes.\n\nRough note: "${rough}"`
-        }],
-      }),
-    });
-    const data = await r.json();
-    const text = (data.content || []).filter((i) => i.type === "text").map((i) => i.text).join("").trim();
-    return text || null;
-  } catch { return null; }
-}
-
+/* The AI drafting assistant runs SERVER-SIDE in production (POST /proposals/{id}/polish-terms
+   via actions.polishTerms) — the API key never reaches the browser. */
 /* real file picker — files kept in browser memory for the session */
 function FilePick({ label = "Choose file(s)", multiple = false, onFiles, small = false }) {
   const id = useMemo(uid, []);
@@ -1378,7 +1358,7 @@ function Workspace({ p, me, byId, actions, iAmDrafter, iAmRequester, iHoldBaton,
           <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
             <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Draft the proposal</h3>
             <p className="text-xs mt-0.5 mb-3" style={{ color: "var(--mut)" }}>Structured fields — the document is generated from these, never typed by hand.</p>
-            <DraftForm draft={draft} setDraft={setDraft} />
+            <DraftForm draft={draft} setDraft={setDraft} onPolish={(rough) => actions.polishTerms(p.id, rough)} />
             <div className="flex items-center gap-2 mt-3 flex-wrap">
               <button onClick={async () => { setGenBusy(true); await actions.generateVersion(p.id, draft, p.versions.length ? `redrafted by ${me.name.split(" ")[0]}` : `drafted by ${me.name.split(" ")[0]}`); setGenBusy(false); gotoDoc(); }} disabled={genBusy || draft.lines.some((l) => !l.fee) || !draft.paymentTerms} className="px-4 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--ink)" }}>
                 {genBusy ? "Generating — professionalizing wording…" : `Generate proposal v${p.versions.length + 1} — preview first`}
@@ -1513,13 +1493,13 @@ function Slot({ s, p, me, byId, actions, iAmDrafter, iAmRequester }) {
   );
 }
 
-function DraftForm({ draft, setDraft }) {
+function DraftForm({ draft, setDraft, onPolish }) {
   const [polishing, setPolishing] = useState(false);
   const [suggest, setSuggest] = useState(null);
 
   const polish = async () => {
     setPolishing(true); setSuggest(null);
-    const text = await polishPaymentTerms(draft.paymentTerms);
+    const text = await onPolish(draft.paymentTerms);
     setSuggest(text || "__err");
     setPolishing(false);
   };
@@ -1711,7 +1691,7 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
               </div>
             ) : (
               <>
-                <DraftForm draft={draft} setDraft={setDraft} />
+                <DraftForm draft={draft} setDraft={setDraft} onPolish={(rough) => actions.polishTerms(p.id, rough)} />
                 <div className="flex gap-2 mt-3">
                   <button disabled={genBusy} onClick={async () => { setGenBusy(true); await actions.generateVersion(p.id, draft, `terms revised by ${me.name.split(" ")[0]}`); setGenBusy(false); setEdit(false); }} className="px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>{genBusy ? "Professionalizing…" : `Regenerate v${p.versions.length + 1}`}</button>
                   <button onClick={() => setEdit(false)} className="px-3 py-2 rounded-md border text-sm" style={{ borderColor: "var(--line)" }}>Cancel</button>
@@ -1751,7 +1731,7 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
               </div>
             ) : (
               <>
-                <DraftForm draft={draft} setDraft={setDraft} />
+                <DraftForm draft={draft} setDraft={setDraft} onPolish={(rough) => actions.polishTerms(p.id, rough)} />
                 <div className="flex gap-2 mt-3">
                   <button disabled={genBusy} onClick={async () => { setGenBusy(true); await actions.generateVersion(p.id, draft, `revised at senior review by ${me.name.split(" ")[0]}`); setGenBusy(false); setEdit(false); }} className="px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "#5C4A8A" }}>{genBusy ? "Professionalizing…" : `Regenerate v${p.versions.length + 1}`}</button>
                   <button onClick={() => setEdit(false)} className="px-3 py-2 rounded-md border text-sm bg-white" style={{ borderColor: "var(--line)" }}>Cancel</button>

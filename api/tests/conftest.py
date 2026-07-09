@@ -5,6 +5,7 @@ import os
 
 os.environ["DATABASE_URL"] = "postgresql+psycopg://baton:baton@localhost:5433/baton_test"
 os.environ["EMAIL_CONN"] = ""  # force console email mode in tests
+os.environ["ANTHROPIC_API_KEY"] = ""  # tests must exercise the raw-text fallback, never the live API
 
 import pytest
 from fastapi.testclient import TestClient

@@ -311,6 +311,17 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     generateVersion: act((ref, draft, note) =>
       api.post(`/proposals/${uuidOf(ref)}/generate`, { draft: unmapDraft(draft), note }), onRef),
 
+    /* server-side AI rewording — returns the polished text, or null so the form shows its
+       "couldn't reach the drafting assistant" note (fallback / guard refusals) */
+    polishTerms: async (ref, rough) => {
+      try {
+        const r = await api.post(`/proposals/${uuidOf(ref)}/polish-terms`, { rough_text: rough });
+        return r.polished ? r.polished_text : null;
+      } catch {
+        return null;
+      }
+    },
+
     submitToManager: act((ref) => api.post(`/proposals/${uuidOf(ref)}/submit`, { version: byRef[ref].versions.length }), onRef),
     sendForRevision: act((ref, comment) => api.post(`/proposals/${uuidOf(ref)}/send-for-revision`, { comment }), onRef),
     sendChat: act((ref, text) => api.post(`/proposals/${uuidOf(ref)}/chat`, { text }), onRef),

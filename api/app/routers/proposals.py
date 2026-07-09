@@ -499,6 +499,25 @@ def start_drafting(pid: uuid.UUID, user: User = Depends(current_user), db: Sessi
 
 # ---------- document generation / review / signatures ----------
 
+class PolishIn(BaseModel):
+    rough_text: str = Field(min_length=1)
+
+
+DRAFTING_STATUSES = ("assigned", "drafting", "waiver_review", "manager_review", "senior_review")
+
+
+@router.post("/{pid}/polish-terms")
+def polish_terms(pid: uuid.UUID, body: PolishIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """AI rewording (STRUCTURE.md §8) — server-side Anthropic call, key never reaches the
+    browser. Graceful fallback: on any error the raw text comes back with polished=false."""
+    p = _get(db, pid, user)
+    require_holder(p, user)
+    require_status(p, *DRAFTING_STATUSES)
+    polished = ai.polish_payment_terms(body.rough_text)
+    if polished:
+        return {"polished_text": polished, "polished": True}
+    return {"polished_text": body.rough_text, "polished": False}
+
 @router.post("/{pid}/generate")
 def generate(pid: uuid.UUID, body: GenerateIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Compose the proposal document (prototype generateVersion). AI-professionalizes the

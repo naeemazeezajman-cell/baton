@@ -231,6 +231,16 @@ def test_conversion_on_upload_signed(client):
         files={"file": ("dup.pdf", b"%PDF", "application/pdf")})
 
 
+def test_polish_terms_fallback_and_guards(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    # no ANTHROPIC_API_KEY in tests → graceful fallback returns the raw text unchanged
+    r = act(client, ctx, "staff", pid, "polish-terms", {"rough_text": "50% advance, blance on delivery"})
+    assert r == {"polished_text": "50% advance, blance on delivery", "polished": False}
+    # holder-only: the manager does not hold the baton at 'assigned'
+    act(client, ctx, "manager", pid, "polish-terms", {"rough_text": "x"}, expect=409)
+
+
 def test_duplicate_prospect_guard(client):
     ctx = setup_firm(client)
     create_proposal(client, ctx)  # "Gulf Horizon Trading LLC" → P-001
