@@ -36,6 +36,11 @@ def send_invite(to: str, name: str, firm: str, set_password_link: str, temp_pass
     _send(to, f"You've been invited to {firm} on Baton", body)
 
 
+def send_client(to: str, subject: str, body: str) -> None:
+    """Client-facing send (proposal / engagement letter emails)."""
+    _send(to, subject, body)
+
+
 def send_reset(to: str, name: str, set_password_link: str) -> None:
     body = (
         f"Hello {name},\n\n"

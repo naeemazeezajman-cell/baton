@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     FRONTEND_ORIGIN: str = "http://localhost:5173"
     EMAIL_CONN: str = ""  # Azure Communication Services connection string; empty = console dev mode
     EMAIL_FROM: str = "DoNotReply@baton.local"
+    AZURE_BLOB_CONN: str = ""  # empty = local filesystem fallback (FILES_DIR)
+    FILES_DIR: str = "var/files"
+    ANTHROPIC_API_KEY: str = ""  # server-side only; empty = payment-terms polish disabled
 
 
 @lru_cache
