@@ -131,6 +131,7 @@ class Client(Base):
     name: Mapped[str] = mapped_column(Text)
     contact: Mapped[dict | None] = mapped_column(JSONB)
     from_proposal: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("proposals.id"))
+    confirmation_basis: Mapped[str | None] = mapped_column(Text)  # signed_upload | email_approval | ...
     created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
 
 

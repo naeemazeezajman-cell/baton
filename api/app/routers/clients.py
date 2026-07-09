@@ -17,7 +17,8 @@ def list_clients(user: User = Depends(current_user), db: Session = Depends(get_d
     rows = db.scalars(tenant_select(Client, user).order_by(Client.created_at)).all()
     return [
         {"id": c.id, "ref": c.ref, "name": c.name, "contact": c.contact,
-         "from_proposal": c.from_proposal, "created_at": c.created_at}
+         "from_proposal": c.from_proposal, "confirmation_basis": c.confirmation_basis,
+         "created_at": c.created_at}
         for c in rows
     ]
 

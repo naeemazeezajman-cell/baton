@@ -929,7 +929,11 @@ function Clients({ clients, healthOf, byId, proposals, now, openP }) {
           return (
             <button key={c.id} onClick={() => openP(c.pid)} className="w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left border-b last:border-0 hover:bg-gray-50 items-center" style={{ borderColor: "var(--line)" }}>
             <span className="font-mono2 text-xs">{c.code}</span>
-            <span className="font-medium truncate">{c.name}<div className="text-[11px] font-normal truncate" style={{ color: "var(--mut)" }}>{c.services.join(" · ")}</div></span>
+            <span className="font-medium truncate">{c.name}
+              {c.confirmationBasis && c.confirmationBasis !== "signed_upload" && (
+                <span className="ml-1.5 text-[10px] font-normal px-1.5 py-0.5 rounded-full align-middle whitespace-nowrap" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>confirmed without signed proposal</span>
+              )}
+              <div className="text-[11px] font-normal truncate" style={{ color: "var(--mut)" }}>{c.services.join(" · ")}</div></span>
             <span className="text-[11px]" style={{ color: "var(--mut)" }}>
               {team.length === 0 ? "Unassigned" : team.map(([svc, uId]) => <div key={svc} className="truncate">{svc.split(" (")[0]}: <b style={{ color: "var(--ink)" }}>{byId(uId).name.split(" ")[0]}</b></div>)}
             </span>
@@ -1852,6 +1856,11 @@ function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequ
   const [signatoryPick, setSignatoryPick] = useState("");
   const [lostMode, setLostMode] = useState(false);
   const [lostNote, setLostNote] = useState("");
+  const [unsignedMode, setUnsignedMode] = useState(false);
+  const [confBasis, setConfBasis] = useState("email_approval");
+  const [confNote, setConfNote] = useState("");
+  const [confFiles, setConfFiles] = useState([]);
+  const [confIdentity, setConfIdentity] = useState(false);
   const [elNote, setElNote] = useState(p.el?.note || "");
   useEffect(() => { setElNote(p.el?.note || ""); }, [p.id, p.status]);
 
@@ -1912,6 +1921,45 @@ function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequ
               </>
             )}
           </div>
+          {!unsignedMode ? (
+            <button onClick={() => setUnsignedMode(true)} className="mt-3 text-[11px] underline" style={{ color: "var(--mut)" }}>
+              Client confirmed without signing? Record the confirmation…
+            </button>
+          ) : (
+            <div className="mt-3 pt-3 border-t space-y-2" style={{ borderColor: "var(--line)" }}>
+              <div className="text-[11px] font-semibold" style={{ color: "var(--amber)" }}>
+                Record a confirmation received without a signed proposal — same discipline as completing a duty
+                without proof: a basis and a mandatory note, permanently logged. The signed engagement letter
+                will serve as the binding client acceptance record.
+              </div>
+              <div className="flex gap-2 flex-wrap items-center">
+                <select value={confBasis} onChange={(e) => setConfBasis(e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+                  <option value="email_approval">Approval received by email</option>
+                  <option value="message_approval">Approval by message (WhatsApp/SMS)</option>
+                  <option value="verbal_instruction">Verbal instruction to proceed</option>
+                  <option value="advance_payment">Advance payment received</option>
+                  <option value="other">Other (describe in the note)</option>
+                </select>
+                <FilePick small multiple label="Attach evidence — email PDF / screenshot (optional)" onFiles={(fs) => setConfFiles([...confFiles, ...fs])} />
+                {confFiles.map((f, i) => (
+                  <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}>
+                    <FileLink {...f} /> <button onClick={() => setConfFiles(confFiles.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button>
+                  </span>
+                ))}
+              </div>
+              <input value={confNote} onChange={(e) => setConfNote(e.target.value)} placeholder={'Mandatory note — exactly how did the client confirm? e.g. "Email from Mariam 09 Jul: please proceed on v2 terms"'} className="w-full border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <label className="flex items-start gap-2 text-[11px]" style={{ color: "var(--mut)" }}>
+                <input type="checkbox" checked={confIdentity} onChange={(e) => setConfIdentity(e.target.checked)} className="mt-0.5" />
+                I re-confirm my identity and take responsibility for recording this client confirmation (in production: password / 2FA re-entry).
+              </label>
+              <div className="flex gap-2 items-center">
+                <button disabled={!confNote.trim() || !confIdentity} onClick={() => { actions.confirmUnsigned(p.id, { basis: confBasis, note: confNote.trim(), files: confFiles }); setUnsignedMode(false); }} className="px-3 py-2 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--amber)" }}>
+                  Record confirmation & convert — logged as unsigned
+                </button>
+                <button onClick={() => setUnsignedMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+              </div>
+            </div>
+          )}
         </ActionCard>
       )}
 

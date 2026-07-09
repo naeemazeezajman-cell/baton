@@ -342,6 +342,68 @@ def test_duplicate_prospect_allowed_after_lost_with_flag(client):
     assert any("previously proposed and LOST" in e["text"] for e in detail["events"])
 
 
+def confirm_unsigned(client, ctx, pid, expect=200, files=None, **fields):
+    data = {"basis": "email_approval", "note": "Email from Mariam: please proceed on these terms", **fields}
+    file_parts = [("evidence", (name, content, "application/pdf")) for name, content in (files or [])]
+    r = client.post(f"/proposals/{pid}/confirm-unsigned", data=data, files=file_parts,
+                    headers=ctx["manager"]["headers"])
+    assert r.status_code == expect, f"confirm-unsigned: {r.status_code} {r.text}"
+    return r.json()
+
+
+def test_confirm_unsigned_with_evidence(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_signed(client, ctx, pid)
+    act(client, ctx, "manager", pid, "send-client", {"to": "a@b.ae", "subject": "P", "body": "x"})
+
+    out = confirm_unsigned(client, ctx, pid,
+                           files=[("Client email.pdf", b"%PDF approval"), ("WhatsApp.png", b"PNGdata")])
+    assert out["client"]["ref"] == "CL-001"
+    p = out["proposal"]
+    assert p["status"] == "el_staffing" and p["client_id"] == out["client"]["id"]
+    conf = p["el"]["client_confirmation"]
+    assert conf["basis"] == "email_approval" and len(conf["evidence"]) == 2
+
+    detail = client.get(f"/proposals/{pid}", headers=ctx["manager"]["headers"]).json()
+    texts = [e["text"] for e in detail["events"]]
+    assert any("CLIENT CONFIRMATION RECORDED WITHOUT SIGNED PROPOSAL — basis: client approval received by email"
+               in t and "Email from Mariam" in t and "Client email.pdf" in t for t in texts)
+    assert any("The signed engagement letter will serve as the binding client acceptance record" in t for t in texts)
+    # client record carries the declared basis; the signed-upload path stores signed_upload
+    clients_list = client.get("/clients", headers=ctx["manager"]["headers"]).json()
+    assert clients_list[0]["confirmation_basis"] == "email_approval"
+    # converting twice is refused
+    confirm_unsigned(client, ctx, pid, expect=409)
+
+    # EL flow proceeds exactly as after upload-signed
+    for svc in [s["name"] for s in SERVICES]:
+        act(client, ctx, "manager", pid, "staff-activity", {"service": svc, "staff_id": ctx["staff"]["id"]})
+    p = act(client, ctx, "manager", pid, "el-route", {"signatory_id": ctx["admin"]["id"]})
+    assert p["status"] == "el_senior_review"
+
+
+def test_confirm_unsigned_without_evidence_and_guards(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_signed(client, ctx, pid)
+    # wrong status: still 'signed', not yet sent to the client
+    confirm_unsigned(client, ctx, pid, expect=409)
+    act(client, ctx, "manager", pid, "send-client", {"to": "a@b.ae", "subject": "P", "body": "x"})
+    # missing note → 409
+    r = confirm_unsigned(client, ctx, pid, note="", expect=409)
+    assert "mandatory" in r["detail"]["reason"]
+    # unknown basis → 422
+    confirm_unsigned(client, ctx, pid, basis="handshake", expect=422)
+    # happy path without evidence
+    out = confirm_unsigned(client, ctx, pid, basis="verbal_instruction",
+                           note="Call with owner 09 Jul — verbal go-ahead, EL to follow")
+    assert out["proposal"]["status"] == "el_staffing"
+    assert out["proposal"]["el"]["client_confirmation"]["evidence"] == []
+    clients_list = client.get("/clients", headers=ctx["manager"]["headers"]).json()
+    assert clients_list[0]["confirmation_basis"] == "verbal_instruction"
+
+
 def test_role_holder_and_status_guards(client):
     ctx = setup_firm(client)
     pid = create_proposal(client, ctx)["id"]

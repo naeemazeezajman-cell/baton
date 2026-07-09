@@ -8,7 +8,7 @@ status; an invalid transition returns 409 {reason}. The prototype's reducer func
 import uuid
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File as FileParam, Form, HTTPException, UploadFile
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -823,7 +823,7 @@ def upload_signed(pid: uuid.UUID, file: UploadFile, user: User = Depends(current
     count = db.scalar(select(func.count()).select_from(Client).where(Client.tenant_id == user.tenant_id))
     client = Client(
         tenant_id=user.tenant_id, ref=f"CL-{count + 1:03d}", name=p.prospect.get("name"),
-        contact=p.prospect, from_proposal=p.id,
+        contact=p.prospect, from_proposal=p.id, confirmation_basis="signed_upload",
     )
     db.add(client)
     db.flush()
@@ -835,6 +835,65 @@ def upload_signed(pid: uuid.UUID, file: UploadFile, user: User = Depends(current
                               f"prospect converted to CLIENT {client.ref}.")
     log_event(db, p, None, "Engagement letter auto-prepared from the signed proposal. "
                            "Next: assign technical staff per activity, then route for senior signature.")
+    db.commit()
+    return {"client": {"id": client.id, "ref": client.ref, "name": client.name}, "proposal": _serialize(p),
+            "services": [l["service"] for l in latest["data"]["lines"]]}
+
+
+CONFIRMATION_BASES = {
+    "email_approval": "client approval received by email",
+    "message_approval": "client approval received by message (WhatsApp/SMS)",
+    "verbal_instruction": "verbal instruction to proceed",
+    "advance_payment": "advance payment received",
+    "other": "other (see note)",
+}
+
+
+@router.post("/{pid}/confirm-unsigned")
+def confirm_unsigned(
+    pid: uuid.UUID,
+    basis: str = Form(...),
+    note: str = Form(""),
+    evidence: list[UploadFile] = FileParam(default=[]),
+    user: User = Depends(require_roles("Admin", "Manager")),
+    db: Session = Depends(get_db),
+):
+    """Declared client confirmation — the client confirmed without returning a signed copy
+    (email reply, WhatsApp, verbal go-ahead). Same conversion as upload-signed, but the
+    audit trail records the declared basis + mandatory note, mirroring duties' declared-
+    without-proof discipline. The signed EL becomes the binding acceptance record."""
+    p = _get(db, pid, user)
+    require_status(p, "proposal_sent")
+    if p.client_id:
+        raise conflict("This proposal has already been converted to a client")
+    if basis not in CONFIRMATION_BASES:
+        raise HTTPException(status_code=422, detail=f"basis must be one of {sorted(CONFIRMATION_BASES)}")
+    if not note.strip():
+        raise conflict("A note describing exactly how the client confirmed is mandatory")
+    label = CONFIRMATION_BASES[basis]
+    latest = _latest_version(p)
+
+    stored = [store_upload(db, user, "proposal", p.id, f) for f in evidence]
+    count = db.scalar(select(func.count()).select_from(Client).where(Client.tenant_id == user.tenant_id))
+    client = Client(
+        tenant_id=user.tenant_id, ref=f"CL-{count + 1:03d}", name=p.prospect.get("name"),
+        contact=p.prospect, from_proposal=p.id, confirmation_basis=basis,
+    )
+    db.add(client)
+    db.flush()
+    p.client_id = client.id
+    p.el = {"note": "", "advance_pct": 0, "signatory_id": None, "signature": None, "sent_at": None,
+            "assignments": {},
+            "client_confirmation": {"basis": basis, "label": label, "note": note.strip(), "at": iso(now()),
+                                    "evidence": [{"file_id": str(f.id), "name": f.name} for f in stored]}}
+    p.status = "el_staffing"
+    ev_txt = f' Evidence on file: {", ".join(f.name for f in stored)}.' if stored else ""
+    log_event(db, p, user.id,
+              f'CLIENT CONFIRMATION RECORDED WITHOUT SIGNED PROPOSAL — basis: {label}; note: "{note.strip()}".'
+              f"{ev_txt} Client confirmation established — prospect converted to CLIENT {client.ref}.")
+    log_event(db, p, None, "Engagement letter auto-prepared. Next: assign technical staff per activity, "
+                           "then route for senior signature. The signed engagement letter will serve as "
+                           "the binding client acceptance record.")
     db.commit()
     return {"client": {"id": client.id, "ref": client.ref, "name": client.name}, "proposal": _serialize(p),
             "services": [l["service"] for l in latest["data"]["lines"]]}

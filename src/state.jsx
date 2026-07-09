@@ -244,6 +244,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     return {
       id: c.id, code: c.ref, name: c.name, contact: c.contact,
       pid: pr?.id || null, engagedAt: ms(c.created_at),
+      confirmationBasis: c.confirmation_basis || null,
       services: pr ? (pr.versions.at(-1)?.data.lines || []).map((l) => l.service) : [],
     };
   });
@@ -349,6 +350,19 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
       fd.append("file", raw, file.name);
       const out = await api.postForm(`/proposals/${uuidOf(ref)}/upload-signed`, fd);
       pushToast(`${byRef[ref].prospect.name} confirmed — now client ${out.client.ref}. EL prepared; assign staff per activity.`);
+      return out;
+    }, onRef),
+
+    confirmUnsigned: act(async (ref, { basis, note, files }) => {
+      const fd = new FormData();
+      fd.append("basis", basis);
+      fd.append("note", note);
+      for (const f of files || []) {
+        const raw = rawFromUrl(f.url);
+        if (raw) fd.append("evidence", raw, f.name);
+      }
+      const out = await api.postForm(`/proposals/${uuidOf(ref)}/confirm-unsigned`, fd);
+      pushToast(`${byRef[ref].prospect.name} confirmed (recorded unsigned) — now client ${out.client.ref}. EL prepared; assign staff per activity.`);
       return out;
     }, onRef),
 
