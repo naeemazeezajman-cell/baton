@@ -109,6 +109,9 @@ const mapPayment = (x, clientsById, refByProposalUuid) => ({
   pid: refByProposalUuid[x.proposal_id] || "",
   label: x.label, amount: x.amount, dueAt: ms(x.due_at),
   invoiceRaised: x.invoice_raised, received: x.received, done: x.done,
+  lifecycle: x.lifecycle, invoiceNumber: x.invoice_number,
+  invoiceRaisedAt: ms(x.invoice_raised_at), invoiceDeclared: !!x.invoice_declared,
+  invoiceFiles: (x.invoice_files || []).map((f) => ({ name: f.name, url: fileUrl(f.file_id) })),
   evidence: (x.receipts || []).filter((r) => r.file_id).map((r) => ({ name: r.file_name, url: fileUrl(r.file_id), amount: r.amount })),
   events: (x.events || []).map((e, i) => ({ id: `${x.id}-e${i}`, at: ms(e.at), by: e.by, text: e.text })),
 });
@@ -403,10 +406,27 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     return api.postForm(`/duties/${dutyId}/complete`, fd);
   });
 
-  const markInvoiceRaised = act((payId) => api.post(`/payments/${payId}/invoice-raised`));
-  const recordReceipt = act(async (payId, amount, file) => {
+  const raiseInvoice = act(async (payId, { number, date, files, declaredReason }) => {
+    const fd = new FormData();
+    fd.append("invoice_number", number);
+    if (date) fd.append("invoice_date", date);
+    if (declaredReason) fd.append("declared_reason", declaredReason);
+    for (const f of files || []) {
+      const raw = rawFromUrl(f.url);
+      if (raw) fd.append("invoice", raw, f.name);
+    }
+    const out = await api.postForm(`/payments/${payId}/raise-invoice`, fd);
+    pushToast(declaredReason ? `Invoice ${number} recorded as raised outside Baton`
+                             : `Invoice ${number} raised & emailed to the client`);
+    return out;
+  });
+  const recordReceipt = act(async (payId, { amount, date, method, reference, note, file }) => {
     const fd = new FormData();
     fd.append("amount", String(amount));
+    if (date) fd.append("received_date", date);
+    fd.append("method", method);
+    if (reference) fd.append("reference", reference);
+    if (note) fd.append("note", note);
     if (file) {
       const raw = rawFromUrl(file.url);
       if (raw) fd.append("evidence", raw, file.name);
@@ -454,7 +474,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
       ready, me, firm, users, proposals: proposalsMapped, clients, duties, payments,
       onboardings: onboardingsRaw.map(mapOnboarding),
       notices, sigUses, toast, pushToast, refetchAll, refetchDetail, uuidOf, setFocus,
-      actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
+      actions, markDutyDone, raiseInvoice, recordReceipt, markNoticesRead,
       setUsersShim, setFirmShim,
     }}>
       {children}

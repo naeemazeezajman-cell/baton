@@ -159,12 +159,16 @@ def test_payments_receipts_and_health(client):
     assert client.get("/payments", headers=ctx["staff"]["headers"]).status_code == 403
 
     quarterly = next(p for p in rows if "VAT Filing" in p["label"])  # due now → immediately overdue
-    r = client.post(f"/payments/{quarterly['id']}/invoice-raised", headers=acct)
+    r = client.post(f"/payments/{quarterly['id']}/raise-invoice",
+                    data={"invoice_number": "INV-1001"},
+                    files={"invoice": ("INV-1001.pdf", b"%PDF invoice", "application/pdf")}, headers=acct)
     assert r.status_code == 200 and r.json()["invoice_raised"] is True
-    client.post(f"/payments/{quarterly['id']}/invoice-raised", headers=acct).status_code == 409
+    assert client.post(f"/payments/{quarterly['id']}/raise-invoice", data={"invoice_number": "INV-1001"},
+                       files={"invoice": ("x.pdf", b"%PDF", "application/pdf")}, headers=acct).status_code == 409
 
     # partial receipt with evidence → not done; health Watch (overdue < 30d)
-    r = client.post(f"/payments/{quarterly['id']}/record-receipt", data={"amount": "2500"},
+    r = client.post(f"/payments/{quarterly['id']}/record-receipt",
+                    data={"amount": "2500", "method": "bank_transfer", "reference": "TRX-889"},
                     files={"evidence": ("receipt1.pdf", b"%PDF r1", "application/pdf")}, headers=acct)
     body = r.json()
     assert r.status_code == 200 and body["received"] == 2500 and body["done"] is False
@@ -180,14 +184,16 @@ def test_payments_receipts_and_health(client):
     assert health["badge"] == "At risk"
 
     # settle both payments → Good; full receipt writes the 'fully received' event
-    r = client.post(f"/payments/{quarterly['id']}/record-receipt", data={"amount": "3500"}, headers=acct)
+    r = client.post(f"/payments/{quarterly['id']}/record-receipt",
+                    data={"amount": "3500", "method": "cheque", "reference": "CHQ-042"}, headers=acct)
     assert r.json()["done"] is True
     assert any("Fully received" in e["text"] for e in r.json()["events"])
     monthly = next(p for p in rows if "Bookkeeping" in p["label"])
     with SessionLocal() as db:  # monthly is due +30d — bring it due and pay it
         db.execute(update(Payment).where(Payment.id == monthly["id"]).values(due_at=_now() - timedelta(days=1)))
         db.commit()
-    client.post(f"/payments/{monthly['id']}/record-receipt", data={"amount": "2000"}, headers=acct)
+    client.post(f"/payments/{monthly['id']}/record-receipt",
+                data={"amount": "2000", "method": "cash", "note": "paid at office by owner"}, headers=acct)
     health = client.get(f"/payments/health/{client_id}", headers=acct).json()
     assert health["badge"] == "Good" and health["outstanding"] == 0
 

@@ -321,7 +321,7 @@ function Shell() {
   const auth = useAuth();
   const {
     ready, me, firm, users, proposals, clients, duties, payments, notices, sigUses, toast,
-    onboardings, actions, markDutyDone, markInvoiceRaised, recordReceipt, markNoticesRead,
+    onboardings, actions, markDutyDone, raiseInvoice, recordReceipt, markNoticesRead,
     setUsersShim, setFirmShim, refetchDetail, uuidOf, setFocus,
   } = useData();
   const [route, setRoute] = useState({ screen: "dashboard" });
@@ -434,7 +434,7 @@ function Shell() {
               <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} onbQueue={onbQueue} openOnb={(id) => setRoute({ screen: "onboarding", id })} />
             )}
             {(route.screen === "payments" || (route.screen === "dashboard" && isAcct)) && (
-              <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} markInvoiceRaised={markInvoiceRaised} recordReceipt={recordReceipt} healthOf={healthOf} />
+              <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} raiseInvoice={raiseInvoice} recordReceipt={recordReceipt} healthOf={healthOf} />
             )}
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
             {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
@@ -1004,7 +1004,26 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
 
 /* ================================================================== */
 
-function Payments({ payments, duePayments, clients, now, byId, markInvoiceRaised, recordReceipt, healthOf }) {
+function Payments({ payments, duePayments, clients, now, byId, raiseInvoice, recordReceipt, healthOf }) {
+  const groups = (list) => {
+    const m = new Map();
+    list.forEach((x) => { const k = x.clientId || "unlinked"; if (!m.has(k)) m.set(k, []); m.get(k).push(x); });
+    return [...m.entries()];
+  };
+  const renderGroups = (list, actionable) => groups(list).map(([cid, rows]) => {
+    const h = cid !== "unlinked" ? healthOf(cid) : null;
+    return (
+      <div key={cid}>
+        <div className="flex items-center gap-2 mt-1 mb-1.5">
+          <span className="text-xs font-semibold" style={{ color: "var(--ink)" }}>{rows[0].clientName || "—"}</span>
+          {h && <span className="text-[10px] px-2 py-0.5 rounded-full font-bold" style={{ background: h.badge[1] + "18", color: h.badge[1] }}>{h.badge[0]}</span>}
+        </div>
+        <div className="space-y-2">
+          {rows.map((x) => <PayRow key={x.id} x={x} now={now} raiseInvoice={raiseInvoice} recordReceipt={recordReceipt} actionable={actionable} />)}
+        </div>
+      </div>
+    );
+  });
   return (
     <div className="max-w-5xl mx-auto">
       {duePayments.length > 0 && (
@@ -1016,21 +1035,21 @@ function Payments({ payments, duePayments, clients, now, byId, markInvoiceRaised
         </div>
       )}
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Payments & receipts</h1>
-      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Invoices are raised in your accounting software — this tracker only records that it happened, and what money actually arrived.</p>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Proof of work applies here too: raising an invoice requires the invoice itself (it is emailed to the client automatically), and every receipt carries a method and reference.</p>
 
       <Section title={`Due now / overdue (${duePayments.length})`}>
         {duePayments.length === 0 && <Empty t="Nothing due. Upcoming items will move here on their due date." />}
-        {duePayments.map((x) => <PayRow key={x.id} x={x} now={now} markInvoiceRaised={markInvoiceRaised} recordReceipt={recordReceipt} actionable />)}
+        {renderGroups(duePayments, true)}
       </Section>
 
       <Section title="Upcoming">
         {payments.filter((x) => !x.done && x.dueAt > now()).length === 0 && <Empty t="No upcoming expected payments." />}
-        {payments.filter((x) => !x.done && x.dueAt > now()).sort((a, b) => a.dueAt - b.dueAt).map((x) => <PayRow key={x.id} x={x} now={now} />)}
+        {renderGroups(payments.filter((x) => !x.done && x.dueAt > now()).sort((a, b) => a.dueAt - b.dueAt), true)}
       </Section>
 
       <Section title="Settled">
         {payments.filter((x) => x.done).length === 0 && <Empty t="No settled payments yet." />}
-        {payments.filter((x) => x.done).map((x) => <PayRow key={x.id} x={x} now={now} />)}
+        {renderGroups(payments.filter((x) => x.done), false)}
       </Section>
     </div>
   );
@@ -1044,39 +1063,101 @@ const Section = ({ title, children }) => (
 );
 const Empty = ({ t }) => <div className="bg-white border rounded-xl p-5 text-sm text-center" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>{t}</div>;
 
-function PayRow({ x, now, markInvoiceRaised, recordReceipt, actionable }) {
+const LIFECYCLE_CHIP = {
+  awaiting_invoice: ["Awaiting invoice", "var(--amber)"],
+  invoiced: ["Invoiced — awaiting payment", "var(--ink)"],
+  partially_received: ["Partially received", "var(--accent)"],
+  settled: ["Settled ✓", "var(--accent)"],
+};
+
+function PayRow({ x, now, raiseInvoice, recordReceipt, actionable }) {
   const [amt, setAmt] = useState("");
+  const [invNo, setInvNo] = useState("");
+  const [invDate, setInvDate] = useState("");
+  const [invFiles, setInvFiles] = useState([]);
+  const [declMode, setDeclMode] = useState(false);
+  const [declReason, setDeclReason] = useState("");
+  const [rcDate, setRcDate] = useState("");
+  const [method, setMethod] = useState("bank_transfer");
+  const [reference, setReference] = useState("");
+  const [rcNote, setRcNote] = useState("");
+  const [rcFile, setRcFile] = useState(null);
   const overdueDays = Math.floor(days(now() - x.dueAt));
   const remaining = x.amount - x.received;
+  const chip = x.lifecycle === "overdue"
+    ? [`Overdue — ${Math.max(1, overdueDays)}d`, "var(--amber)"]
+    : LIFECYCLE_CHIP[x.lifecycle] || [x.lifecycle || "—", "var(--mut)"];
+  const receiptValid = num(amt) > 0 && (method === "cash" ? rcNote.trim() : reference.trim());
+  const doReceipt = () => {
+    recordReceipt(x.id, { amount: Math.min(num(amt), remaining), date: rcDate, method, reference: reference.trim(), note: rcNote.trim(), file: rcFile })
+      .then(() => { setAmt(""); setReference(""); setRcNote(""); setRcFile(null); })
+      .catch(() => {});
+  };
   return (
     <div className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
       <div className="flex items-center gap-3 flex-wrap text-sm">
         <div className="flex-1 min-w-[220px]">
           <b>{x.clientName}</b> <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>({x.pid})</span>
-          <div className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>{x.label}</div>
+          <div className="text-xs mt-0.5" style={{ color: "var(--mut)" }}>{x.label}{x.invoiceNumber && <span className="font-mono2"> · Invoice {x.invoiceNumber}{x.invoiceDeclared ? " (declared)" : ""}</span>}</div>
         </div>
         <div className="font-mono2 text-sm">{money(x.amount)}{x.received > 0 && !x.done && <span className="text-xs" style={{ color: "var(--accent)" }}> · {money(x.received)} received</span>}</div>
         <div className="text-xs font-mono2" style={{ color: x.done ? "var(--accent)" : x.dueAt <= now() ? "var(--red)" : "var(--mut)" }}>
           {x.done ? "✓ settled" : x.dueAt <= now() ? `due ${fmtD(x.dueAt)} · ${overdueDays}d overdue` : `due ${fmtD(x.dueAt)}`}
         </div>
-        <div className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={x.invoiceRaised ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
-          {x.invoiceRaised ? "Invoice raised" : "Invoice NOT raised"}
-        </div>
+        <div className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: chip[1] + "18", color: chip[1] }}>{chip[0]}</div>
       </div>
-      {actionable && !x.done && (
-        <div className="mt-3 pt-3 border-t flex items-center gap-2 flex-wrap" style={{ borderColor: "var(--line)" }}>
-          {!x.invoiceRaised && (
-            <button onClick={() => markInvoiceRaised(x.id)} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold" style={{ background: "var(--ink)" }}>
-              Mark invoice raised (in accounting software)
+
+      {actionable && !x.done && !x.invoiceRaised && (
+        <div className="mt-3 pt-3 border-t space-y-2" style={{ borderColor: "var(--line)" }}>
+          <div className="text-[11px] font-semibold" style={{ color: "var(--mut)" }}>Raise the invoice — the document is required and is emailed to the client automatically with secure links.</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <FilePick small multiple label="Attach invoice PDF *" onFiles={(fs) => setInvFiles([...invFiles, ...fs])} />
+            {invFiles.map((f, i) => <span key={i} className="text-xs font-mono2 px-2 py-1 rounded border" style={{ borderColor: "var(--line)" }}>{f.name} <button onClick={() => setInvFiles(invFiles.filter((_, j) => j !== i))} style={{ color: "var(--red)" }}>×</button></span>)}
+            <input value={invNo} onChange={(e) => setInvNo(e.target.value)} placeholder="Invoice number *" className="border rounded-md px-2.5 py-1.5 text-xs w-36 font-mono2" style={{ borderColor: "var(--line)" }} />
+            <input type="date" value={invDate} onChange={(e) => setInvDate(e.target.value)} title="Invoice date (defaults to today)" className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+            <button disabled={!invNo.trim() || invFiles.length === 0} onClick={() => raiseInvoice(x.id, { number: invNo.trim(), date: invDate, files: invFiles }).then(() => { setInvNo(""); setInvFiles([]); }).catch(() => {})} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--ink)" }}>
+              Raise invoice & email client ✉️
             </button>
+          </div>
+          {!declMode ? (
+            <button onClick={() => setDeclMode(true)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>Raised outside Baton? Declare it (reason required — capped for ratings)…</button>
+          ) : (
+            <div className="flex gap-2 items-center flex-wrap">
+              <input value={invNo} onChange={(e) => setInvNo(e.target.value)} placeholder="Invoice number *" className="border rounded-md px-2.5 py-1.5 text-xs w-36 font-mono2" style={{ borderColor: "var(--line)" }} />
+              <input value={declReason} onChange={(e) => setDeclReason(e.target.value)} placeholder="Mandatory reason — why is the invoice not on file?" className="flex-1 min-w-[220px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+              <button disabled={!invNo.trim() || !declReason.trim()} onClick={() => raiseInvoice(x.id, { number: invNo.trim(), date: invDate, declaredReason: declReason.trim() }).then(() => { setDeclMode(false); setInvNo(""); setDeclReason(""); }).catch(() => {})} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--amber)" }}>Declare raised</button>
+              <button onClick={() => setDeclMode(false)} className="text-xs" style={{ color: "var(--mut)" }}>cancel</button>
+            </div>
           )}
-          {x.invoiceRaised && (
-            <>
-              <input value={amt} onChange={(e) => setAmt(e.target.value)} placeholder={`Amount received (remaining ${money(remaining)})`} className="border rounded-md px-2.5 py-1.5 text-xs w-56 font-mono2" style={{ borderColor: "var(--line)" }} />
-              <FilePick small label="Upload transfer / receipt evidence & record" onFiles={(fs) => { const a = num(amt) || remaining; recordReceipt(x.id, Math.min(a, remaining), fs[0]); setAmt(""); }} />
-              <button onClick={() => { const a = num(amt); if (a > 0) { recordReceipt(x.id, Math.min(a, remaining), null); setAmt(""); } }} className="px-3 py-1.5 rounded-md border text-xs font-semibold" style={{ borderColor: "var(--line)" }}>Record without evidence</button>
-            </>
-          )}
+        </div>
+      )}
+
+      {actionable && !x.done && x.invoiceRaised && (
+        <div className="mt-3 pt-3 border-t space-y-2" style={{ borderColor: "var(--line)" }}>
+          <div className="flex items-center gap-2 flex-wrap">
+            <input value={amt} onChange={(e) => setAmt(e.target.value)} placeholder={`Amount received (remaining ${money(remaining)})`} className="border rounded-md px-2.5 py-1.5 text-xs w-56 font-mono2" style={{ borderColor: "var(--line)" }} />
+            <input type="date" value={rcDate} onChange={(e) => setRcDate(e.target.value)} title="Date received (defaults to today)" className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+            <select value={method} onChange={(e) => setMethod(e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+              <option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option><option value="cash">Cash</option><option value="card">Card</option><option value="other">Other</option>
+            </select>
+            {method === "cash" ? (
+              <input value={rcNote} onChange={(e) => setRcNote(e.target.value)} placeholder="Note * — who paid, where received" className="flex-1 min-w-[200px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+            ) : (
+              <input value={reference} onChange={(e) => setReference(e.target.value)} placeholder="Reference * — transaction ID / cheque no." className="flex-1 min-w-[200px] border rounded-md px-2.5 py-1.5 text-xs font-mono2" style={{ borderColor: "var(--line)" }} />
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <FilePick small label={rcFile ? `Evidence: ${rcFile.name}` : "Attach evidence (optional)"} onFiles={(fs) => setRcFile(fs[0])} />
+            <button disabled={!receiptValid} onClick={doReceipt} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+              Record receipt
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(x.invoiceFiles || []).length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-2 text-xs">
+          {x.invoiceFiles.map((f, i) => <span key={i} className="px-2 py-1 rounded-md border font-mono2" style={{ borderColor: "var(--line)" }}>🧾 <FileLink {...f} /></span>)}
         </div>
       )}
       {x.evidence.length > 0 && (
@@ -2664,17 +2745,18 @@ function PerformanceScreen() {
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Employee performance</h1>
       <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Firm-wide ratings computed from every completed proposal cycle and duty completion. Visible to management only. Click a row for the person's recent star events.</p>
       <div className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
-        <div className="grid grid-cols-[1fr_160px_160px_200px_110px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
-          <div>Employee</div><div>Proposals</div><div>Duties</div><div>Overall</div><div>Open workload</div>
+        <div className="grid grid-cols-[1fr_130px_130px_130px_200px_110px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+          <div>Employee</div><div>Proposals</div><div>Duties</div><div>Invoicing</div><div>Overall</div><div>Open workload</div>
         </div>
         {data.employees.map((e) => {
           const isOpen = openU === e.user_id;
           return (
             <div key={e.user_id} className="border-b last:border-0" style={{ borderColor: "var(--line)" }}>
-              <button onClick={() => setOpenU(isOpen ? null : e.user_id)} className="w-full grid grid-cols-[1fr_160px_160px_200px_110px] gap-3 px-5 py-3.5 text-sm text-left items-center hover:bg-gray-50">
+              <button onClick={() => setOpenU(isOpen ? null : e.user_id)} className="w-full grid grid-cols-[1fr_130px_130px_130px_200px_110px] gap-3 px-5 py-3.5 text-sm text-left items-center hover:bg-gray-50">
                 <span><b>{e.name}</b><div className="text-[11px] font-normal" style={{ color: "var(--mut)" }}>{e.designation} · {e.role}</div></span>
                 <span>{avgCell(e.proposal_avg_stars, e.proposal_count)}</span>
                 <span>{avgCell(e.duties_avg_stars, e.duty_count)}</span>
+                <span>{avgCell(e.invoicing_avg_stars, e.invoicing_count)}</span>
                 <span>
                   {e.overall_avg == null
                     ? <span className="text-xs" style={{ color: "var(--mut)" }}>no completed work yet</span>
@@ -2688,7 +2770,7 @@ function PerformanceScreen() {
                   {e.recent_events.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No completed work yet.</div>}
                   {e.recent_events.map((ev, i) => (
                     <div key={i} className="flex items-center gap-3 py-1.5 text-xs border-b last:border-0" style={{ borderColor: "var(--line)" }}>
-                      <span className="w-16 text-[10px] uppercase font-bold" style={{ color: ev.source === "proposal" ? "var(--accent)" : "var(--amber)" }}>{ev.source}</span>
+                      <span className="w-16 text-[10px] uppercase font-bold" style={{ color: ev.source === "proposal" ? "var(--accent)" : ev.source === "invoicing" ? "var(--ink)" : "var(--amber)" }}>{ev.source}</span>
                       <span className="flex-1">{ev.label}</span>
                       <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(new Date(ev.at).getTime())}</span>
                       <Stars n={ev.stars} />
@@ -2703,6 +2785,7 @@ function PerformanceScreen() {
       <div className="mt-3 text-[10px] space-y-0.5" style={{ color: "var(--mut)" }}>
         <div>Proposal cycles: {data.proposal_stars_scale_text}</div>
         <div>Duty completions: {data.duty_stars_scale_text}</div>
+        <div>Invoicing: {data.invoicing_stars_scale_text}</div>
       </div>
     </div>
   );

@@ -257,6 +257,8 @@ class Payment(Base):
     amount: Mapped[float] = mapped_column(Numeric(12, 2))
     due_at: Mapped[datetime] = mapped_column(TS)
     invoice_raised: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    invoice_raised_at: Mapped[datetime | None] = mapped_column(TS)
+    invoice: Mapped[dict | None] = mapped_column(JSONB)  # {number, date, files, by, declared, reason}
     receipts: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
     events: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
 

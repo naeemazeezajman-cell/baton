@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Client, Duty, DutyCompletion, HolderLog, Proposal, User
+from ..models import Client, Duty, DutyCompletion, HolderLog, Payment, Proposal, User
 from ..security import require_roles
 from ..tenancy import get_scoped_or_404, tenant_select
 from .proposals import CLOSED_STATUSES, STARS_SCALE_TEXT as PROPOSAL_STARS_SCALE_TEXT, stars_for
@@ -20,6 +20,13 @@ COMPLETED_STATUSES = ("el_sent", "onboarding_complete")
 
 DUTY_STARS_SCALE_TEXT = ("completed on/before due ★5 · ≤1d late ★4 · ≤3d late ★3 · ≤7d late ★2 · beyond ★1 · "
                          "declared without proof capped at ★3")
+INVOICING_STARS_SCALE_TEXT = ("invoice raised on/before due ★5 · ≤1d late ★4 · ≤3d late ★3 · ≤7d late ★2 · "
+                              "beyond ★1 · declared raised outside Baton capped at ★3")
+
+
+def invoicing_stars(late_ms: int, declared: bool) -> int:
+    """Stars for one raised invoice vs the payment's due date — same scale/cap as duties."""
+    return duty_stars(late_ms, "declared" if declared else "proof")
 
 
 def duty_stars(late_ms: int, method: str) -> int:
@@ -151,6 +158,23 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
             "at": c.completed_at, "stars": duty_stars(c.late_ms, c.method),
         })
 
+    # invoicing star events: one per raised invoice, credited to the raiser
+    invoicing_events: dict = {}
+    clients_by_id = {c.id: c for c in db.scalars(tenant_select(Client, user)).all()}
+    for pay in db.scalars(tenant_select(Payment, user).where(Payment.invoice_raised_at.is_not(None))).all():
+        inv = pay.invoice or {}
+        if not inv.get("by"):
+            continue
+        raiser = uuid.UUID(inv["by"])
+        late_ms = int((pay.invoice_raised_at - pay.due_at).total_seconds() * 1000)
+        cl = clients_by_id.get(pay.client_id)
+        invoicing_events.setdefault(raiser, []).append({
+            "source": "invoicing",
+            "label": f"Invoice {inv.get('number', '—')} — {cl.name if cl else pay.label}",
+            "at": pay.invoice_raised_at,
+            "stars": invoicing_stars(late_ms, bool(inv.get("declared"))),
+        })
+
     open_props = db.scalars(tenant_select(Proposal, user).where(Proposal.status.notin_(CLOSED_STATUSES))).all()
     open_duties = db.scalars(tenant_select(Duty, user).where(Duty.closed.is_(False))).all()
 
@@ -158,7 +182,8 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
     for u in users:
         pe = prop_events.get(u.id, [])
         de = duty_events.get(u.id, [])
-        all_events = sorted([*pe, *de], key=lambda e: e["at"], reverse=True)
+        ie = invoicing_events.get(u.id, [])
+        all_events = sorted([*pe, *de, *ie], key=lambda e: e["at"], reverse=True)
         mean = lambda xs: (sum(xs) / len(xs)) if xs else None  # noqa: E731
         held = sum(1 for p in open_props if p.holder == u.id)
         open_d = sum(1 for d in open_duties if d.staff_id == u.id)
@@ -168,6 +193,8 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
             "proposal_count": len(pe),
             "duties_avg_stars": mean([e["stars"] for e in de]),
             "duty_count": len(de),
+            "invoicing_avg_stars": mean([e["stars"] for e in ie]),
+            "invoicing_count": len(ie),
             "overall_avg": mean([e["stars"] for e in all_events]),
             "event_count": len(all_events),
             "open_workload": {"held_proposals": held, "open_duties": open_d, "total": held + open_d},
@@ -179,4 +206,5 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
         "employees": employees,
         "proposal_stars_scale_text": PROPOSAL_STARS_SCALE_TEXT,
         "duty_stars_scale_text": DUTY_STARS_SCALE_TEXT,
+        "invoicing_stars_scale_text": INVOICING_STARS_SCALE_TEXT,
     }

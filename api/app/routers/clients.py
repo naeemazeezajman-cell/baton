@@ -35,6 +35,30 @@ def list_clients(user: User = Depends(current_user), db: Session = Depends(get_d
     ]
 
 
+from pydantic import BaseModel, EmailStr  # noqa: E402
+
+
+class ContactPatchIn(BaseModel):
+    name: str | None = None
+    contactPerson: str | None = None
+    email: EmailStr | None = None
+    phone: str | None = None
+
+
+@router.patch("/clients/{client_id}/contact")
+def patch_contact(client_id: uuid.UUID, body: ContactPatchIn,
+                  user: User = Depends(require_roles("Admin", "Accountant")),
+                  db: Session = Depends(get_db)):
+    """Accountants keep contact details current — required before invoices can be emailed."""
+    client = get_scoped_or_404(db, Client, client_id, user)
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    if body.email is not None:
+        patch["email"] = str(body.email)
+    client.contact = {**(client.contact or {}), **patch}
+    db.commit()
+    return {"id": client.id, "ref": client.ref, "contact": client.contact}
+
+
 @router.get("/clients/{client_id}/documents")
 def client_documents(client_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Everything on file for a client — proposal-stage uploads plus every onboarding item
