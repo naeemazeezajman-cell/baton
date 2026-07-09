@@ -6,6 +6,7 @@ status; an invalid transition returns 409 {reason}. The prototype's reducer func
 """
 
 import uuid
+from datetime import timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File as FileParam, Form, HTTPException, UploadFile
@@ -32,6 +33,7 @@ from ..workflow import (
     require_holder,
     require_status,
 )
+from .duties import fmt_dur as _fmt_dur
 from .files import store_upload
 
 router = APIRouter(prefix="/proposals", tags=["proposals"])
@@ -215,6 +217,7 @@ def _serialize(p: Proposal, db: Session | None = None, include_events: bool = Tr
         "senior_note": p.senior_note, "last_rejection": p.last_rejection,
         "payment_terms_rough": p.payment_terms_rough, "payment_terms": p.payment_terms,
         "created_at": p.created_at, "proposal_sent_at": p.proposal_sent_at,
+        "part1_completed_at": p.onboarding_completed_at,
     }
     if db is not None:
         if include_events:
@@ -526,7 +529,8 @@ def generate(pid: uuid.UUID, body: GenerateIn, user: User = Depends(current_user
     p = _get(db, pid, user)
     if user.id not in (p.assigned_to, p.requested_by, p.signatory_id):
         raise conflict("Only the drafter, requesting manager, or signatory can generate the document")
-    if p.status in TERMINAL or p.status in ("proposal_sent", "el_staffing", "el_senior_review", "el_approved", "signed"):
+    if p.status in TERMINAL or p.status in ("proposal_sent", "el_staffing", "el_senior_review", "el_approved",
+                                            "signed", "onboarding_complete"):
         raise conflict(f"Document is locked at status {p.status}")
 
     draft = body.draft.model_dump()
@@ -1054,11 +1058,16 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
     emails.send_client(str(body.to), body.subject, body.body)
     p.el = {**p.el, "sent_at": iso(t0)}
     p.status = "el_sent"
+    p.onboarding_completed_at = t0  # part 1 completion stamp — the process closes here
     log_event(db, p, user.id,
               f'Email confirmed & sent to {body.to} — subject: "{body.subject}" (signed engagement letter PDF attached)',
               kind="email", meta={"to": str(body.to), "subject": body.subject})
-    log_event(db, p, None, f"ONBOARDING PART 1 COMPLETE. Payment schedule generated ({len(pays)} expected payment(s)) "
+    log_event(db, p, None, f"Payment schedule generated ({len(pays)} expected payment(s)) "
                            f"— accountant notified; daily email + in-system reminders run until each receipt status is updated.")
+    duration_ms = (t0 - (p.created_at if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc))).total_seconds() * 1000
+    log_event(db, p, None, f"PROCESS COMPLETE — proposal to engagement letter in {_fmt_dur(duration_ms)}. "
+                           f"Audit trail sealed; performance report available to management. "
+                           f"Client documentation proceeds as a separate onboarding workflow per activity.")
     pass_holder(db, p, None, user, "")
 
     accountant = db.scalar(tenant_select(User, user).where(User.role == "Accountant", User.active.is_(True)))
@@ -1075,6 +1084,80 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
             "payments": [{"id": x.id, "label": x.label, "amount": float(x.amount), "due_at": x.due_at} for x in pays]}
 
 
+# ---------- performance report (process closes at el_sent) ----------
+
+# the prototype's starsFor scale, exactly (baton-prototype.jsx)
+STARS_SCALE = [
+    {"max_days": 0.5, "stars": 5},
+    {"max_days": 1, "stars": 4.5},
+    {"max_days": 2, "stars": 4},
+    {"max_days": 3, "stars": 3.5},
+    {"max_days": 5, "stars": 3},
+    {"max_days": 7, "stars": 2},
+    {"max_days": None, "stars": 1},
+]
+STARS_SCALE_TEXT = "≤½ day ★5 · ≤1d ★4½ · ≤2d ★4 · ≤3d ★3½ · ≤5d ★3 · ≤7d ★2 · beyond ★1"
+
+
+def stars_for(avg_days: float) -> float:
+    for step in STARS_SCALE:
+        if step["max_days"] is None or avg_days <= step["max_days"]:
+            return step["stars"]
+    return 1
+
+
+@router.get("/{pid}/report")
+def performance_report(pid: uuid.UUID, user: User = Depends(require_roles("Admin", "Manager")),
+                       db: Session = Depends(get_db)):
+    """Management-only performance report, available once the process completes at el_sent.
+    Computed from holder_log; client-held rows (user_id null) are excluded from all
+    employee figures — only internally-held periods count."""
+    p = _get(db, pid, user)
+    if p.status != "el_sent":
+        raise conflict("The performance report is available once the process completes at EL sent")
+    completed = p.onboarding_completed_at
+    created = p.created_at
+    total_ms = int((completed - created).total_seconds() * 1000)
+
+    rows = db.scalars(
+        select(HolderLog).where(HolderLog.proposal_id == p.id).order_by(HolderLog.started_at, HolderLog.id)
+    ).all()
+    per: dict = {}
+    for h in rows:
+        if h.user_id is None:  # client-held — excluded from employee figures
+            continue
+        ended = h.ended_at or completed
+        dur = int((ended - h.started_at).total_seconds() * 1000)
+        per.setdefault(h.user_id, []).append({
+            "started": h.started_at, "ended": ended, "duration_ms": dur,
+            "reason": h.reason or "responsibility held",
+        })
+
+    per_employee = []
+    for uid_, holdings in per.items():
+        u = db.get(User, uid_)
+        total_held = sum(h["duration_ms"] for h in holdings)
+        avg = total_held / len(holdings)
+        per_employee.append({
+            "user_id": uid_,
+            "name": u.name if u else "—",
+            "designation": u.designation if u else None,
+            "role": u.role if u else None,
+            "total_held_ms": total_held,
+            "holdings": sorted(holdings, key=lambda h: -h["duration_ms"]),
+            "avg_holding_ms": int(avg),
+            "stars": stars_for(avg / 86400000),
+        })
+    per_employee.sort(key=lambda r: (-r["stars"], r["total_held_ms"]))
+
+    return {
+        "ref": p.ref, "prospect": p.prospect.get("name"),
+        "created_at": created, "completed_at": completed, "total_ms": total_ms,
+        "per_employee": per_employee,
+        "stars_scale": STARS_SCALE, "stars_scale_text": STARS_SCALE_TEXT,
+    }
+
+
 # ---------- chat ----------
 
 class ChatIn(BaseModel):
@@ -1086,7 +1169,7 @@ def chat(pid: uuid.UUID, body: ChatIn, user: User = Depends(current_user), db: S
     """Any tenant participant posts to the matter's chat (prototype sendChat) — stored as a
     proposal_event kind=chat. Closed matters refuse new messages."""
     p = _get(db, pid, user)
-    if p.status in ("onboarding_complete", "lost"):
+    if p.status in CLOSED_STATUSES:
         raise conflict(f"Matter is closed ({p.status}) — the chat is read-only")
     log_event(db, p, user.id, f'Chat: "{body.text}"', kind="chat")
     other = p.requested_by if user.id == p.assigned_to else p.assigned_to

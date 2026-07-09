@@ -144,7 +144,8 @@ def test_full_happy_path_request_to_el_sent(client):
     # audit trail: full event history is present and Part 1 completion is recorded
     detail = client.get(f"/proposals/{pid}", headers=ctx["manager"]["headers"]).json()
     texts = [e["text"] for e in detail["events"]]
-    assert any("ONBOARDING PART 1 COMPLETE" in t for t in texts)
+    assert any("PROCESS COMPLETE — proposal to engagement letter" in t for t in texts)
+    assert any("Payment schedule generated" in t for t in texts)
     assert any(e["kind"] == "email" for e in detail["events"])
     # every holder-log row is closed at completion
     assert all(h["ended_at"] for h in detail["holder_log"])
@@ -402,6 +403,71 @@ def test_confirm_unsigned_without_evidence_and_guards(client):
     assert out["proposal"]["el"]["client_confirmation"]["evidence"] == []
     clients_list = client.get("/clients", headers=ctx["manager"]["headers"]).json()
     assert clients_list[0]["confirmation_basis"] == "verbal_instruction"
+
+
+def test_el_sent_closes_process_with_report(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    # report is not available before completion
+    assert client.get(f"/proposals/{pid}/report", headers=ctx["manager"]["headers"]).status_code == 409
+    drive_to_el_approved(client, ctx, pid, advance_pct=0)
+    out = act(client, ctx, "manager", pid, "el-send", {"to": "a@b.ae", "subject": "EL", "body": "x"})
+    p = out["proposal"]
+    assert p["status"] == "el_sent" and p["part1_completed_at"]
+
+    detail = client.get(f"/proposals/{pid}", headers=ctx["manager"]["headers"]).json()
+    texts = [e["text"] for e in detail["events"]]
+    assert any("PROCESS COMPLETE — proposal to engagement letter in" in t
+               and "Audit trail sealed" in t
+               and "separate onboarding workflow" in t for t in texts)
+    # closed: chat is read-only after el_sent
+    r = act(client, ctx, "manager", pid, "chat", {"text": "too late"}, expect=409)
+    assert "read-only" in r["detail"]["reason"]
+
+    # role guard: staff cannot read the report
+    assert client.get(f"/proposals/{pid}/report", headers=ctx["staff"]["headers"]).status_code == 403
+
+    r = client.get(f"/proposals/{pid}/report", headers=ctx["manager"]["headers"]).json()
+    assert r["ref"] == "P-001" and r["total_ms"] > 0
+    assert r["stars_scale_text"].startswith("≤½ day ★5")
+    assert r["stars_scale"][0] == {"max_days": 0.5, "stars": 5}
+    names = {e["name"] for e in r["per_employee"]}
+    assert {"Priya Nair", "Rashid Al Mansoori", "Ayesha Khan"} <= names  # drafter, manager, signatory
+    for e in r["per_employee"]:
+        assert e["total_held_ms"] == sum(h["duration_ms"] for h in e["holdings"])
+        assert e["avg_holding_ms"] * len(e["holdings"]) - e["total_held_ms"] < len(e["holdings"])  # int truncation only
+        durs = [h["duration_ms"] for h in e["holdings"]]
+        assert durs == sorted(durs, reverse=True)  # longest first
+        assert e["stars"] == 5  # the scripted flow runs in seconds — well under half a day per holding
+    # every employee-held period fits inside the total window
+    assert sum(e["total_held_ms"] for e in r["per_employee"]) <= r["total_ms"] + 1000
+
+
+def test_report_excludes_client_held_rows(client):
+    from datetime import timedelta
+
+    from app.db import SessionLocal
+    from app.models import HolderLog, Proposal
+
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_el_approved(client, ctx, pid, advance_pct=0)
+    act(client, ctx, "manager", pid, "el-send", {"to": "a@b.ae", "subject": "EL", "body": "x"})
+
+    # inject a synthetic 5-day client-held row (user_id NULL) — must not appear anywhere
+    with SessionLocal() as db:
+        import uuid as _uuid
+        row = db.get(Proposal, _uuid.UUID(pid))
+        db.add(HolderLog(tenant_id=row.tenant_id, proposal_id=row.id, user_id=None,
+                         started_at=row.created_at, ended_at=row.created_at + timedelta(days=5),
+                         reason="with client"))
+        db.commit()
+
+    r = client.get(f"/proposals/{pid}/report", headers=ctx["manager"]["headers"]).json()
+    assert all(e["user_id"] for e in r["per_employee"])
+    assert all("with client" not in h["reason"] for e in r["per_employee"] for h in e["holdings"])
+    # the 5-day client period did not drag any employee's rating down
+    assert all(e["stars"] == 5 for e in r["per_employee"])
 
 
 def test_role_holder_and_status_guards(client):

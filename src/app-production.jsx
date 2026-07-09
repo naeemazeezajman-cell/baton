@@ -1243,7 +1243,7 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
       </div>
 
       <div className="mt-5 flex gap-1 border-b overflow-x-auto" style={{ borderColor: "var(--line)" }}>
-        {[["work", "Workspace"], ["doc", `Proposal ${p.versions.length ? `(v${p.versions.length})` : ""}`], ...(showEngTab ? [["eng", "Engagement"]] : []), ...(p.status === "onboarding_complete" && (me.role === "Manager" || me.role === "Admin") ? [["report", "★ Performance report"]] : []), ["chat", `Chat (${p.chat.length})`], ["audit", `Audit trail (${p.events.length})`]].map(([k, l]) => (
+        {[["work", "Workspace"], ["doc", `Proposal ${p.versions.length ? `(v${p.versions.length})` : ""}`], ...(showEngTab ? [["eng", "Engagement"]] : []), ...(["el_sent", "onboarding_complete"].includes(p.status) && (me.role === "Manager" || me.role === "Admin") ? [["report", "★ Performance report"]] : []), ["chat", `Chat (${p.chat.length})`], ["audit", `Audit trail (${p.events.length})`]].map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} className="px-4 py-2.5 text-sm font-medium -mb-px border-b-2 transition whitespace-nowrap" style={tab === k ? { borderColor: "var(--accent)", color: "var(--accent)" } : { borderColor: "transparent", color: "var(--mut)" }}>{l}</button>
         ))}
       </div>
@@ -1251,9 +1251,9 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
       {tab === "work" && <Workspace p={p} me={me} byId={byId} actions={actions} iAmDrafter={iAmDrafter} iAmRequester={iAmRequester} iHoldBaton={iHoldBaton} gotoDoc={() => setTab("doc")} draft={wsDraft} setDraft={setWsDraft} dirty={formDirty} />}
       {tab === "doc" && <DocTab p={p} byId={byId} firm={firm} me={me} users={users} actions={actions} iAmRequester={iAmRequester} formDirty={formDirty} />}
       {tab === "eng" && showEngTab && <EngTab p={p} byId={byId} firm={firm} me={me} users={users} client={client} workloadOf={workloadOf} actions={actions} iAmRequester={iAmRequester} now={now} />}
-      {tab === "report" && p.status === "onboarding_complete" && (me.role === "Manager" || me.role === "Admin") && <PerfReport p={p} byId={byId} />}
-      {tab === "chat" && <ChatTab p={p} me={me} byId={byId} send={(t) => actions.sendChat(p.id, t)} closed={["onboarding_complete", "lost"].includes(p.status)} />}
-      {tab === "audit" && <AuditTab p={p} byId={byId} closed={p.status === "onboarding_complete"} />}
+      {tab === "report" && ["el_sent", "onboarding_complete"].includes(p.status) && (me.role === "Manager" || me.role === "Admin") && <PerfReportHost p={p} byId={byId} />}
+      {tab === "chat" && <ChatTab p={p} me={me} byId={byId} send={(t) => actions.sendChat(p.id, t)} closed={["el_sent", "onboarding_complete", "lost"].includes(p.status)} />}
+      {tab === "audit" && <AuditTab p={p} byId={byId} closed={["el_sent", "onboarding_complete"].includes(p.status)} />}
     </div>
   );
 }
@@ -2260,7 +2260,35 @@ const Stars = ({ n }) => (
   </span>
 );
 
-function PerfReport({ p, byId }) {
+/* Fetches the server-computed report (client-held time excluded server-side) and adapts it
+   onto the verbatim PerfReport component's expected shape. */
+function PerfReportHost({ p, byId }) {
+  const { uuidOf } = useData();
+  const [report, setReport] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    let on = true;
+    setReport(null);
+    api.get(`/proposals/${uuidOf(p.id)}/report`)
+      .then((r) => { if (on) setReport(r); })
+      .catch((e) => { if (on) setErr(e.message); });
+    return () => { on = false; };
+  }, [p.id, p.status]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (err) return <div className="mt-6 text-sm" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!report) return <div className="mt-6 text-sm" style={{ color: "var(--mut)" }}>Generating report…</div>;
+  const t = (x) => new Date(x).getTime();
+  const p2 = {
+    ...p,
+    createdAt: t(report.created_at),
+    onboardingCompletedAt: t(report.completed_at),
+    holderLog: report.per_employee.flatMap((e) =>
+      e.holdings.map((h) => ({ userId: e.user_id, start: t(h.started), end: t(h.ended), reason: h.reason }))),
+  };
+  return <PerfReport p={p2} byId={byId}
+    scaleText={`Rating reflects average time to pass the baton while holding it (${report.stars_scale_text}). Click an employee to see their tasks, longest first.`} />;
+}
+
+function PerfReport({ p, byId, scaleText }) {
   const [openUser, setOpenUser] = useState(null);
   const total = (p.onboardingCompletedAt || p.el?.sentAt || p.events[p.events.length - 1].at) - p.createdAt;
 
@@ -2280,19 +2308,19 @@ function PerfReport({ p, byId }) {
       <section className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--accent)" }}>
         <div className="flex items-center justify-between flex-wrap gap-3">
           <div>
-            <h3 className="font-disp font-bold text-lg" style={{ color: "var(--ink)" }}>Client onboarding — performance report (Parts 1 & 2)</h3>
-            <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>Generated automatically at completion · audit trail closed · visible to management only</div>
+            <h3 className="font-disp font-bold text-lg" style={{ color: "var(--ink)" }}>Proposal → engagement letter — performance report</h3>
+            <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>Generated automatically at completion · audit trail sealed · visible to management only</div>
           </div>
           <div className="text-right">
             <div className="font-mono2 text-2xl font-bold" style={{ color: "var(--accent)" }}>{fmtDur(total)}</div>
-            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--mut)" }}>request → onboarding complete · {fmtD(p.createdAt)} → {fmtD(p.onboardingCompletedAt || p.el.sentAt)}</div>
+            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--mut)" }}>request → EL sent · {fmtD(p.createdAt)} → {fmtD(p.onboardingCompletedAt || p.el.sentAt)}</div>
           </div>
         </div>
       </section>
 
       <section className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--line)" }}>
         <h4 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Employee performance — responsiveness ratings</h4>
-        <p className="text-[11px] mt-0.5" style={{ color: "var(--mut)" }}>Rating reflects average time to pass the baton while holding it (≤½ day ★5 · ≤1d ★4½ · ≤2d ★4 · ≤3d ★3½ · ≤5d ★3 · ≤7d ★2 · beyond ★1). Click an employee to see their tasks, longest first.</p>
+        <p className="text-[11px] mt-0.5" style={{ color: "var(--mut)" }}>{scaleText || "Rating reflects average time to pass the baton while holding it (≤½ day ★5 · ≤1d ★4½ · ≤2d ★4 · ≤3d ★3½ · ≤5d ★3 · ≤7d ★2 · beyond ★1). Click an employee to see their tasks, longest first."}</p>
         <div className="mt-3 space-y-2">
           {rows.map((r) => {
             const u = byId(r.uId);
@@ -2371,7 +2399,7 @@ function AuditTab({ p, byId, closed }) {
     <div className="max-w-3xl mt-5">
       {closed && (
         <div className="mb-3 rounded-xl border p-3 text-sm flex items-center gap-2" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)", color: "var(--accent)" }}>
-          🔒 <b>Trail closed</b> — client onboarding (Parts 1 & 2) completed; this record is sealed and final.
+          🔒 <b>Trail sealed</b> — proposal → engagement letter process complete; this record is final. Client documentation proceeds as a separate onboarding workflow.
         </div>
       )}
       <div className="bg-white border rounded-xl p-5" style={{ borderColor: "var(--line)" }}>
