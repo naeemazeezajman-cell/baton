@@ -231,6 +231,79 @@ def test_conversion_on_upload_signed(client):
         files={"file": ("dup.pdf", b"%PDF", "application/pdf")})
 
 
+def drive_to_senior_review_v2_after_rejection(client, ctx, pid):
+    """v1 generated+manager-signed → senior-rejected; v2 revised+manager-signed → senior_review."""
+    drive_to_drafting(client, ctx, pid)
+    g1 = act(client, ctx, "staff", pid, "generate", {"draft": {"lines": DLINES, "payment_terms": "Net 30",
+                                                               "validity_days": 30, "scope": ""}, "note": "v1"})
+    act(client, ctx, "staff", pid, "submit", {"version": g1["version"]["v"]})
+    act(client, ctx, "manager", pid, "sign-route", {"signatory_id": ctx["admin"]["id"]})
+    act(client, ctx, "admin", pid, "senior-reject", {"note": "Fee too low for this scope"})
+    act(client, ctx, "manager", pid, "send-for-revision", {"comment": "Raise VAT Filing to 7500"})
+    revised = [dict(DLINES[0]), {**DLINES[1], "fee": "7500"}]
+    g2 = act(client, ctx, "staff", pid, "generate", {"draft": {"lines": revised, "payment_terms": "Net 30",
+                                                               "validity_days": 30, "scope": ""}, "note": "revised"})
+    act(client, ctx, "staff", pid, "submit", {"version": g2["version"]["v"]})
+    return act(client, ctx, "manager", pid, "sign-route", {"signatory_id": ctx["admin"]["id"]})
+
+
+def test_approve_earlier_version_reissues_identically(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    p = drive_to_senior_review_v2_after_rejection(client, ctx, pid)
+    assert p["status"] == "senior_review" and len(p["versions"]) == 2
+    # the rejected version's fate is stamped in its metadata for the history view
+    assert p["versions"][0]["rejection"]["note"] == "Fee too low for this scope"
+
+    p = act(client, ctx, "admin", pid, "approve-version", {"version_no": 1})
+    assert p["status"] == "signed"
+    assert len(p["versions"]) == 3
+    v3 = p["versions"][-1]
+    assert v3["reverted_from"] == 1
+    assert v3["data"] == p["versions"][0]["data"]  # identical content re-issue
+    # manager signature re-applied on the proposal AND embedded in the new version's metadata
+    assert p["signatures"]["manager"]["by"] == ctx["manager"]["id"]
+    assert p["signatures"]["manager"]["reapplied_from_v"] == 1
+    assert v3["signatures"]["manager"]["by"] == ctx["manager"]["id"]
+    assert p["signatures"]["senior"]["by"] == ctx["admin"]["id"]
+    assert p["holder"] == ctx["manager"]["id"]
+
+    detail = client.get(f"/proposals/{pid}", headers=ctx["manager"]["headers"]).json()
+    texts = [e["text"] for e in detail["events"]]
+    assert any("Manager signature re-applied — content identical to v1" in t for t in texts)
+    diffs = [e for e in detail["events"] if e["kind"] == "diff" and e["meta"].get("reverted_from") == 1]
+    assert diffs and "VAT Filing: fee AED 7,500 → AED 6,000" in diffs[0]["text"]
+    mgr_notices = client.get("/notices", headers=ctx["manager"]["headers"]).json()
+    assert any("signature re-applied" in n["text"] for n in mgr_notices)
+
+    # signed proposal proceeds exactly as a normal approval
+    p = act(client, ctx, "manager", pid, "send-client", {"to": "a@b.ae", "subject": "P", "body": "x"})
+    assert p["status"] == "proposal_sent"
+
+
+def test_approve_version_guards(client):
+    ctx = setup_firm(client)
+    pid = create_proposal(client, ctx)["id"]
+    drive_to_drafting(client, ctx, pid)
+    # v1 generated but never routed; v2 generated, submitted and manager-signed
+    act(client, ctx, "staff", pid, "generate", {"draft": {"lines": DLINES, "payment_terms": "Net 30",
+                                                          "validity_days": 30, "scope": ""}, "note": "v1"})
+    g2 = act(client, ctx, "staff", pid, "generate", {"draft": {"lines": DLINES, "payment_terms": "Net 14",
+                                                               "validity_days": 30, "scope": ""}, "note": "v2"})
+    act(client, ctx, "staff", pid, "submit", {"version": g2["version"]["v"]})
+    act(client, ctx, "manager", pid, "sign-route", {"signatory_id": ctx["admin"]["id"]})
+
+    # non-routed callers are refused
+    act(client, ctx, "manager", pid, "approve-version", {"version_no": 1}, expect=409)
+    act(client, ctx, "staff", pid, "approve-version", {"version_no": 1}, expect=409)
+    # v1 never carried a manager signature
+    r = act(client, ctx, "admin", pid, "approve-version", {"version_no": 1}, expect=409)
+    assert "never carried a manager signature" in r["detail"]["reason"]
+    # the current version must go through senior-approve
+    r = act(client, ctx, "admin", pid, "approve-version", {"version_no": 2}, expect=409)
+    assert "use senior-approve" in r["detail"]["reason"]
+
+
 def test_polish_terms_fallback_and_guards(client):
     ctx = setup_firm(client)
     pid = create_proposal(client, ctx)["id"]

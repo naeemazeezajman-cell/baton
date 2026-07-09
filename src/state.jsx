@@ -60,6 +60,8 @@ function mapProposal(a, docs = []) {
     })),
     versions: (a.versions || []).map((v) => ({
       v: v.v, at: ms(v.at), by: v.by, data: mapDraft(v.data), note: v.note, signatures: v.signatures,
+      rejection: v.rejection ? { by: v.rejection.by, at: ms(v.rejection.at), note: v.rejection.note } : null,
+      revertedFrom: v.reverted_from ?? null,
     })),
     draft: mapDraft(a.draft),
     signatures: { manager: mapSig(a.signatures?.manager), senior: mapSig(a.signatures?.senior) },
@@ -328,6 +330,8 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     managerSignRoute: act((ref, signatoryId, note) =>
       api.post(`/proposals/${uuidOf(ref)}/sign-route`, { signatory_id: signatoryId, note: note || null }), onRef),
     seniorApprove: act((ref) => api.post(`/proposals/${uuidOf(ref)}/senior-approve`), onRef),
+    approveVersion: act((ref, versionNo) =>
+      api.post(`/proposals/${uuidOf(ref)}/approve-version`, { version_no: versionNo }), onRef),
     seniorReject: act((ref, note) => api.post(`/proposals/${uuidOf(ref)}/senior-reject`, { note }), onRef),
 
     sendClientEmail: act(async (ref, kind, mail) => {

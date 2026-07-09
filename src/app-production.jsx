@@ -1573,6 +1573,8 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
   const [cmp, setCmp] = useState(null);
   const [cmpA, setCmpA] = useState(1);
   const [cmpB, setCmpB] = useState(2);
+  const [approveOldMode, setApproveOldMode] = useState(false);
+  const [confirmSigOld, setConfirmSigOld] = useState(false);
 
   const managerMayAct = iAmRequester && p.status === "manager_review";
   const iAmSenior = me.id === p.signatoryId && p.status === "senior_review";
@@ -1741,6 +1743,48 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
           </section>
         )}
 
+        {viewingOld && iAmSenior && (
+          <section className="border rounded-xl p-4" style={{ borderColor: "#D8CBEF", background: "#F8F5FE" }}>
+            <h3 className="font-disp font-bold text-sm" style={{ color: "#5C4A8A" }}>Approve these earlier terms</h3>
+            {shown.signatures?.manager ? (
+              !approveOldMode ? (
+                <>
+                  <p className="text-[11px] mt-2 mb-2" style={{ color: "var(--mut)" }}>
+                    v{shown.v} carried {byId(shown.signatures.manager.by).name}'s signature when it was routed.
+                    Approving it re-issues the identical content as v{latest.v + 1}, re-applies their signature
+                    (content unchanged from what they signed), and applies your counter-signature — the document
+                    locks exactly as a normal approval.
+                  </p>
+                  <button onClick={() => { setApproveOldMode(true); setConfirmSigOld(false); }} className="w-full px-3 py-2 rounded-md text-white text-sm font-semibold" style={{ background: "#5C4A8A" }}>
+                    Approve these terms instead — issues v{latest.v + 1} identical to v{shown.v}
+                  </button>
+                </>
+              ) : (
+                <div className="mt-2 flex flex-col gap-2">
+                  <div className="text-[11px] px-2.5 py-2 rounded-md bg-white border" style={{ borderColor: "#D8CBEF", color: "var(--mut)" }}>
+                    Confirm: issue <b>v{latest.v + 1}</b> with content identical to <b>v{shown.v}</b>,
+                    re-apply {byId(shown.signatures.manager.by).name}'s signature, counter-sign and lock.
+                    v{latest.v} becomes superseded. {byId(shown.signatures.manager.by).name} is notified.
+                  </div>
+                  <label className="flex items-start gap-2 text-[11px]" style={{ color: "var(--mut)" }}>
+                    <input type="checkbox" checked={confirmSigOld} onChange={(e) => setConfirmSigOld(e.target.checked)} className="mt-0.5" />
+                    I re-confirm my identity and authorize applying <b>my own</b> signature (in production: password / 2FA re-entry).
+                  </label>
+                  <button disabled={!confirmSigOld} onClick={() => { actions.approveVersion(p.id, shown.v); setApproveOldMode(false); setViewV(null); }} className="px-3 py-2 rounded-md text-white text-sm font-semibold disabled:opacity-40" style={{ background: "#5C4A8A" }}>
+                    Confirm — approve v{shown.v} terms ✍️
+                  </button>
+                  <button onClick={() => setApproveOldMode(false)} className="text-xs underline text-left" style={{ color: "var(--mut)" }}>cancel</button>
+                </div>
+              )
+            ) : (
+              <p className="text-[11px] mt-2" style={{ color: "var(--mut)" }}>
+                v{shown.v} was never manager-signed when routed, so it cannot be approved directly.
+                Reject the current version with a note, or have the manager re-route these terms.
+              </p>
+            )}
+          </section>
+        )}
+
         <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
           <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Version history</h3>
           {canReview && p.versions.length > 1 && (
@@ -1762,10 +1806,24 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
             {[...p.versions].reverse().map((v) => (
               <div key={v.v} className="text-xs border rounded-md p-2.5" style={{ borderColor: shown.v === v.v ? "var(--accent)" : "var(--line)", background: shown.v === v.v ? "var(--accent-soft)" : "#fff" }}>
                 <div className="flex justify-between items-center font-mono2">
-                  <b>v{v.v}{v.v === latest.v && <span className="ml-1.5 font-sans font-medium text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--accent)", color: "#fff" }}>current</span>}</b>
+                  <b>v{v.v}
+                    {v.v === latest.v
+                      ? <span className="ml-1.5 font-sans font-medium text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--accent)", color: "#fff" }}>current</span>
+                      : <span className="ml-1.5 font-sans font-medium text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>superseded</span>}
+                  </b>
                   <span style={{ color: "var(--mut)" }}>{fmtDT(v.at)}</span>
                 </div>
                 <div className="mt-0.5" style={{ color: "var(--mut)" }}>{v.note} — {byId(v.by).name}</div>
+                {v.rejection && (
+                  <div className="mt-1 font-medium" style={{ color: "var(--red)" }}>
+                    ↩️ rejected by {byId(v.rejection.by).name}: “{v.rejection.note}”
+                  </div>
+                )}
+                {v.revertedFrom && (
+                  <div className="mt-1 font-medium" style={{ color: "var(--accent)" }}>
+                    ⤴️ re-issued from v{v.revertedFrom} — terms approved as originally signed
+                  </div>
+                )}
                 <div className="mt-0.5 font-mono2" style={{ color: "var(--mut)" }}>Σ line fees AED {v.data.lines.reduce((a, l) => a + num(l.fee), 0).toLocaleString()} (mixed basis)</div>
                 {canReview && (
                   <div className="mt-1.5 flex gap-2">

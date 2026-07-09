@@ -687,11 +687,92 @@ def senior_reject(pid: uuid.UUID, body: NoteIn, user: User = Depends(current_use
     p.signatures = {**p.signatures, "manager": None}
     p.status = "manager_review"
     p.last_rejection = {"by": str(user.id), "at": iso(now()), "note": body.note, "stage": "proposal"}
+    # stamp the rejection on the version that was rejected, so the fate of every version
+    # stays visible in the history even after last_rejection is cleared on re-route
+    if p.versions:
+        versions = [dict(v) for v in p.versions]
+        versions[-1]["rejection"] = {"by": str(user.id), "at": iso(now()), "note": body.note}
+        p.versions = versions
     log_event(db, p, user.id, f'Senior review REJECTED by {user.name} — note: "{body.note}". '
                               f"Manager signature voided; revision required.")
     requester = db.get(User, p.requested_by)
     pass_holder(db, p, requester, user, "senior rejection — revise and re-route")
     _notify(db, p, p.requested_by, f'{p.ref}: rejected at senior review — "{body.note}"')
+    db.commit()
+    return _serialize(p)
+
+
+class ApproveVersionIn(BaseModel):
+    version_no: int = Field(ge=1)
+
+
+@router.post("/{pid}/approve-version")
+def approve_version(pid: uuid.UUID, body: ApproveVersionIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Senior approves an EARLIER version's terms: re-issues that version's content as v(n+1),
+    re-applies the original manager's signature (content identical to what they signed), then
+    counter-signs and locks exactly like senior-approve. One transaction."""
+    import copy
+
+    p = _get(db, pid, user)
+    if p.signatory_id != user.id:
+        raise conflict("Only the routed signatory can approve")
+    require_holder(p, user)
+    require_status(p, "senior_review")
+    latest = _latest_version(p)
+    if body.version_no >= latest["v"]:
+        raise conflict(f"v{body.version_no} is the current version — use senior-approve, or pick an earlier version")
+    chosen = next((v for v in p.versions if v["v"] == body.version_no), None)
+    if chosen is None:
+        raise conflict(f"Version v{body.version_no} does not exist")
+    mgr_sig = (chosen.get("signatures") or {}).get("manager")
+    if not mgr_sig:
+        raise conflict(f"v{body.version_no} never carried a manager signature when routed — "
+                       f"only manager-signed versions can be approved this way")
+
+    manager = db.get(User, uuid.UUID(mgr_sig["by"]))
+    manager_name = manager.name if manager else "the original manager"
+    data = copy.deepcopy(chosen["data"])
+    v = latest["v"] + 1
+
+    # 1) revert the live draft and issue the identical re-issue version
+    new_version = {
+        "v": v, "at": iso(now()), "by": str(user.id), "data": data,
+        "note": f"re-issued from v{chosen['v']} at senior review",
+        "reverted_from": chosen["v"],
+        "signatures": {"manager": {"by": mgr_sig["by"], "at": iso(now()),
+                                   "specimen_ref": mgr_sig.get("specimen_ref"),
+                                   "reapplied_from_v": chosen["v"]}},
+    }
+    p.versions = [*p.versions, new_version]
+    p.draft = copy.deepcopy(data)
+    p.payment_terms = data.get("payment_terms") or None
+    log_event(db, p, user.id, f"Version v{v} issued — content identical to v{chosen['v']} "
+                              f"(earlier terms approved at senior review)")
+    changes = diff_drafts(latest["data"], data)
+    log_event(db, p, user.id,
+              f"Changes in v{v} vs v{latest['v']}: {'; '.join(changes)}" if changes
+              else f"v{v} is identical in commercial content to v{latest['v']}",
+              kind="diff", meta={"v": v, "prev_v": latest["v"], "changes": changes, "reverted_from": chosen["v"]})
+
+    # 2) re-apply the original manager's signature ref
+    p.signatures = {**p.signatures,
+                    "manager": {"by": mgr_sig["by"], "at": iso(now()), "reapplied_from_v": chosen["v"]}}
+    db.add(SignatureUse(tenant_id=p.tenant_id, user_id=uuid.UUID(mgr_sig["by"]),
+                        document=f"Proposal {p.ref} v{v} (re-applied from v{chosen['v']})", context=p.ref))
+    log_event(db, p, None, f"Manager signature re-applied — content identical to v{chosen['v']} "
+                           f"previously signed by {manager_name}.")
+    _notify(db, p, uuid.UUID(mgr_sig["by"]),
+            f"{p.ref}: {user.name} approved the terms of v{chosen['v']} at senior review — re-issued as v{v} "
+            f"with your signature re-applied (content identical to what you signed).")
+
+    # 3) senior signature + lock, exactly like senior-approve
+    p.signatures = {**p.signatures, "senior": {"by": str(user.id), "at": iso(now())}}
+    p.status = "signed"
+    _record_signature(db, p, user, f"Proposal {p.ref} v{v}", "senior")
+    log_event(db, p, user.id, f"Proposal approved & counter-signed by {user.name} (identity re-confirmed). Document locked.")
+    requester = db.get(User, p.requested_by)
+    pass_holder(db, p, requester, user, "signed proposal returned — ready to send to client")
+    _notify(db, p, p.requested_by, f"{p.ref}: proposal signed by {user.name} — ready to send to client")
     db.commit()
     return _serialize(p)
 
