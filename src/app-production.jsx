@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import { api, registerFile, rawFromUrl, openFileLink } from "./api.js";
 import { AuthProvider, useAuth, LoginScreen, ForcedResetScreen } from "./auth.jsx";
 import { DataProvider, useData } from "./state.jsx";
+import { VatEngineNav, VatEngineScreen } from "./vat-engine/index.jsx"; // VAT-ENGINE (removable module — see REMOVING-VAT-ENGINE.md)
 
 /* ------------------------------------------------------------------ */
 /*  Baton — CRM & employee performance tracker for bookkeeping firms    */
@@ -404,6 +405,7 @@ function Shell() {
             {isMgr && <NavBtn label="New proposal request" active={route.screen === "new"} onClick={() => setRoute({ screen: "new" })} />}
             {(isMgr || isAcct) && <NavBtn label="Clients" active={route.screen === "clients"} onClick={() => setRoute({ screen: "clients" })} />}
             {isMgr && <NavBtn label="★ Performance" active={route.screen === "performance"} onClick={() => setRoute({ screen: "performance" })} />}
+            <VatEngineNav active={route.screen === "vat"} onClick={() => setRoute({ screen: "vat" })} /> {/* VAT-ENGINE (removable) */}
             {isAcct && <NavBtn label="Payments" active={route.screen === "payments"} onClick={() => setRoute({ screen: "payments" })} />}
             {me.role === "Admin" && (
               <>
@@ -439,6 +441,7 @@ function Shell() {
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
             {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
             {route.screen === "performance" && isMgr && <PerformanceScreen />}
+            {route.screen === "vat" && <VatEngineScreen />} {/* VAT-ENGINE (removable) */}
             {route.screen === "onboarding" && route.id && <OnboardingView oid={route.id} me={me} byId={byId} back={() => setRoute({ screen: "dashboard" })} />}
             {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} clients={clients} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
             {route.screen === "detail" && (

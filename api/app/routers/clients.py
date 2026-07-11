@@ -79,6 +79,13 @@ def client_documents(client_id: uuid.UUID, user: User = Depends(current_user), d
                          "uploaded_by": uploader.name if uploader else "—",
                          "at": f.at, "qualifier": None})
 
+    # generic client-level registry files (any feature can file documents directly to the client)
+    for f in db.scalars(select(File).where(File.tenant_id == user.tenant_id, File.entity == "client",
+                                           File.entity_id == client.id).order_by(File.at)).all():
+        uploader = users_by_id.get(f.uploaded_by)
+        docs.append({"file_id": f.id, "name": f.name, "size": f.size, "source": "Client registry",
+                     "uploaded_by": uploader.name if uploader else "—", "at": f.at, "qualifier": None})
+
     obs = db.scalars(tenant_select(Onboarding, user).where(Onboarding.client_id == client.id)).all()
     for ob in obs:
         items = db.scalars(select(OnboardingItem).where(OnboardingItem.onboarding_id == ob.id)).all()

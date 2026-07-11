@@ -49,7 +49,7 @@ async function refreshOnce() {
   return true;
 }
 
-async function request(path, { method = "GET", json, form, auth = true, _retried = false } = {}) {
+async function request(path, { method = "GET", json, form, auth = true, blob = false, _retried = false } = {}) {
   const headers = {};
   if (auth && accessToken) headers.Authorization = `Bearer ${accessToken}`;
   let body;
@@ -61,7 +61,7 @@ async function request(path, { method = "GET", json, form, auth = true, _retried
   }
   const r = await fetch(`${BASE}${path}`, { method, headers, body });
   if (r.status === 401 && auth && !_retried && (await refreshOnce())) {
-    return request(path, { method, json, form, auth, _retried: true });
+    return request(path, { method, json, form, auth, blob, _retried: true });
   }
   if (!r.ok) {
     let detail;
@@ -73,11 +73,13 @@ async function request(path, { method = "GET", json, form, auth = true, _retried
     throw new ApiError(r.status, detail);
   }
   if (r.status === 204) return null;
+  if (blob) return r.blob();
   return r.json();
 }
 
 export const api = {
   get: (path) => request(path),
+  getBlob: (path) => request(path, { blob: true }),
   post: (path, json) => request(path, { method: "POST", json }),
   patch: (path, json) => request(path, { method: "PATCH", json }),
   postForm: (path, formData) => request(path, { method: "POST", form: formData }),

@@ -7,6 +7,11 @@ from app.config import get_settings
 from app.db import Base
 from app import models  # noqa: F401 — register all tables on Base.metadata
 
+try:  # VAT-ENGINE (removable module) — registers vat_* tables for autogenerate; delete with the module
+    from app.routers import vat_engine  # noqa: F401
+except ImportError:
+    pass
+
 config = context.config
 config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL)
 

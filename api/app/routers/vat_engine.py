@@ -1,0 +1,952 @@
+"""VAT Filing Engine — a strictly SEPARATE, REMOVABLE module (see REMOVING-VAT-ENGINE.md).
+
+Everything VAT-specific lives in this one file: the vat_* tables, the router, Excel
+template generation (openpyxl), upload parsing (pandas), reconciliation, the computation,
+client emails, and sealing. Gated behind env VAT_ENGINE_ENABLED (default true) — when
+false every endpoint 404s and the frontend hides all VAT UI.
+
+The module's ONLY outward touch is duties.apply_completion() at the very end, completing
+the linked duty through the existing machinery. Nothing outside this module imports it
+except the two registration lines in app/main.py and alembic/env.py.
+"""
+
+import io
+import os
+import re
+import uuid
+from datetime import date, datetime, timedelta
+
+from fastapi import APIRouter, Depends, File as FileParam, Form, HTTPException, UploadFile
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, ForeignKey, Index, Numeric, Text, select, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, Session, mapped_column
+from sqlalchemy.types import TIMESTAMP
+
+from .. import blobs, emails
+from ..config import get_settings
+from ..db import Base, get_db
+from ..models import Client, Duty, File as FileModel, User
+from ..security import current_user
+from ..tenancy import get_scoped_or_404, tenant_select
+from ..workflow import conflict, iso, now
+from .duties import CADENCE_MONTHS, apply_completion, fmt_d
+from .files import _download_token
+
+TS = TIMESTAMP(timezone=True)
+GEN_UUID = text("gen_random_uuid()")
+NOW = text("now()")
+
+STATUSES = ("ledgers_pending", "invoices_pending", "reconciled", "computation_draft",
+            "awaiting_client_approval", "ready_to_file", "complete")
+EMIRATES = ("Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah")
+VAT_TOLERANCE = 0.01
+
+LEDGER_COLUMNS = ["Invoice No", "Invoice Date", "Party Name", "TRN", "Emirate",
+                  "Net Amount", "VAT Amount", "Type (Output/Input)"]
+REGISTER_COLUMNS = ["Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT Amount", "Notes"]
+
+APPROVAL_BASES = {
+    "evidence_upload": "written approval on file (upload)",
+    "email_approval": "client approval received by email",
+    "message_approval": "client approval received by message (WhatsApp/SMS)",
+    "verbal_instruction": "verbal instruction to proceed",
+}
+
+
+# ---------- env gate ----------
+
+def _enabled() -> bool:
+    return os.getenv("VAT_ENGINE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def require_enabled():
+    if not _enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+router = APIRouter(prefix="/vat-engine", tags=["vat-engine"], dependencies=[Depends(require_enabled)])
+
+
+# ---------- models (module-owned vat_* tables) ----------
+
+class VatFiling(Base):
+    __tablename__ = "vat_filings"
+    __table_args__ = (CheckConstraint(f"status IN {STATUSES}", name="vat_filings_status_check"),
+                      Index("ix_vat_filings_duty_id", "duty_id"))
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    duty_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("duties.id"))
+    client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("clients.id"))
+    staff_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))  # holder — always the staff
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    prev_period_start: Mapped[date] = mapped_column(Date)  # window rule boundary
+    status: Mapped[str] = mapped_column(Text, server_default="ledgers_pending")
+    ledger_file: Mapped[dict | None] = mapped_column(JSONB)
+    invoice_file: Mapped[dict | None] = mapped_column(JSONB)
+    invoice_evidence: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
+    recon: Mapped[dict | None] = mapped_column(JSONB)
+    computation: Mapped[dict | None] = mapped_column(JSONB)
+    client_approval: Mapped[dict | None] = mapped_column(JSONB)
+    fta_ack: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    completed_at: Mapped[datetime | None] = mapped_column(TS)
+
+
+class VatFilingItem(Base):
+    __tablename__ = "vat_filing_items"
+    __table_args__ = (Index("ix_vat_filing_items_filing_id", "filing_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    filing_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("vat_filings.id"))
+    source: Mapped[str] = mapped_column(Text)  # ledger | invoice
+    row_no: Mapped[int] = mapped_column(BigInteger)  # excel row for error/trace messages
+    invoice_no: Mapped[str] = mapped_column(Text)
+    invoice_no_norm: Mapped[str] = mapped_column(Text)
+    invoice_date: Mapped[date] = mapped_column(Date)
+    party: Mapped[str] = mapped_column(Text)
+    trn: Mapped[str | None] = mapped_column(Text)
+    emirate: Mapped[str] = mapped_column(Text)
+    net: Mapped[float] = mapped_column(Numeric(14, 2))
+    vat: Mapped[float] = mapped_column(Numeric(14, 2))
+    type_: Mapped[str | None] = mapped_column("type", Text)  # Output | Input (ledger only)
+    notes: Mapped[str | None] = mapped_column(Text)
+    bucket: Mapped[str | None] = mapped_column(Text)  # matched | ledger_only | invoice_only | out_of_window
+    resolution: Mapped[dict | None] = mapped_column(JSONB)  # {action, reason, by, at}
+    included: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+
+
+class VatFilingEvent(Base):
+    __tablename__ = "vat_filing_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    filing_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("vat_filings.id"))
+    at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    by_user: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    text_: Mapped[str] = mapped_column("text", Text)
+
+
+class VatClientRequest(Base):
+    __tablename__ = "vat_client_requests"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    filing_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("vat_filings.id"))
+    kind: Mapped[str] = mapped_column(Text)  # ledger | invoices | missing_invoice | computation
+    item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    to_email: Mapped[str] = mapped_column(Text)
+    subject: Mapped[str] = mapped_column(Text)
+    sent_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    by_user: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+
+# ---------- schemas ----------
+
+class OpenIn(BaseModel):
+    duty_id: uuid.UUID
+
+
+class MailIn(BaseModel):
+    to: EmailStr
+    subject: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+
+
+class RequestFromClientIn(MailIn):
+    kind: str  # ledger | invoices
+
+
+class ReasonIn(BaseModel):
+    reason: str = Field(min_length=1)
+
+
+# ---------- helpers ----------
+
+def _log(db: Session, f: VatFiling, by_user, txt: str):
+    db.add(VatFilingEvent(tenant_id=f.tenant_id, filing_id=f.id, by_user=by_user, text_=txt))
+
+
+def _get(db: Session, fid: uuid.UUID, user: User) -> VatFiling:
+    return get_scoped_or_404(db, VatFiling, fid, user)
+
+
+def _require_staff_open(f: VatFiling, user: User):
+    if f.status == "complete":
+        raise conflict("This filing is complete — the trail is sealed")
+    if f.staff_id != user.id:
+        raise conflict("Only the responsible staff member can act on this filing")
+
+
+def _require_status(f: VatFiling, *allowed: str):
+    if f.status not in allowed:
+        raise conflict(f"Filing is at stage '{f.status}' — this action requires {' / '.join(allowed)}")
+
+
+def _period_label(f: VatFiling) -> str:
+    return f"{f.period_start:%d %b %Y} – {f.period_end:%d %b %Y}"
+
+
+def _month_shift(year: int, month: int, months_back: int) -> tuple[int, int]:
+    m = year * 12 + (month - 1) - months_back
+    return m // 12, m % 12 + 1
+
+
+def derive_period(duty: Duty) -> tuple[date, date, date]:
+    """Filing period from the duty's schedule (incl. staggered quarters): the period ends
+    on the last day of the month before the due month; it spans one cadence back; the
+    window rule boundary is one further cadence back."""
+    months = CADENCE_MONTHS.get(duty.cadence, 3)
+    due = duty.next_due
+    period_end = date(due.year, due.month, 1) - timedelta(days=1)
+    y1, m1 = _month_shift(due.year, due.month, months)
+    period_start = date(y1, m1, 1)
+    y2, m2 = _month_shift(due.year, due.month, 2 * months)
+    prev_period_start = date(y2, m2, 1)
+    return period_start, period_end, prev_period_start
+
+
+def _store_bytes(db: Session, user: User, entity: str, entity_id, name: str, data: bytes) -> FileModel:
+    """Store generated bytes as a files row (registry files use entity='client')."""
+    path = blobs.blob_path_for(user.tenant_id, entity, name)
+    blobs.save_blob(path, data)
+    row = FileModel(tenant_id=user.tenant_id, entity=entity, entity_id=entity_id,
+                    name=name, size=len(data), blob_path=path, uploaded_by=user.id)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _store_upload(db: Session, user: User, entity: str, entity_id, upload: UploadFile) -> FileModel:
+    return _store_bytes(db, user, entity, entity_id, upload.filename, upload.file.read())
+
+
+def _file_link(f: FileModel) -> str:
+    url = blobs.sas_link(f.blob_path)
+    if url is None:
+        url = f"{get_settings().FRONTEND_ORIGIN}/files/{f.id}/download?token={_download_token(f.id)}"
+    return url
+
+
+def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
+    duty = db.get(Duty, f.duty_id)
+    client = db.get(Client, f.client_id) if f.client_id else None
+    staff = db.get(User, f.staff_id)
+    out = {
+        "id": f.id, "duty_id": f.duty_id, "client_id": f.client_id,
+        "client_name": client.name if client else (duty.client_name if duty else None),
+        "client_ref": client.ref if client else None,
+        "client_contact": client.contact if client else (duty.contact if duty else None),
+        "staff_id": f.staff_id, "staff_name": staff.name if staff else None,
+        "service": duty.service if duty else "VAT Filing",
+        "period_start": f.period_start, "period_end": f.period_end,
+        "prev_period_start": f.prev_period_start, "period_label": _period_label(f),
+        "status": f.status, "holder": f.staff_id,
+        "ledger_file": f.ledger_file, "invoice_file": f.invoice_file,
+        "invoice_evidence": f.invoice_evidence, "recon": f.recon,
+        "computation": f.computation, "client_approval": f.client_approval, "fta_ack": f.fta_ack,
+        "created_at": f.created_at, "completed_at": f.completed_at,
+        "duty_next_due": duty.next_due if duty else None,
+    }
+    if detail:
+        items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)
+                           .order_by(VatFilingItem.source, VatFilingItem.row_no)).all()
+        out["items"] = [{
+            "id": i.id, "source": i.source, "row_no": i.row_no, "invoice_no": i.invoice_no,
+            "invoice_date": i.invoice_date, "party": i.party, "trn": i.trn, "emirate": i.emirate,
+            "net": float(i.net), "vat": float(i.vat), "type": i.type_, "notes": i.notes,
+            "bucket": i.bucket, "resolution": i.resolution, "included": i.included,
+        } for i in items]
+        events = db.scalars(select(VatFilingEvent).where(VatFilingEvent.filing_id == f.id)
+                            .order_by(VatFilingEvent.at, VatFilingEvent.id)).all()
+        out["events"] = [{"at": e.at, "by": e.by_user, "text": e.text_} for e in events]
+        reqs = db.scalars(select(VatClientRequest).where(VatClientRequest.filing_id == f.id)
+                          .order_by(VatClientRequest.sent_at, VatClientRequest.id)).all()
+        out["client_requests"] = [{"id": r.id, "kind": r.kind, "item_id": r.item_id, "to": r.to_email,
+                                   "subject": r.subject, "sent_at": r.sent_at, "by": r.by_user} for r in reqs]
+        out["unresolved_differences"] = _unresolved_count(items)
+    return out
+
+
+def _unresolved_count(items) -> int:
+    return sum(1 for i in items
+               if i.bucket in ("ledger_only", "invoice_only")
+               and (i.resolution or {}).get("action") not in ("excluded", "resolved"))
+
+
+# ---------- status probe (frontend hides all UI on 404) ----------
+
+@router.get("/status")
+def status(user: User = Depends(current_user)):
+    return {"enabled": True}
+
+
+# ---------- Excel templates (openpyxl, generated on the fly) ----------
+
+def _template_workbook(columns: list[str], instruction: str, validations: dict[str, list[str]]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(columns))
+    c = ws.cell(row=1, column=1, value=instruction)
+    c.font = Font(italic=True, size=9, color="666666")
+    for idx, name in enumerate(columns, start=1):
+        h = ws.cell(row=2, column=idx, value=name)
+        h.font = Font(bold=True, color="FFFFFF")
+        h.fill = PatternFill("solid", fgColor="14606B")
+        ws.column_dimensions[get_column_letter(idx)].width = max(14, len(name) + 4)
+    for col_name, options in validations.items():
+        col_idx = columns.index(col_name) + 1
+        dv = DataValidation(type="list", formula1='"' + ",".join(options) + '"', allow_blank=True,
+                            showErrorMessage=True, errorTitle="Invalid value",
+                            error=f"Pick one of: {', '.join(options)}")
+        ws.add_data_validation(dv)
+        letter = get_column_letter(col_idx)
+        dv.add(f"{letter}3:{letter}1000")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+LEDGER_INSTRUCTION = ("VAT Ledger — one row per invoice line. Keep the columns exactly as given "
+                      "(the upload is validated against them). Dates as dd/mm/yyyy or Excel dates. "
+                      "Type: Output = sales, Input = purchases. One file covers both two-ledger and "
+                      "single-ledger bookkeeping — mark each row's Type.")
+REGISTER_INSTRUCTION = ("Invoice Register — one row per issued invoice. Keep the columns exactly as "
+                        "given (the upload is validated against them). Dates as dd/mm/yyyy or Excel dates.")
+
+
+def _ledger_template_bytes() -> bytes:
+    return _template_workbook(LEDGER_COLUMNS, LEDGER_INSTRUCTION,
+                              {"Type (Output/Input)": ["Output", "Input"], "Emirate": list(EMIRATES)})
+
+
+def _register_template_bytes() -> bytes:
+    return _template_workbook(REGISTER_COLUMNS, REGISTER_INSTRUCTION, {"Emirate": list(EMIRATES)})
+
+
+def _xlsx_response(data: bytes, name: str):
+    from fastapi.responses import Response
+    return Response(content=data,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.get("/templates/ledger")
+def ledger_template(user: User = Depends(current_user)):
+    return _xlsx_response(_ledger_template_bytes(), "VAT Ledger Template.xlsx")
+
+
+@router.get("/templates/invoice-register")
+def register_template(user: User = Depends(current_user)):
+    return _xlsx_response(_register_template_bytes(), "Invoice Register Template.xlsx")
+
+
+# ---------- upload parsing (pandas; hard-fail with row-level errors) ----------
+
+def _norm_invoice_no(v) -> str:
+    s = str(v).strip()
+    if s.endswith(".0"):  # Excel numeric cells round-trip as floats
+        s = s[:-2]
+    return re.sub(r"\s+", "", s).upper()
+
+
+def _parse_upload(data: bytes, columns: list[str], is_ledger: bool) -> list[dict]:
+    import pandas as pd
+
+    try:
+        df = pd.read_excel(io.BytesIO(data), header=1)
+    except Exception:
+        raise HTTPException(status_code=422, detail={
+            "reason": "The file could not be read as an Excel workbook — download the template and fill it in.",
+            "errors": []})
+    got = [str(c).strip() for c in df.columns[:len(columns)]]
+    if got != columns:
+        raise HTTPException(status_code=422, detail={
+            "reason": "Columns don't match the template — download the template and keep its columns exactly.",
+            "errors": [f"Expected: {' | '.join(columns)}", f"Got: {' | '.join(got) or '(no header row found)'}"]})
+    df = df[df.columns[:len(columns)]]
+    df = df.dropna(how="all")
+    rows, errors = [], []
+    for idx, raw in df.iterrows():
+        excel_row = idx + 3  # header on row 2, data starts row 3
+        vals = dict(zip(columns, raw.tolist()))
+
+        def val(col):
+            v = vals.get(col)
+            return None if pd.isna(v) else v
+
+        inv_no = val("Invoice No")
+        if inv_no is None or not str(inv_no).strip():
+            errors.append(f"Row {excel_row}: Invoice No is required")
+            continue
+        try:
+            d = pd.to_datetime(val("Invoice Date"), dayfirst=True)
+            if pd.isna(d):
+                raise ValueError
+            inv_date = d.date()
+        except Exception:
+            errors.append(f"Row {excel_row}: Invoice Date {val('Invoice Date')!r} is not a valid date")
+            continue
+        party_col = "Party Name" if is_ledger else "Party"
+        party = str(val(party_col) or "").strip()
+        if not party:
+            errors.append(f"Row {excel_row}: {party_col} is required")
+            continue
+        emirate = str(val("Emirate") or "").strip().title().replace("Al Quwain", "Al Quwain")
+        matched_emirate = next((e for e in EMIRATES if e.lower() == emirate.lower()), None)
+        if matched_emirate is None:
+            errors.append(f"Row {excel_row}: Emirate {val('Emirate')!r} must be one of {', '.join(EMIRATES)}")
+            continue
+        net_col = "Net Amount" if is_ledger else "Net"
+        try:
+            net = round(float(val(net_col)), 2)
+            vat = round(float(val("VAT Amount")), 2)
+        except (TypeError, ValueError):
+            errors.append(f"Row {excel_row}: {net_col} and VAT Amount must be numbers")
+            continue
+        row_type = None
+        if is_ledger:
+            row_type = str(val("Type (Output/Input)") or "").strip().capitalize()
+            if row_type not in ("Output", "Input"):
+                errors.append(f"Row {excel_row}: Type must be Output or Input, got {val('Type (Output/Input)')!r}")
+                continue
+        rows.append({
+            "row_no": excel_row, "invoice_no": str(inv_no).strip(),
+            "invoice_no_norm": _norm_invoice_no(inv_no), "invoice_date": inv_date,
+            "party": party, "trn": str(val("TRN")).strip() if is_ledger and val("TRN") is not None else None,
+            "emirate": matched_emirate, "net": net, "vat": vat, "type": row_type,
+            "notes": str(val("Notes")).strip() if not is_ledger and val("Notes") is not None else None,
+        })
+    if errors:
+        raise HTTPException(status_code=422, detail={
+            "reason": f"Template mismatch — {len(errors)} row error(s). Fix the file and re-upload; "
+                      f"that's what the template is for.",
+            "errors": errors})
+    if not rows:
+        raise HTTPException(status_code=422, detail={"reason": "The file has no data rows.", "errors": []})
+    return rows
+
+
+# ---------- open / read ----------
+
+@router.get("/filings")
+def list_filings(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    q = tenant_select(VatFiling, user)
+    rows = db.scalars(q.order_by(VatFiling.created_at)).all()
+    if user.role not in ("Admin", "Manager"):
+        rows = [f for f in rows if f.staff_id == user.id]
+    return [serialize(db, f) for f in rows]
+
+
+@router.post("/filings/open")
+def open_filing(body: OpenIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Open (or return the existing open) filing for the duty's current period."""
+    duty = get_scoped_or_404(db, Duty, body.duty_id, user)
+    if duty.kind != "vat":
+        raise conflict("The VAT Filing Engine only runs on VAT duties")
+    if duty.closed:
+        raise conflict("This duty is closed")
+    if user.id != duty.staff_id and user.role not in ("Admin", "Manager"):
+        raise conflict("Only the responsible staff member (or management) can open the filing")
+    existing = db.scalar(select(VatFiling).where(VatFiling.duty_id == duty.id,
+                                                 VatFiling.status != "complete"))
+    if existing:
+        return serialize(db, existing, detail=True)
+    ps, pe, pps = derive_period(duty)
+    f = VatFiling(tenant_id=duty.tenant_id, duty_id=duty.id, client_id=duty.client_id,
+                  staff_id=duty.staff_id, period_start=ps, period_end=pe, prev_period_start=pps,
+                  status="ledgers_pending")
+    db.add(f)
+    db.flush()
+    _log(db, f, user.id, f"VAT filing period opened: {_period_label(f)} (derived from the duty schedule, "
+                         f"due {fmt_d(duty.next_due)}). Stage 1 — collect the VAT ledger. "
+                         f"Invoices dated before {pps:%d %b %Y} fall out of the filing window (VAT rule).")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.get("/filings/{fid}")
+def get_filing(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return serialize(db, _get(db, fid, user), detail=True)
+
+
+# ---------- stage 1 & 2: uploads ----------
+
+def _replace_items(db: Session, f: VatFiling, source: str, rows: list[dict]):
+    from sqlalchemy import delete
+    db.execute(delete(VatFilingItem).where(VatFilingItem.filing_id == f.id, VatFilingItem.source == source))
+    for r in rows:
+        db.add(VatFilingItem(tenant_id=f.tenant_id, filing_id=f.id, source=source,
+                             row_no=r["row_no"], invoice_no=r["invoice_no"],
+                             invoice_no_norm=r["invoice_no_norm"], invoice_date=r["invoice_date"],
+                             party=r["party"], trn=r["trn"], emirate=r["emirate"],
+                             net=r["net"], vat=r["vat"], type_=r["type"], notes=r["notes"]))
+    db.flush()  # the session doesn't autoflush — reconciliation must see these rows
+
+
+@router.post("/filings/{fid}/ledger")
+def upload_ledger(fid: uuid.UUID, file: UploadFile, user: User = Depends(current_user),
+                  db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "ledgers_pending", "invoices_pending")
+    rows = _parse_upload(file.file.read(), LEDGER_COLUMNS, is_ledger=True)
+    file.file.seek(0)
+    stored = _store_upload(db, user, "vat_filing", f.id, file)
+    _replace_items(db, f, "ledger", rows)
+    f.ledger_file = {"file_id": str(stored.id), "name": stored.name, "rows": len(rows), "at": iso(now())}
+    f.status = "invoices_pending"
+    out_n = sum(1 for r in rows if r["type"] == "Output")
+    _log(db, f, user.id, f"VAT ledger uploaded: {stored.name} — {len(rows)} row(s) parsed "
+                         f"({out_n} Output / {len(rows) - out_n} Input). Stage 2 — collect the invoice register.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/invoices")
+def upload_invoices(fid: uuid.UUID, file: UploadFile,
+                    evidence: list[UploadFile] = FileParam(default=[]),
+                    user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "invoices_pending", "reconciled")
+    rows = _parse_upload(file.file.read(), REGISTER_COLUMNS, is_ledger=False)
+    file.file.seek(0)
+    stored = _store_upload(db, user, "vat_filing", f.id, file)
+    pdfs = [_store_upload(db, user, "vat_filing", f.id, e) for e in evidence]
+    _replace_items(db, f, "invoice", rows)
+    f.invoice_file = {"file_id": str(stored.id), "name": stored.name, "rows": len(rows), "at": iso(now())}
+    if pdfs:
+        f.invoice_evidence = [*f.invoice_evidence,
+                              *[{"file_id": str(p.id), "name": p.name, "size": p.size} for p in pdfs]]
+    pdf_txt = f" · {len(pdfs)} invoice PDF(s) stored as evidence" if pdfs else ""
+    _log(db, f, user.id, f"Invoice register uploaded: {stored.name} — {len(rows)} row(s) parsed{pdf_txt}.")
+    _reconcile(db, f, user)
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+# ---------- stage 3: auto-reconciliation ----------
+
+def _reconcile(db: Session, f: VatFiling, user: User):
+    """Match key = normalized invoice_no + VAT amount (±0.01). Dates are NEVER used for
+    matching — but rows dated before the PREVIOUS period's start are out of window."""
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)).all()
+    for i in items:  # recon always restarts clean
+        i.bucket = None
+        i.resolution = None
+        i.included = True
+
+    in_window, out_of_window = [], []
+    for i in items:
+        if i.invoice_date < f.prev_period_start:
+            i.bucket = "out_of_window"
+            i.included = False
+            out_of_window.append(i)
+        else:
+            in_window.append(i)
+
+    # only Output (sales) ledger rows match against the client's issued-invoice register;
+    # Input (purchase) rows have no register counterpart — they stay included, unbucketed
+    ledger = [i for i in in_window if i.source == "ledger" and i.type_ == "Output"]
+    invoices = [i for i in in_window if i.source == "invoice"]
+    unused = list(invoices)
+    matched = []
+    for L in ledger:
+        hit = next((I for I in unused
+                    if I.invoice_no_norm == L.invoice_no_norm
+                    and round(abs(float(I.vat) - float(L.vat)), 2) <= VAT_TOLERANCE), None)
+        if hit is not None:
+            L.bucket = hit.bucket = "matched"
+            unused.remove(hit)
+            matched.append((L, hit))
+        else:
+            L.bucket = "ledger_only"
+    for I in unused:
+        I.bucket = "invoice_only"
+
+    ledger_only = [i for i in ledger if i.bucket == "ledger_only"]
+    invoice_only = unused
+    excel = _recon_workbook(f, matched, ledger_only, invoice_only, out_of_window)
+    fname = f"VAT Reconciliation {f.period_start:%b} - {f.period_end:%b %Y}.xlsx"
+    stored = _store_bytes(db, user, "client", f.client_id or f.id, fname, excel)
+    f.recon = {
+        "at": iso(now()), "excel_file_id": str(stored.id), "excel_name": fname,
+        "matched": len(matched), "ledger_only": len(ledger_only),
+        "invoice_only": len(invoice_only), "out_of_window": len(out_of_window),
+    }
+    f.status = "reconciled"
+    diffs = len(ledger_only) + len(invoice_only)
+    _log(db, f, user.id,
+         f"Auto-reconciliation run (key: invoice no + VAT amount ±{VAT_TOLERANCE:.2f}; dates never matched): "
+         f"{len(matched)} matched · {len(ledger_only)} in ledger not in invoices · "
+         f"{len(invoice_only)} in invoices not in ledger · {len(out_of_window)} out of window "
+         f"(dated before {f.prev_period_start:%d %b %Y} — VAT rule). "
+         f"Reconciliation workbook stored on the client registry: {fname}. "
+         + ("Resolve every difference to unlock the computation." if diffs
+            else "No differences — the computation is unlocked."))
+
+
+def _recon_workbook(f: VatFiling, matched, ledger_only, invoice_only, out_of_window) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    AMBER = PatternFill("solid", fgColor="FDE9C8")
+    HEAD = Font(bold=True)
+    COLS = ["Source", "Row", "Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT", "Type", "Bucket"]
+
+    def put_rows(ws, items, fill=None):
+        ws.append(COLS)
+        for c in ws[1]:
+            c.font = HEAD
+        for i in items:
+            ws.append([i.source, i.row_no, i.invoice_no, i.invoice_date.strftime("%d/%m/%Y"), i.party,
+                       i.emirate, float(i.net), float(i.vat), i.type_ or "", i.bucket])
+            if fill:
+                for c in ws[ws.max_row]:
+                    c.fill = fill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["VAT Reconciliation"])
+    ws["A1"].font = Font(bold=True, size=13)
+    ws.append([f"Period: {_period_label(f)}"])
+    ws.append([f"Window rule: invoices dated before {f.prev_period_start:%d %b %Y} are excluded (VAT rule)"])
+    ws.append([])
+    ws.append(["Matched", len(matched)])
+    ws.append(["In ledger, not in invoices", len(ledger_only)])
+    ws.append(["In invoices, not in ledger", len(invoice_only)])
+    ws.append(["Out of window (VAT rule)", len(out_of_window)])
+    put_rows(wb.create_sheet("Matched"), [x for pair in matched for x in pair])
+    put_rows(wb.create_sheet("Differences"), [*ledger_only, *invoice_only], fill=AMBER)
+    put_rows(wb.create_sheet("Excluded"), out_of_window)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _item(db: Session, f: VatFiling, item_id: uuid.UUID) -> VatFilingItem:
+    it = db.scalar(select(VatFilingItem).where(VatFilingItem.filing_id == f.id, VatFilingItem.id == item_id))
+    if it is None:
+        raise HTTPException(status_code=404, detail="filing item not found")
+    return it
+
+
+@router.post("/filings/{fid}/items/{item_id}/request-invoice")
+def request_missing_invoice(fid: uuid.UUID, item_id: uuid.UUID, body: MailIn,
+                            user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    it = _item(db, f, item_id)
+    if it.bucket not in ("ledger_only", "invoice_only"):
+        raise conflict("Only reconciliation differences can be chased with the client")
+    emails.send_client(str(body.to), body.subject, body.body)
+    db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="missing_invoice",
+                            item_id=it.id, to_email=str(body.to), subject=body.subject, by_user=user.id))
+    it.resolution = {"action": "requested", "by": str(user.id), "at": iso(now()), "to": str(body.to)}
+    _log(db, f, user.id, f'Missing-invoice request emailed to {body.to} for "{it.invoice_no}" '
+                         f'({it.party}, VAT {float(it.vat):,.2f}) — subject: "{body.subject}"')
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/items/{item_id}/resolve")
+def resolve_item(fid: uuid.UUID, item_id: uuid.UUID, user: User = Depends(current_user),
+                 db: Session = Depends(get_db)):
+    """The requested invoice arrived (or the ledger was corrected) — the row counts as resolved."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    it = _item(db, f, item_id)
+    if it.bucket not in ("ledger_only", "invoice_only"):
+        raise conflict("Only reconciliation differences can be resolved")
+    it.resolution = {**(it.resolution or {}), "action": "resolved", "by": str(user.id), "at": iso(now())}
+    _log(db, f, user.id, f'Difference resolved: "{it.invoice_no}" ({it.source}) — supporting record received.')
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/items/{item_id}/exclude")
+def exclude_item(fid: uuid.UUID, item_id: uuid.UUID, body: ReasonIn,
+                 user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    it = _item(db, f, item_id)
+    if it.bucket not in ("ledger_only", "invoice_only"):
+        raise conflict("Only reconciliation differences can be excluded")
+    it.resolution = {"action": "excluded", "reason": body.reason.strip(), "by": str(user.id), "at": iso(now())}
+    it.included = False
+    _log(db, f, user.id, f'Difference EXCLUDED from this filing: "{it.invoice_no}" ({it.source}) — '
+                         f'mandatory reason: "{body.reason.strip()}"')
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+# ---------- client requests (stage 1 & 2, template attached) ----------
+
+@router.post("/filings/{fid}/request-from-client")
+def request_from_client(fid: uuid.UUID, body: RequestFromClientIn,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    if body.kind not in ("ledger", "invoices"):
+        raise HTTPException(status_code=422, detail="kind must be ledger or invoices")
+    template = _ledger_template_bytes() if body.kind == "ledger" else _register_template_bytes()
+    tname = "VAT Ledger Template.xlsx" if body.kind == "ledger" else "Invoice Register Template.xlsx"
+    stored = _store_bytes(db, user, "vat_filing", f.id, tname, template)
+    link = _file_link(stored)
+    emails.send_client(str(body.to), body.subject,
+                       body.body + f"\n\nTemplate ({tname}) — download link (valid {blobs.LINK_TTL_MIN} minutes):\n{link}")
+    db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind=body.kind,
+                            to_email=str(body.to), subject=body.subject, by_user=user.id))
+    label = "VAT ledger" if body.kind == "ledger" else "invoice register"
+    _log(db, f, user.id, f'{label.capitalize()} requested from client at {body.to} — '
+                         f'subject: "{body.subject}" (template attached).')
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+# ---------- stage 4: computation ----------
+
+def _included_ledger_rows(db: Session, f: VatFiling) -> list[VatFilingItem]:
+    """Ledger rows entering the computation: matched Output rows, resolved differences,
+    and Input rows (never register-matched) — excluded and out-of-window rows never."""
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id,
+                                                   VatFilingItem.source == "ledger")).all()
+    out = []
+    for i in items:
+        if not i.included or i.bucket == "out_of_window":
+            continue
+        if i.bucket == "ledger_only" and (i.resolution or {}).get("action") != "resolved":
+            continue
+        out.append(i)
+    return out
+
+
+@router.post("/filings/{fid}/draft-computation")
+def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)).all()
+    unresolved = _unresolved_count(items)
+    if unresolved:
+        raise conflict(f"{unresolved} reconciliation difference(s) unresolved — every difference must be "
+                       f"matched, requested→resolved, or excluded with a reason before the computation")
+    rows = _included_ledger_rows(db, f)
+    if not rows:
+        raise conflict("No includable ledger rows — nothing to compute")
+    output = [r for r in rows if r.type_ == "Output"]
+    input_ = [r for r in rows if r.type_ == "Input"]
+    output_vat = round(sum(float(r.vat) for r in output), 2)
+    input_vat = round(sum(float(r.vat) for r in input_), 2)
+    net = round(output_vat - input_vat, 2)
+    per_emirate = {}
+    for r in output:
+        pe = per_emirate.setdefault(r.emirate, {"taxable_sales": 0.0, "output_vat": 0.0, "rows": 0})
+        pe["taxable_sales"] = round(pe["taxable_sales"] + float(r.net), 2)
+        pe["output_vat"] = round(pe["output_vat"] + float(r.vat), 2)
+        pe["rows"] += 1
+    excluded = sum(1 for i in items if (i.resolution or {}).get("action") == "excluded")
+    f.computation = {
+        "period": _period_label(f), "at": iso(now()), "by": str(user.id),
+        "output_vat": output_vat, "input_vat": input_vat, "net": abs(net),
+        "position": "payable" if net >= 0 else "refundable",
+        "taxable_sales": round(sum(float(r.net) for r in output), 2),
+        "per_emirate": per_emirate,
+        "counts": {"included": len(rows), "output_rows": len(output), "input_rows": len(input_),
+                   "matched": sum(1 for i in items if i.bucket == "matched") // 2,
+                   "excluded": excluded,
+                   "out_of_window": sum(1 for i in items if i.bucket == "out_of_window")},
+        "confirmed": False,
+    }
+    f.status = "computation_draft"
+    _log(db, f, user.id, f"Computation auto-drafted from {len(rows)} included ledger row(s): "
+                         f"output VAT {output_vat:,.2f} · input VAT {input_vat:,.2f} · "
+                         f"net {abs(net):,.2f} {f.computation['position'].upper()}. Review and confirm.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+def _computation_pdf(f: VatFiling, client_name: str) -> bytes:
+    """Minimal clean single-page PDF (no external deps) with the computation."""
+    c = f.computation
+    lines = [
+        "VAT Return Computation",
+        f"Client: {client_name}",
+        f"Period: {c['period']}",
+        "",
+        f"Taxable sales (net):        AED {c['taxable_sales']:,.2f}",
+        f"Output VAT:                 AED {c['output_vat']:,.2f}",
+        f"Input VAT (recoverable):    AED {c['input_vat']:,.2f}",
+        f"NET VAT {c['position'].upper():<12}        AED {c['net']:,.2f}",
+        "",
+        "Taxable sales per emirate:",
+    ]
+    for em, v in c["per_emirate"].items():
+        lines.append(f"  {em:<18} AED {v['taxable_sales']:,.2f}  (output VAT {v['output_vat']:,.2f}, "
+                     f"{v['rows']} invoice(s))")
+    k = c["counts"]
+    lines += ["", f"Basis: {k['included']} ledger rows included ({k['output_rows']} output / "
+                  f"{k['input_rows']} input) · {k['matched']} reconciled matches · "
+                  f"{k['excluded']} excluded · {k['out_of_window']} out of window.",
+              "", "Please review and confirm your approval so we can file at the FTA."]
+
+    def esc(s):
+        return s.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+    content = "BT /F1 11 Tf 14 TL 56 790 Td\n"
+    for i, ln in enumerate(lines):
+        content += f"({esc(ln)}) Tj T*\n"
+    content += "ET"
+    content_b = content.encode("latin-1", "replace")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        b"<< /Length " + str(len(content_b)).encode() + b" >>\nstream\n" + content_b + b"\nendstream",
+    ]
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for n, body in enumerate(objs, start=1):
+        offsets.append(out.tell())
+        out.write(f"{n} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref_at = out.tell()
+    out.write(f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode())
+    for off in offsets:
+        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF".encode())
+    return out.getvalue()
+
+
+@router.post("/filings/{fid}/confirm-computation")
+def confirm_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "computation_draft")
+    client = db.get(Client, f.client_id) if f.client_id else None
+    client_name = client.name if client else "Client"
+    pdf = _computation_pdf(f, client_name)
+    pname = f"VAT Computation {f.period_start:%b} - {f.period_end:%b %Y}.pdf"
+    stored = _store_bytes(db, user, "client", f.client_id or f.id, pname, pdf)
+    f.computation = {**f.computation, "confirmed": True, "confirmed_at": iso(now()),
+                     "pdf_file_id": str(stored.id), "pdf_name": pname}
+    f.status = "awaiting_client_approval"
+    _log(db, f, user.id, f"Computation reviewed and CONFIRMED by staff. Rendered as {pname} "
+                         f"(stored on the client registry). Stage 5 — send to the client for approval.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/send-computation")
+def send_computation(fid: uuid.UUID, body: MailIn, user: User = Depends(current_user),
+                     db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "awaiting_client_approval")
+    pdf_id = (f.computation or {}).get("pdf_file_id")
+    pdf_row = db.get(FileModel, uuid.UUID(pdf_id)) if pdf_id else None
+    link = f"\n\nComputation ({f.computation['pdf_name']}) — download link (valid {blobs.LINK_TTL_MIN} minutes):\n" \
+           f"{_file_link(pdf_row)}" if pdf_row else ""
+    emails.send_client(str(body.to), body.subject, body.body + link)
+    db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="computation",
+                            to_email=str(body.to), subject=body.subject, by_user=user.id))
+    _log(db, f, user.id, f'Computation emailed to the client at {body.to} — subject: "{body.subject}" '
+                         f"(PDF attached). Awaiting client approval.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/client-approval")
+def record_client_approval(
+    fid: uuid.UUID,
+    basis: str = Form("evidence_upload"),
+    note: str = Form(""),
+    evidence: list[UploadFile] = FileParam(default=[]),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Evidence upload, or declared-with-basis + mandatory note (proposal-confirmation discipline)."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "awaiting_client_approval")
+    if basis not in APPROVAL_BASES:
+        raise HTTPException(status_code=422, detail=f"basis must be one of {sorted(APPROVAL_BASES)}")
+    stored = [_store_upload(db, user, "client", f.client_id or f.id, e) for e in evidence]
+    if basis == "evidence_upload" and not stored:
+        raise HTTPException(status_code=422, detail="Upload the client's approval, or pick a declared basis")
+    if basis != "evidence_upload" and not note.strip():
+        raise conflict("A note describing exactly how the client approved is mandatory")
+    f.client_approval = {"basis": basis, "label": APPROVAL_BASES[basis], "note": note.strip() or None,
+                         "at": iso(now()), "by": str(user.id),
+                         "evidence": [{"file_id": str(s.id), "name": s.name} for s in stored]}
+    f.status = "ready_to_file"
+    ev_txt = f' Evidence on file: {", ".join(s.name for s in stored)}.' if stored else ""
+    _log(db, f, user.id, f"Client approval recorded — basis: {APPROVAL_BASES[basis]}"
+                         f"{'; note: ' + repr(note.strip()) if note.strip() else ''}.{ev_txt} "
+                         f"Stage 6 — file at the FTA.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+# ---------- stage 6: file at FTA → complete the linked duty ----------
+
+@router.post("/filings/{fid}/file-at-fta")
+def file_at_fta(
+    fid: uuid.UUID,
+    note: str = Form(""),
+    acknowledgement: list[UploadFile] = FileParam(default=[]),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "ready_to_file")
+    if not acknowledgement:
+        raise HTTPException(status_code=422, detail="The FTA acknowledgement upload is required")
+    duty = db.get(Duty, f.duty_id)
+    if duty is None or duty.closed:
+        raise conflict("The linked duty is missing or closed")
+    if duty.staff_id != user.id:
+        raise conflict("Only the responsible staff member can complete this duty")
+
+    stored = [_store_upload(db, user, "client", f.client_id or f.id, a) for a in acknowledgement]
+    c = f.computation
+    record = {
+        "period": c["period"],
+        "position": c["position"],
+        "net VAT (AED)": f"{c['net']:,.2f}",
+        "output VAT (AED)": f"{c['output_vat']:,.2f}",
+        "input VAT (AED)": f"{c['input_vat']:,.2f}",
+        "taxable sales per emirate": "; ".join(
+            f"{em} {v['taxable_sales']:,.2f}" for em, v in c["per_emirate"].items()),
+    }
+    # the module's ONE outward touch: complete the linked duty through the existing machinery
+    apply_completion(db, duty, user, method="proof", stored=stored, record_obj=record,
+                     note=note or f"Filed via VAT Filing Engine — {c['period']}")
+
+    f.fta_ack = {"at": iso(now()), "by": str(user.id), "note": note or None,
+                 "evidence": [{"file_id": str(s.id), "name": s.name} for s in stored]}
+    f.status = "complete"
+    f.completed_at = now()
+    _log(db, f, user.id, f"FILED AT FTA — acknowledgement on file: {', '.join(s.name for s in stored)}. "
+                         f"FILING COMPLETE — {c['period']}, net {c['net']:,.2f} {c['position'].upper()}. "
+                         f"Linked duty completed with method=proof (record pre-filled from the computation); "
+                         f"the schedule rolls forward automatically. Trail sealed.")
+    db.commit()
+    return {"filing": serialize(db, f, detail=True),
+            "duty": {"id": duty.id, "next_due": duty.next_due, "closed": duty.closed}}

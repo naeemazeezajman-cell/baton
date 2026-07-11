@@ -42,6 +42,10 @@ app.include_router(clients.router)
 app.include_router(performance.router)
 app.include_router(files.router)
 
+# VAT-ENGINE (separate, removable module — see REMOVING-VAT-ENGINE.md): delete these two lines to detach
+from .routers import vat_engine  # noqa: E402
+app.include_router(vat_engine.router)
+
 
 @app.get("/health", tags=["meta"])
 def health():

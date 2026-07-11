@@ -162,35 +162,19 @@ def _validate_completion(kind: str, method: str, files: list, record: dict | Non
     raise HTTPException(status_code=422, detail="method must be sent, proof, or declared")
 
 
-@router.post("/{duty_id}/complete")
-def complete_duty(
-    duty_id: uuid.UUID,
-    method: str = Form(...),
-    note: str = Form(""),
-    reason: str = Form(""),
-    emailed_to: str = Form(""),
-    record: str = Form(""),  # JSON object string
-    evidence: list[UploadFile] = FileParam(default=[]),
-    user: User = Depends(current_user),
-    db: Session = Depends(get_db),
-):
-    d = get_scoped_or_404(db, Duty, duty_id, user)
-    if d.staff_id != user.id:
-        raise conflict("Only the responsible staff member can complete this duty")
-    if d.closed:
-        raise conflict("This duty is closed")
-    try:
-        record_obj = json.loads(record) if record.strip() else None
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=422, detail="record must be a JSON object")
-    _validate_completion(d.kind, method, evidence, record_obj, emailed_to, reason)
+def apply_completion(db: Session, d: Duty, user: User, method: str, stored: list,
+                     record_obj: dict | None = None, note: str = "", reason: str = "",
+                     emailed_to: str = ""):
+    """Core completion: completion row, events, 'sent' email, schedule advance. No commit.
+    `stored` is already-persisted File rows (evidence). Used by the /complete endpoint and
+    by modules that finish a duty as their last step (e.g. the VAT Filing Engine)."""
+    _validate_completion(d.kind, method, stored, record_obj, emailed_to, reason)
 
     done_at = now()
     due_at = d.next_due if d.next_due.tzinfo else d.next_due.replace(tzinfo=timezone.utc)
     late_ms = max(0, int((done_at - due_at).total_seconds() * 1000))
     late_txt = f"{fmt_dur(late_ms)} LATE" if late_ms > 0 else "on time"
 
-    stored = [store_upload(db, user, "duty", d.id, f) for f in evidence]
     evidence_meta = [{"file_id": str(f.id), "name": f.name, "size": f.size} for f in stored]
     names = ", ".join(f.name for f in stored)
 
@@ -238,5 +222,32 @@ def complete_duty(
     else:
         d.closed = True
         _log(db, d, None, "One-time duty closed.")
+
+
+@router.post("/{duty_id}/complete")
+def complete_duty(
+    duty_id: uuid.UUID,
+    method: str = Form(...),
+    note: str = Form(""),
+    reason: str = Form(""),
+    emailed_to: str = Form(""),
+    record: str = Form(""),  # JSON object string
+    evidence: list[UploadFile] = FileParam(default=[]),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    d = get_scoped_or_404(db, Duty, duty_id, user)
+    if d.staff_id != user.id:
+        raise conflict("Only the responsible staff member can complete this duty")
+    if d.closed:
+        raise conflict("This duty is closed")
+    try:
+        record_obj = json.loads(record) if record.strip() else None
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=422, detail="record must be a JSON object")
+    _validate_completion(d.kind, method, evidence, record_obj, emailed_to, reason)
+    stored = [store_upload(db, user, "duty", d.id, f) for f in evidence]
+    apply_completion(db, d, user, method, stored, record_obj=record_obj, note=note,
+                     reason=reason, emailed_to=emailed_to)
     db.commit()
     return _serialize(d, db)
