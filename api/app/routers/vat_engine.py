@@ -10,11 +10,12 @@ the linked duty through the existing machinery. Nothing outside this module impo
 except the two registration lines in app/main.py and alembic/env.py.
 """
 
+import calendar
 import io
 import os
 import re
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from typing import Literal
 
@@ -51,12 +52,20 @@ REGISTER_COLUMNS = ["Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VA
                     "Supply Category"]
 
 SUPPLY_CATEGORIES = {"standard": "Standard (5%)", "zero_rated": "Zero-rated (0%)", "exempt": "Exempt",
-                     "margin": "Margin scheme", "rcm_import": "RCM-Import"}
+                     "margin": "Margin scheme", "rcm_import": "RCM-Import",
+                     "out_of_scope": "Out of scope (designated zone)"}
 
 BUSINESS_CATEGORIES = ("Trading", "Services", "Real estate", "Used goods & vehicles", "Manufacturing",
                        "Logistics & transport", "Education", "Healthcare", "Financial services", "Other")
-FLAG_KEYS = ("has_zero_rated", "has_exempt", "margin_scheme", "rcm_imports", "designated_zone")
+# the practitioner interview (wizard v2) — one stored answer per key, yes/no/not_sure + note
+FLAG_KEYS = ("trn_confirmed", "has_zero_rated", "has_exempt", "designated_zone", "margin_scheme",
+             "rcm_imports", "blocked_input_risk", "open_fta_matters")
 FLAG_VALUE_LABELS = {"yes": "Yes", "no": "No", "not_sure": "Not sure"}
+
+STAGGERS = {"jan_apr_jul_oct": "Jan/Apr/Jul/Oct", "feb_may_aug_nov": "Feb/May/Aug/Nov",
+            "mar_jun_sep_dec": "Mar/Jun/Sep/Dec", "monthly": "Monthly"}
+STAGGER_END_MONTHS = {"jan_apr_jul_oct": (1, 4, 7, 10), "feb_may_aug_nov": (2, 5, 8, 11),
+                      "mar_jun_sep_dec": (3, 6, 9, 12)}
 
 APPROVAL_BASES = {
     "evidence_upload": "written approval on file (upload)",
@@ -156,6 +165,7 @@ class VatClientProfile(Base):
     client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clients.id"))
     nature_of_business: Mapped[str | None] = mapped_column(Text)
     business_category: Mapped[str] = mapped_column(Text)
+    tax_period_stagger: Mapped[str | None] = mapped_column(Text)  # STAGGERS key — drives period derivation
     flags: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'"))  # {key: {value: yes|no|not_sure, note}}
     other_notes: Mapped[str | None] = mapped_column(Text)
     version: Mapped[int] = mapped_column(Integer, server_default=text("1"))
@@ -206,6 +216,7 @@ class FlagIn(BaseModel):
 class ProfileIn(BaseModel):
     nature_of_business: str = ""
     business_category: str
+    tax_period_stagger: Literal["jan_apr_jul_oct", "feb_may_aug_nov", "mar_jun_sep_dec", "monthly"] | None = None
     flags: dict[str, FlagIn] = {}
     other_notes: str | None = None
 
@@ -246,18 +257,26 @@ def _month_shift(year: int, month: int, months_back: int) -> tuple[int, int]:
     return m // 12, m % 12 + 1
 
 
-def derive_period(duty: Duty) -> tuple[date, date, date]:
-    """Filing period from the duty's schedule (incl. staggered quarters): the period ends
-    on the last day of the month before the due month; it spans one cadence back; the
-    window rule boundary is one further cadence back."""
+def derive_period(duty: Duty, profile=None) -> tuple[date, date, date]:
+    """Filing period from the duty's schedule. When the client's VAT profile records a tax
+    period stagger, the stagger drives the period: the period ends on the latest stagger
+    month-end before the due month (monthly stagger → one-month periods). Without a
+    profile, the period simply ends the month before the due month and spans one cadence.
+    The window-rule boundary is one further period back."""
     months = CADENCE_MONTHS.get(duty.cadence, 3)
+    stagger = getattr(profile, "tax_period_stagger", None) if profile else None
+    if stagger == "monthly":
+        months = 1
     due = duty.next_due
-    period_end = date(due.year, due.month, 1) - timedelta(days=1)
-    y1, m1 = _month_shift(due.year, due.month, months)
-    period_start = date(y1, m1, 1)
-    y2, m2 = _month_shift(due.year, due.month, 2 * months)
-    prev_period_start = date(y2, m2, 1)
-    return period_start, period_end, prev_period_start
+    end_y, end_m = _month_shift(due.year, due.month, 1)  # month before the due month
+    if stagger in STAGGER_END_MONTHS:
+        months = 3
+        while end_m not in STAGGER_END_MONTHS[stagger]:
+            end_y, end_m = _month_shift(end_y, end_m, 1)
+    period_end = date(end_y, end_m, calendar.monthrange(end_y, end_m)[1])
+    y1, m1 = _month_shift(end_y, end_m, months - 1)
+    y2, m2 = _month_shift(end_y, end_m, 2 * months - 1)
+    return date(y1, m1, 1), period_end, date(y2, m2, 1)
 
 
 def _store_bytes(db: Session, user: User, entity: str, entity_id, name: str, data: bytes) -> FileModel:
@@ -343,7 +362,10 @@ def _serialize_profile(p: VatClientProfile | None) -> dict | None:
     if p is None:
         return None
     return {"id": p.id, "client_id": p.client_id, "nature_of_business": p.nature_of_business,
-            "business_category": p.business_category, "flags": p.flags, "other_notes": p.other_notes,
+            "business_category": p.business_category,
+            "tax_period_stagger": p.tax_period_stagger,
+            "tax_period_stagger_label": STAGGERS.get(p.tax_period_stagger),
+            "flags": p.flags, "other_notes": p.other_notes,
             "version": p.version, "created_by": p.created_by, "created_at": p.created_at,
             "updated": p.updated}
 
@@ -377,6 +399,23 @@ def _log_to_open_filings(db: Session, user: User, client_id, txt: str):
         _log(db, f, user.id, txt)
 
 
+def _realign_open_periods(db: Session, user: User, client_id, profile: VatClientProfile):
+    """The stagger drives every deadline: open filings that haven't started collecting yet
+    re-derive their period when the profile's stagger is recorded or changed."""
+    for f in db.scalars(select(VatFiling).where(VatFiling.tenant_id == user.tenant_id,
+                                                VatFiling.client_id == client_id,
+                                                VatFiling.status == "ledgers_pending")).all():
+        duty = db.get(Duty, f.duty_id)
+        if duty is None:
+            continue
+        ps, pe, pps = derive_period(duty, profile)
+        if (ps, pe, pps) != (f.period_start, f.period_end, f.prev_period_start):
+            f.period_start, f.period_end, f.prev_period_start = ps, pe, pps
+            _log(db, f, user.id, f"Filing period re-aligned to the profile's tax period stagger "
+                                 f"({STAGGERS.get(profile.tax_period_stagger, '—')}): {_period_label(f)}. "
+                                 f"Window rule boundary now {pps:%d %b %Y}.")
+
+
 @router.get("/clients/{client_id}/profile")
 def get_profile(client_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
     get_scoped_or_404(db, Client, client_id, user)
@@ -395,21 +434,39 @@ def create_profile(client_id: uuid.UUID, body: ProfileIn, user: User = Depends(c
         raise conflict("A VAT profile already exists for this client — edit it instead")
     if body.business_category not in BUSINESS_CATEGORIES:
         raise HTTPException(status_code=422, detail=f"business_category must be one of {BUSINESS_CATEGORIES}")
+    flags_n = _normalize_flags(body.flags)
     p = VatClientProfile(tenant_id=user.tenant_id, client_id=client_id,
                          nature_of_business=body.nature_of_business.strip() or None,
                          business_category=body.business_category,
-                         flags=_normalize_flags(body.flags),
+                         tax_period_stagger=body.tax_period_stagger,
+                         flags=flags_n,
                          other_notes=(body.other_notes or "").strip() or None,
                          created_by=user.id)
+    # v1 history entry — every answer, including "Not sure", is on record from day one
+    v1_changes = [{"field": "business_category", "old": None, "new": body.business_category, "note": None},
+                  {"field": "tax_period_stagger", "old": None,
+                   "new": STAGGERS.get(body.tax_period_stagger), "note": None}]
+    if body.nature_of_business.strip():
+        v1_changes.append({"field": "nature_of_business", "old": None,
+                           "new": body.nature_of_business.strip(), "note": None})
+    for k in FLAG_KEYS:
+        v1_changes.append({"field": k, "old": None, "new": FLAG_VALUE_LABELS[flags_n[k]["value"]],
+                           "note": flags_n[k]["note"]})
+    p.updated = [{"version": 1, "at": iso(now()), "by": str(user.id), "by_name": user.name,
+                  "changes": v1_changes}]
     db.add(p)
     db.flush()
     active = [k for k in FLAG_KEYS if p.flags[k]["value"] in ("yes", "not_sure")]
     unsure = [k for k in FLAG_KEYS if p.flags[k]["value"] == "not_sure"]
     _log_to_open_filings(db, user, client_id,
                          f"VAT client profile v1 recorded by {user.name} for {client.name} "
-                         f"({body.business_category}) — flags: {', '.join(active) or 'none'}"
+                         f"({body.business_category}"
+                         + (f", stagger {STAGGERS[body.tax_period_stagger]}" if body.tax_period_stagger else "")
+                         + f") — flags: {', '.join(active) or 'none'}"
                          + (f"; NOT SURE (confirm with client): {', '.join(unsure)}" if unsure else "")
                          + ". Applied to this filing.")
+    if body.tax_period_stagger:
+        _realign_open_periods(db, user, client_id, p)
     db.commit()
     return _serialize_profile(p)
 
@@ -425,31 +482,46 @@ def update_profile(client_id: uuid.UUID, body: ProfileIn, user: User = Depends(c
     if body.business_category not in BUSINESS_CATEGORIES:
         raise HTTPException(status_code=422, detail=f"business_category must be one of {BUSINESS_CATEGORIES}")
     new_flags = _normalize_flags(body.flags)
+    # structured version rows: {field, old → new, note}
     changes = []
     if (p.nature_of_business or "") != (body.nature_of_business.strip() or ""):
-        changes.append(f'nature of business "{p.nature_of_business or "—"}" → "{body.nature_of_business.strip() or "—"}"')
+        changes.append({"field": "nature_of_business", "old": p.nature_of_business or "—",
+                        "new": body.nature_of_business.strip() or "—", "note": None})
     if p.business_category != body.business_category:
-        changes.append(f"category {p.business_category} → {body.business_category}")
+        changes.append({"field": "business_category", "old": p.business_category,
+                        "new": body.business_category, "note": None})
+    if p.tax_period_stagger != body.tax_period_stagger:
+        changes.append({"field": "tax_period_stagger", "old": STAGGERS.get(p.tax_period_stagger, "—"),
+                        "new": STAGGERS.get(body.tax_period_stagger, "—"), "note": None})
     for k in FLAG_KEYS:
         old, new = p.flags.get(k) or {"value": "no", "note": None}, new_flags[k]
         if old.get("value") != new["value"]:
-            note_txt = f' — note: "{new["note"]}"' if new["note"] else ""
-            changes.append(f"{k} {FLAG_VALUE_LABELS[old.get('value', 'no')]} → {FLAG_VALUE_LABELS[new['value']]}{note_txt}")
+            changes.append({"field": k, "old": FLAG_VALUE_LABELS[old.get("value", "no")],
+                            "new": FLAG_VALUE_LABELS[new["value"]], "note": new["note"]})
         elif (old.get("note") or None) != new["note"]:
-            changes.append(f'{k} note → "{new["note"] or "—"}"')
+            changes.append({"field": k, "old": old.get("note") or "—", "new": new["note"] or "—",
+                            "note": "note changed"})
     if (p.other_notes or None) != ((body.other_notes or "").strip() or None):
-        changes.append("other notes updated")
+        changes.append({"field": "other_notes", "old": p.other_notes or "—",
+                        "new": (body.other_notes or "").strip() or "—", "note": None})
     if not changes:
         return _serialize_profile(p)
+    stagger_changed = p.tax_period_stagger != body.tax_period_stagger
     p.nature_of_business = body.nature_of_business.strip() or None
     p.business_category = body.business_category
+    p.tax_period_stagger = body.tax_period_stagger
     p.flags = new_flags
     p.other_notes = (body.other_notes or "").strip() or None
     p.version = p.version + 1
     p.updated = [*p.updated, {"at": iso(now()), "by": str(user.id), "by_name": user.name,
                               "version": p.version, "changes": changes}]
+    rendered = "; ".join(
+        f"{c['field']} {c['old']} → {c['new']}" + (f' — note: "{c["note"]}"' if c["note"] else "")
+        for c in changes)
     _log_to_open_filings(db, user, client_id,
-                         f"Profile updated to v{p.version} by {user.name}: {'; '.join(changes)}")
+                         f"Profile updated to v{p.version} by {user.name}: {rendered}")
+    if stagger_changed:
+        _realign_open_periods(db, user, client_id, p)
     db.commit()
     return _serialize_profile(p)
 
@@ -663,16 +735,18 @@ def open_filing(body: OpenIn, user: User = Depends(current_user), db: Session = 
                                                  VatFiling.status != "complete"))
     if existing:
         return serialize(db, existing, detail=True)
-    ps, pe, pps = derive_period(duty)
+    prof = _get_profile(db, user.tenant_id, duty.client_id)
+    ps, pe, pps = derive_period(duty, prof)
     f = VatFiling(tenant_id=duty.tenant_id, duty_id=duty.id, client_id=duty.client_id,
                   staff_id=duty.staff_id, period_start=ps, period_end=pe, prev_period_start=pps,
                   status="ledgers_pending")
     db.add(f)
     db.flush()
-    _log(db, f, user.id, f"VAT filing period opened: {_period_label(f)} (derived from the duty schedule, "
-                         f"due {fmt_d(duty.next_due)}). Stage 1 — collect the VAT ledger. "
+    stagger_txt = (f", stagger {STAGGERS[prof.tax_period_stagger]} from profile v{prof.version}"
+                   if prof and prof.tax_period_stagger else "")
+    _log(db, f, user.id, f"VAT filing period opened: {_period_label(f)} (derived from the duty schedule"
+                         f"{stagger_txt}, due {fmt_d(duty.next_due)}). Stage 1 — collect the VAT ledger. "
                          f"Invoices dated before {pps:%d %b %Y} fall out of the filing window (VAT rule).")
-    prof = _get_profile(db, f.tenant_id, f.client_id)
     if prof:
         active = [k for k in FLAG_KEYS if prof.flags.get(k, {}).get("value") in ("yes", "not_sure")]
         _log(db, f, None, f"VAT client profile v{prof.version} auto-applied "
@@ -957,32 +1031,45 @@ def _compliance_checks(profile: VatClientProfile | None, present: dict) -> list[
     checks = []
     yes = lambda k: _flag_value(profile, k) in ("yes", "not_sure")  # noqa: E731
     labels = {"zero_rated": "zero-rated", "exempt": "exempt", "margin": "margin-scheme",
-              "rcm_import": "RCM-import"}
+              "rcm_import": "RCM-import", "out_of_scope": "out-of-scope (designated zone)"}
     if profile is not None:
         if yes("has_zero_rated") and present["zero_rated"] == 0:
             checks.append({"id": "zero_rated_expected_missing", "kind": "warning",
-                           "text": "The client profile expects zero-rated sales (exports, international "
-                                   "services…) but this period's ledger has none — confirm with the client "
-                                   "that nothing was missed before filing."})
+                           "text": "The client profile expects zero-rated supplies (Art. 45 — exports, "
+                                   "international transport…) but this period's ledger has none — confirm "
+                                   "with the client that nothing was missed before filing."})
         for cat, flag in (("zero_rated", "has_zero_rated"), ("exempt", "has_exempt"),
-                          ("margin", "margin_scheme"), ("rcm_import", "rcm_imports")):
+                          ("margin", "margin_scheme"), ("rcm_import", "rcm_imports"),
+                          ("out_of_scope", "designated_zone")):
             if present[cat] > 0 and _flag_value(profile, flag) == "no":
                 checks.append({"id": f"{cat}_unexpected", "kind": "warning",
                                "text": f"The ledger contains {present[cat]} {labels[cat]} row(s) but the "
                                        f"client profile says No — update the profile or correct the ledger."})
         if yes("margin_scheme") and present["margin"] > 0:
             checks.append({"id": "margin_confirmation", "kind": "confirmation",
-                           "text": f"VAT on the {present['margin']} margin-scheme row(s) is computed on the "
-                                   f"profit margin (sale − purchase), not the full sale value, per FTA "
-                                   f"margin scheme rules."})
+                           "text": f"Margin-scheme eligibility confirmed for the {present['margin']} "
+                                   f"margin row(s) (Art. 29, Exec. Regs): goods previously subject to VAT, "
+                                   f"purchased from non-registrants or under the scheme — VAT computed on "
+                                   f"the profit margin (sale − purchase), not the full sale value."})
         if yes("rcm_imports"):
             checks.append({"id": "rcm_confirmation", "kind": "confirmation",
-                           "text": "Reverse-charge on imports is self-assessed and included in both output "
-                                   "VAT and recoverable input VAT as applicable."})
+                           "text": "Reverse-charge on imports (Art. 48) is self-assessed — output VAT in "
+                                   "Box 3/6 mechanics and recoverable input VAT as applicable; import VAT "
+                                   "flows via the customs-linked TRN."})
+        if yes("blocked_input_risk"):
+            checks.append({"id": "blocked_input_review", "kind": "confirmation",
+                           "text": "Blocked input categories in the client's spend (entertainment, motor "
+                                   "vehicles with personal use) have been excluded from input VAT recovery."})
+    if present["zero_rated"] > 0:
+        checks.append({"id": "zero_rated_evidence", "kind": "confirmation",
+                       "text": f"Export/zero-rating evidence is retained for the {present['zero_rated']} "
+                               f"zero-rated row(s) — official and commercial evidence (customs exit + "
+                               f"transport documents) within the 90-day rule (Art. 45). Without evidence "
+                               f"the supply is standard-rated at 5%."})
     if present["exempt"] > 0:
         checks.append({"id": "exempt_apportionment", "kind": "confirmation",
                        "text": "Input VAT apportionment has been considered for the exempt supplies in "
-                               "this period."})
+                               "this period (Art. 46 — exempt suppliers cannot recover related input VAT)."})
     return checks
 
 
@@ -1000,9 +1087,11 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
     if not rows:
         raise conflict("No includable ledger rows — nothing to compute")
 
-    # VAT201-shaped split: RCM rows self-assess both sides; zero-rated/exempt add no output VAT
+    # VAT201-shaped split: RCM rows self-assess both sides; zero-rated/exempt add no output
+    # VAT; out-of-scope (designated zone) rows sit outside the return boxes entirely
     rcm_rows = [r for r in rows if r.category == "rcm_import"]
-    non_rcm = [r for r in rows if r.category != "rcm_import"]
+    oos = [r for r in rows if r.category == "out_of_scope"]
+    non_rcm = [r for r in rows if r.category not in ("rcm_import", "out_of_scope")]
     output = [r for r in non_rcm if r.type_ == "Output"]
     input_ = [r for r in non_rcm if r.type_ == "Input"]
     std = [r for r in output if r.category == "standard"]
@@ -1024,7 +1113,7 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
         pe["rows"] += 1
 
     present = {"zero_rated": len(zero), "exempt": len(exempt), "margin": len(margin),
-               "rcm_import": len(rcm_rows)}
+               "rcm_import": len(rcm_rows), "out_of_scope": len(oos)}
     profile = _get_profile(db, f.tenant_id, f.client_id)
     checks = _compliance_checks(profile, present)
     excluded = sum(1 for i in items if (i.resolution or {}).get("action") == "excluded")
@@ -1039,6 +1128,7 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
         "exempt": {"sales": ssum(exempt, "net"), "rows": len(exempt)},
         "margin": {"sales": ssum(margin, "net"), "output_vat": margin_vat, "rows": len(margin)},
         "rcm": {"output_vat": rcm_vat, "input_vat": rcm_vat, "rows": len(rcm_rows)},
+        "out_of_scope": {"sales": ssum(oos, "net"), "rows": len(oos)},  # outside the return boxes
         "checks": checks,
         "counts": {"included": len(rows), "output_rows": len(output), "input_rows": len(input_),
                    "matched": sum(1 for i in items if i.bucket == "matched") // 2,
@@ -1064,6 +1154,7 @@ def _computation_pdf(f: VatFiling, client_name: str) -> bytes:
     """Minimal clean single-page PDF (no external deps) with the computation."""
     c = f.computation
     zr, ex, mg, rcm = (c.get("zero_rated") or {}), (c.get("exempt") or {}), (c.get("margin") or {}), (c.get("rcm") or {})
+    oos = c.get("out_of_scope") or {}
     lines = [
         "VAT Return Computation",
         f"Client: {client_name}",
@@ -1074,6 +1165,7 @@ def _computation_pdf(f: VatFiling, client_name: str) -> bytes:
         f"Exempt supplies:            AED {ex.get('sales', 0):,.2f}",
         f"Margin-scheme sales:        AED {mg.get('sales', 0):,.2f}  (VAT on margin: {mg.get('output_vat', 0):,.2f})",
         f"RCM self-assessed:          output {rcm.get('output_vat', 0):,.2f} / input {rcm.get('input_vat', 0):,.2f}",
+        f"Out of scope (desig. zone): AED {oos.get('sales', 0):,.2f}  (outside the return boxes)",
         f"Output VAT (total):         AED {c['output_vat']:,.2f}",
         f"Input VAT (recoverable):    AED {c['input_vat']:,.2f}",
         f"NET VAT {c['position'].upper():<12}        AED {c['net']:,.2f}",

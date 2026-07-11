@@ -16,23 +16,47 @@ const money = (n) => `AED ${Number(n).toLocaleString("en-AE", { minimumFractionD
 const BUSINESS_CATEGORIES = ["Trading", "Services", "Real estate", "Used goods & vehicles", "Manufacturing",
   "Logistics & transport", "Education", "Healthcare", "Financial services", "Other"];
 
-const FLAG_QUESTIONS = [
-  { key: "has_zero_rated", short: "Zero-rated", q: "Does the client make zero-rated sales?",
-    what: "Sales charged at 0% — typically exports outside the GCC, international transport. The sale appears on the return but adds no output VAT.",
-    example: "e.g. An Ajman trader shipping goods to a buyer in India charges 0% VAT — the sale still goes on the VAT return." },
-  { key: "has_exempt", short: "Exempt", q: "Does the client make exempt supplies?",
-    what: "Supplies with no VAT and no input-VAT credit — residential rent, bare land, local passenger transport, certain financial services.",
-    example: "e.g. A landlord letting residential flats charges no VAT on that rent — and can't recover the related input VAT." },
-  { key: "margin_scheme", short: "Margin scheme", q: "Does the client trade second-hand goods or used vehicles?",
-    what: "Used-car and second-hand dealers may pay VAT only on their profit margin (sale price minus purchase price), not the full sale value — FTA margin scheme.",
-    example: "e.g. A used car bought for AED 40,000, sold for AED 45,000 → VAT is computed on the AED 5,000 margin." },
-  { key: "rcm_imports", short: "RCM imports", q: "Does the client import goods or services from abroad?",
-    what: "On imports the buyer self-accounts the VAT (reverse charge) — it appears as output VAT and, where recoverable, as input VAT on the same return.",
-    example: "e.g. Software licences bought from a US vendor: the client reports the 5% itself instead of the supplier." },
-  { key: "designated_zone", short: "Designated zone", q: "Does the client operate from a designated zone?",
-    what: "FTA-designated free zones (e.g. JAFZA, KIZAD) have special rules — some goods movements are outside the scope of VAT.",
-    example: "e.g. Goods sold between two designated-zone companies may fall outside the scope of UAE VAT entirely." },
+const STAGGER_OPTIONS = [
+  ["jan_apr_jul_oct", "Quarters ending Jan / Apr / Jul / Oct"],
+  ["feb_may_aug_nov", "Quarters ending Feb / May / Aug / Nov"],
+  ["mar_jun_sep_dec", "Quarters ending Mar / Jun / Sep / Dec"],
+  ["monthly", "Monthly tax periods"],
 ];
+
+/* The practitioner interview — how a UAE VAT executive scopes a new filing client.
+   Article references per card; summaries only (see the wizard footer disclaimer). */
+const FLAG_QUESTIONS = [
+  { key: "has_zero_rated", short: "Zero-rated (Art. 45)",
+    q: "Does the client make zero-rated supplies? (Art. 45, Decree-Law)",
+    what: "Exports of goods outside the UAE, international transport, certain international services, the first supply of new residential buildings (within 3 years), qualifying education/healthcare — charged at 0%. Zero-rating of goods exports is CONDITIONAL: export within 90 days with official and commercial evidence retained (customs exit + transport documents); without evidence the supply is standard-rated at 5%. Zero-rated ≠ exempt: zero-rated suppliers still recover input VAT.",
+    example: "A MAINLAND Ajman trader shipping goods to India: 0% only with export evidence under the 90-day rule — otherwise 5%." },
+  { key: "has_exempt", short: "Exempt (Art. 46)",
+    q: "Any exempt income? (Art. 46, Decree-Law)",
+    what: "Residential rent (other than the zero-rated first supply), bare land, local passenger transport, certain margin-based financial services. Exempt suppliers cannot recover related input VAT — with mixed supplies, input VAT apportionment applies.",
+    example: "A landlord letting residential flats charges no VAT on that rent — and the related input VAT is not recoverable." },
+  { key: "designated_zone", short: "Designated zone",
+    q: "Does the client operate in or transact with DESIGNATED zones? (Cabinet Decision listed zones — JAFZA, KIZAD, etc.)",
+    what: "Certain goods movements within/between designated zones can be OUT OF SCOPE under specific conditions — distinct from both zero-rated and exempt, and distinct from ordinary free zones, which follow normal VAT rules.",
+    example: "Goods moved between two designated-zone companies without entering the mainland may fall outside the scope of UAE VAT." },
+  { key: "margin_scheme", short: "Margin scheme (Art. 29 ER)",
+    q: "Used goods / second-hand vehicles / antiques dealing? (Art. 29, Executive Regulations)",
+    what: "Dealers may account for VAT on the profit margin (sale price minus purchase price), not the full sale value. Eligibility conditions apply: the goods were previously subject to VAT and were purchased from non-registrants or under the scheme.",
+    example: "A used car bought from a private individual for AED 40,000, sold for AED 45,000 → VAT on the AED 5,000 margin — if eligibility holds." },
+  { key: "rcm_imports", short: "Reverse charge (Art. 48)",
+    q: "Imports of goods or services from abroad? (Art. 48, Decree-Law)",
+    what: "The buyer self-assesses the VAT (reverse charge) — output VAT via the Box 3/6 mechanics and recoverable input VAT as applicable. Import VAT on goods flows through the customs-linked TRN.",
+    example: "Software licences bought from a US vendor: the client reports the 5% itself instead of the supplier." },
+  { key: "blocked_input_risk", short: "Blocked input",
+    q: "Any blocked input categories in the client's spend?",
+    what: "Some input VAT is never recoverable — entertainment expenses, and motor vehicles available for personal use. Claiming it exposes the client to assessments and penalties.",
+    example: "VAT on a staff iftar dinner or on a company car the owner also drives privately: not recoverable." },
+  { key: "open_fta_matters", short: "FTA history",
+    q: "Any open FTA matters — voluntary disclosures, penalties, clarifications?",
+    what: "Open FTA matters change how conservatively the return should be prepared. Also record: who did the prior filings, and are prior-period working papers available?",
+    example: "e.g. A pending voluntary disclosure on Q4 last year, or a reconsideration request on a late-registration penalty." },
+];
+
+const WIZARD_DISCLAIMER = "Reference summaries only — verify against the Decree-Law and Executive Regulations as amended.";
 
 const STAGES = [
   ["ledgers_pending", "1 · Ledger"],
@@ -199,10 +223,29 @@ export function VatEngineScreen() {
   );
 }
 
-/* First-time recognition wizard / profile editor — one question per card, plain language,
-   each with a "What this means" explainer and a concrete UAE example. */
+function YesNoUnsure({ value, onPick }) {
+  return (
+    <div className="mt-3 flex gap-2">
+      {[["yes", "Yes"], ["no", "No"], ["not_sure", "Not sure"]].map(([v, l]) => (
+        <button key={v} onClick={() => onPick(v)}
+          className="px-4 py-2 rounded-lg text-sm font-semibold border"
+          style={value === v
+            ? { background: v === "not_sure" ? "var(--amber)" : "var(--accent)", color: "#fff", borderColor: "transparent" }
+            : { ...line, ...mut }}>{l}</button>
+      ))}
+    </div>
+  );
+}
+
+/* The practitioner interview — one question per card, article-referenced explainer +
+   concrete UAE example. Every answer (including "Not sure") is stored and versioned. */
 function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }) {
-  const [step, setStep] = useState(0); // 0 = nature; 1..N = flags; N+1 = review
+  const [step, setStep] = useState(0); // 0 registration · 1 nature · 2..N+1 flags · last review
+  const [trn, setTrn] = useState(() => {
+    const e = existing?.flags?.trn_confirmed;
+    return { value: e?.value || null, note: e?.note || "" };
+  });
+  const [stagger, setStagger] = useState(existing?.tax_period_stagger || "");
   const [nature, setNature] = useState(existing?.nature_of_business || "");
   const [category, setCategory] = useState(existing?.business_category || "");
   const [fl, setFl] = useState(() => Object.fromEntries(FLAG_QUESTIONS.map((q) => {
@@ -210,26 +253,38 @@ function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }
     return [q.key, { value: e?.value || null, note: e?.note || "" }];
   })));
   const [otherNotes, setOtherNotes] = useState(existing?.other_notes || "");
-  const last = FLAG_QUESTIONS.length + 1;
-  const flag = step >= 1 && step <= FLAG_QUESTIONS.length ? FLAG_QUESTIONS[step - 1] : null;
-  const canNext = step === 0 ? !!category : step === last ? true : !!fl[flag.key].value;
+  const last = FLAG_QUESTIONS.length + 2;
+  const flag = step >= 2 && step <= FLAG_QUESTIONS.length + 1 ? FLAG_QUESTIONS[step - 2] : null;
+  const canNext = step === 0 ? (!!trn.value && !!stagger)
+    : step === 1 ? !!category
+    : step === last ? true
+    : !!fl[flag.key].value;
 
   const save = () => run(() => api[existing ? "patch" : "post"](`/vat-engine/clients/${clientId}/profile`, {
     nature_of_business: nature.trim(),
     business_category: category,
-    flags: Object.fromEntries(Object.entries(fl).map(([k, v]) => [k, { value: v.value || "no", note: v.note.trim() || null }])),
+    tax_period_stagger: stagger || null,
+    flags: {
+      trn_confirmed: { value: trn.value || "no", note: trn.note.trim() || null },
+      ...Object.fromEntries(Object.entries(fl).map(([k, v]) => [k, { value: v.value || "no", note: v.note.trim() || null }])),
+    },
     other_notes: otherNotes.trim() || null,
   })).then(onDone).catch(() => {});
+
+  const noteInput = (v, set) => (
+    <input value={v.note} onChange={(e) => set({ ...v, note: e.target.value })}
+      placeholder="Optional note — specifics worth remembering" className="mt-2.5 w-full border rounded-md px-2.5 py-1.5 text-xs" style={line} />
+  );
 
   return (
     <div className="max-w-2xl mx-auto">
       <button onClick={onCancel} className="text-xs font-medium mb-3" style={mut}>← Back</button>
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>
-        {existing ? "Edit VAT profile" : "Getting to know"} {clientName}
+        {existing ? "Edit VAT profile" : "Scoping"} {clientName}
       </h1>
       <p className="text-sm mt-1" style={mut}>
-        {existing ? "Every change is logged on the filing trail." :
-          "First VAT filing for this client — a few quick questions build the VAT profile. It's remembered for every future period and drives the compliance checks. \"Not sure\" is fine; it just gets flagged to confirm with the client."}
+        {existing ? "Every change creates a new profile version and is logged on the filing trail." :
+          "First VAT filing for this client — the interview a VAT executive runs before touching a return. Every answer is stored and versioned; it drives period deadlines and the compliance checks on every future filing. \"Not sure\" is fine — it stays amber until confirmed with the client."}
       </p>
       <div className="mt-3 flex gap-1">
         {Array.from({ length: last + 1 }, (_, i) => (
@@ -240,9 +295,26 @@ function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }
       <div className="mt-4 bg-white border rounded-xl p-5" style={line}>
         {step === 0 && (
           <>
-            <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>What does the business do?</h3>
-            <label className="block text-xs font-semibold mt-3" style={mut}>Nature of business (free text)</label>
-            <input value={nature} onChange={(e) => setNature(e.target.value)} placeholder='e.g. "Wholesale of electronics; occasional exports to Africa"' className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={line} />
+            <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>Registration & tax periods</h3>
+            <div className="mt-2 text-xs rounded-lg border p-2.5" style={{ ...line, background: "var(--paper)" }}>
+              <b>What this means:</b> The TRN on invoices and the FTA portal must match the registration certificate. The tax period stagger drives every deadline — get it wrong and every filing lands on the wrong month.
+            </div>
+            <div className="mt-3 text-sm font-medium" style={{ color: "var(--ink)" }}>TRN confirmed against the registration certificate?</div>
+            <YesNoUnsure value={trn.value} onPick={(v) => setTrn({ ...trn, value: v })} />
+            {trn.value === "not_sure" && <div className="mt-2 text-[11px]" style={{ color: "var(--amber)" }}>Stays amber on the profile until confirmed with the client.</div>}
+            {noteInput(trn, setTrn)}
+            <div className="mt-4 text-sm font-medium" style={{ color: "var(--ink)" }}>Tax period stagger *</div>
+            <select value={stagger} onChange={(e) => setStagger(e.target.value)} className="mt-1.5 border rounded-md px-2.5 py-2 text-sm w-full" style={line}>
+              <option value="">— select the FTA-assigned stagger —</option>
+              {STAGGER_OPTIONS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+            </select>
+          </>
+        )}
+        {step === 1 && (
+          <>
+            <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>Nature of supplies</h3>
+            <label className="block text-xs font-semibold mt-3" style={mut}>Describe the main revenue streams — what does the client actually invoice for?</label>
+            <input value={nature} onChange={(e) => setNature(e.target.value)} placeholder='e.g. "Wholesale of electronics; occasional exports to East Africa; some repair services"' className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={line} />
             <label className="block text-xs font-semibold mt-3" style={mut}>Category *</label>
             <div className="mt-1.5 flex flex-wrap gap-1.5">
               {BUSINESS_CATEGORIES.map((c) => (
@@ -259,20 +331,11 @@ function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }
               <b>What this means:</b> {flag.what}
               <div className="mt-1" style={mut}>{flag.example}</div>
             </div>
-            <div className="mt-3 flex gap-2">
-              {[["yes", "Yes"], ["no", "No"], ["not_sure", "Not sure"]].map(([v, l]) => (
-                <button key={v} onClick={() => setFl({ ...fl, [flag.key]: { ...fl[flag.key], value: v } })}
-                  className="px-4 py-2 rounded-lg text-sm font-semibold border"
-                  style={fl[flag.key].value === v
-                    ? { background: v === "not_sure" ? "var(--amber)" : "var(--accent)", color: "#fff", borderColor: "transparent" }
-                    : { ...line, ...mut }}>{l}</button>
-              ))}
-            </div>
+            <YesNoUnsure value={fl[flag.key].value} onPick={(v) => setFl({ ...fl, [flag.key]: { ...fl[flag.key], value: v } })} />
             {fl[flag.key].value === "not_sure" && (
               <div className="mt-2 text-[11px]" style={{ color: "var(--amber)" }}>Flagged amber on the profile — confirm with the client. Treated as Yes for the compliance warnings.</div>
             )}
-            <input value={fl[flag.key].note} onChange={(e) => setFl({ ...fl, [flag.key]: { ...fl[flag.key], note: e.target.value } })}
-              placeholder="Optional note — e.g. which products / counterparties" className="mt-2.5 w-full border rounded-md px-2.5 py-1.5 text-xs" style={line} />
+            {noteInput(fl[flag.key], (v) => setFl({ ...fl, [flag.key]: v }))}
           </>
         )}
         {step === last && (
@@ -282,12 +345,15 @@ function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }
             <div className="mt-3 text-xs font-semibold" style={mut}>Profile summary</div>
             <div className="mt-1.5 flex flex-wrap gap-1.5">
               <span className="px-2 py-1 rounded-full text-[11px] font-medium border" style={line}>{category}{nature.trim() ? ` — ${nature.trim()}` : ""}</span>
-              {FLAG_QUESTIONS.map((q) => fl[q.key].value && fl[q.key].value !== "no" && (
-                <span key={q.key} className="px-2 py-1 rounded-full text-[11px] font-bold"
-                  style={fl[q.key].value === "yes" ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
-                  {q.short}{fl[q.key].value === "not_sure" ? " — confirm with client" : ""}
-                </span>
-              ))}
+              {stagger && <span className="px-2 py-1 rounded-full text-[11px] font-medium border" style={line}>⏱ {STAGGER_OPTIONS.find(([k]) => k === stagger)?.[1]}</span>}
+              {[{ key: "trn_confirmed", short: "TRN confirmed", v: trn }, ...FLAG_QUESTIONS.map((q) => ({ key: q.key, short: q.short, v: fl[q.key] }))]
+                .filter((x) => x.v.value && x.v.value !== "no")
+                .map((x) => (
+                  <span key={x.key} className="px-2 py-1 rounded-full text-[11px] font-bold"
+                    style={x.v.value === "yes" ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
+                    {x.short}{x.v.value === "not_sure" ? " — confirm with client" : ""}
+                  </span>
+                ))}
             </div>
           </>
         )}
@@ -295,9 +361,10 @@ function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }
           <button onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0} className="text-xs underline disabled:opacity-30" style={mut}>← previous</button>
           {step < last
             ? <Btn disabled={!canNext} onClick={() => setStep(step + 1)}>Next →</Btn>
-            : <Btn onClick={save}>{existing ? "Save changes" : "Save profile & open the period"}</Btn>}
+            : <Btn onClick={save}>{existing ? "Save changes (new version)" : "Save profile & open the period"}</Btn>}
         </div>
       </div>
+      <div className="mt-3 text-[10px] text-center" style={mut}>{WIZARD_DISCLAIMER}</div>
     </div>
   );
 }
@@ -306,6 +373,7 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
   const [modal, setModal] = useState(null); // {type, item?}
   const [trailOpen, setTrailOpen] = useState(false);
   const [editProfile, setEditProfile] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const iAmStaff = me.id === f.staff_id;
 
   // first-time recognition: no VAT profile yet → the questionnaire replaces the period view
@@ -363,23 +431,49 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
 
       {/* profile summary bar — the engine's memory, applied to every period */}
       {f.profile && (
-        <div className="mt-3 flex items-center gap-1.5 flex-wrap text-[11px]">
-          <span className="px-2 py-1 rounded-full border font-medium" style={{ ...line, ...mut }}>
-            🧾 {f.profile.business_category}{f.profile.nature_of_business ? ` — ${f.profile.nature_of_business}` : ""} · profile v{f.profile.version}
-          </span>
-          {FLAG_QUESTIONS.map((q) => {
-            const v = f.profile.flags?.[q.key]?.value;
-            if (!v || v === "no") return null;
-            return (
-              <span key={q.key} className="px-2 py-1 rounded-full font-bold"
-                title={f.profile.flags[q.key]?.note || ""}
-                style={v === "yes" ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
-                {q.short}{v === "not_sure" ? " — confirm with client" : ""}
-              </span>
-            );
-          })}
-          <button onClick={() => setEditProfile(true)} className="underline" style={mut}>Edit profile</button>
-        </div>
+        <>
+          <div className="mt-3 flex items-center gap-1.5 flex-wrap text-[11px]">
+            <span className="px-2 py-1 rounded-full border font-medium" style={{ ...line, ...mut }}>
+              🧾 {f.profile.business_category}{f.profile.nature_of_business ? ` — ${f.profile.nature_of_business}` : ""} · profile v{f.profile.version}
+            </span>
+            {f.profile.tax_period_stagger_label && (
+              <span className="px-2 py-1 rounded-full border font-medium" style={{ ...line, ...mut }}>⏱ {f.profile.tax_period_stagger_label}</span>
+            )}
+            {[{ key: "trn_confirmed", short: "TRN confirmed" }, ...FLAG_QUESTIONS].map((q) => {
+              const v = f.profile.flags?.[q.key]?.value;
+              if (!v || v === "no") return null;
+              return (
+                <span key={q.key} className="px-2 py-1 rounded-full font-bold"
+                  title={f.profile.flags[q.key]?.note || ""}
+                  style={v === "yes" ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
+                  {q.short}{v === "not_sure" ? " — confirm with client" : ""}
+                </span>
+              );
+            })}
+            <button onClick={() => setEditProfile(true)} className="underline" style={mut}>Edit profile</button>
+            <button onClick={() => setHistoryOpen(!historyOpen)} className="underline" style={mut}>
+              History ({(f.profile.updated || []).length}) {historyOpen ? "▾" : "▸"}
+            </button>
+          </div>
+          {historyOpen && (
+            <div className="mt-2 rounded-lg border p-3 text-xs space-y-2" style={{ ...line, background: "var(--paper)" }}>
+              {[...(f.profile.updated || [])].reverse().map((v, i) => (
+                <div key={i}>
+                  <div className="font-semibold" style={{ color: "var(--ink)" }}>
+                    v{v.version} · {v.by_name} · {fmtDT(v.at)}
+                  </div>
+                  {(v.changes || []).map((c, j) => (
+                    <div key={j} className="pl-3" style={mut}>
+                      {c.field}: {c.old ?? "—"} → <b style={{ color: "var(--ink)" }}>{c.new ?? "—"}</b>
+                      {c.note && <span> — "{c.note}"</span>}
+                    </div>
+                  ))}
+                </div>
+              ))}
+              {(f.profile.updated || []).length === 0 && <div style={mut}>No history recorded.</div>}
+            </div>
+          )}
+        </>
       )}
 
       {/* stage tracker */}
@@ -587,6 +681,7 @@ function Vat201({ c }) {
   const ex = c.exempt || { sales: 0, rows: 0 };
   const mg = c.margin || { sales: 0, output_vat: 0, rows: 0 };
   const rcm = c.rcm || { output_vat: 0, input_vat: 0, rows: 0 };
+  const oos = c.out_of_scope || { sales: 0, rows: 0 };
   const Row = ({ label, sub, value, extra, strong }) => (
     <div className="flex gap-4 items-baseline py-1 border-b last:border-0" style={line}>
       <span className={`flex-1 ${strong ? "font-bold" : ""}`} style={strong ? { color: "var(--ink)" } : undefined}>
@@ -610,6 +705,7 @@ function Vat201({ c }) {
       <Row label="Exempt supplies" sub={`${ex.rows} inv — outside output VAT, input apportionment applies`} value={money(ex.sales)} />
       {mg.rows > 0 && <Row label="Margin-scheme sales" sub={`${mg.rows} inv — VAT on margin, not sale price`} extra={`margin VAT ${money(mg.output_vat)}`} value={money(mg.sales)} />}
       {rcm.rows > 0 && <Row label="RCM imports (self-assessed)" sub={`${rcm.rows} row(s)`} extra={`+${money(rcm.output_vat)} output / +${money(rcm.input_vat)} input`} value="—" />}
+      {oos.rows > 0 && <Row label="Out of scope (designated zone)" sub={`${oos.rows} inv — outside the return boxes, listed for completeness`} value={money(oos.sales)} />}
       <div className="mt-2" />
       <Row label="Output VAT (total)" value={money(c.output_vat)} />
       <Row label="Input VAT (recoverable)" value={money(c.input_vat)} />

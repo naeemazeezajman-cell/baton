@@ -26,6 +26,7 @@ src/vat-engine/                      (entire folder)
 api/tests/test_vat_engine.py
 api/alembic/versions/c9e5a12b8d47_vat_engine_tables.py   (see step 4 first)
 api/alembic/versions/d8a4e63f9b15_vat_client_profiles.py (see step 4 first)
+api/alembic/versions/e2b9c74a5d18_vat_profile_stagger.py (see step 4 first)
 REMOVING-VAT-ENGINE.md               (this file)
 ```
 

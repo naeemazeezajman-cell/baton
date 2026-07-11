@@ -384,8 +384,17 @@ def test_wizard_gate_and_profile_change_events(client):
                           "flags": flags(has_zero_rated="not_sure")},
                     headers=H(ctx, "staff"))
     assert r.status_code == 201, r.text
-    assert r.json()["version"] == 1
-    assert r.json()["flags"]["has_zero_rated"]["value"] == "not_sure"
+    p = r.json()
+    assert p["version"] == 1
+    # "Not sure" is stored verbatim (renders the amber confirm-with-client chip)
+    assert p["flags"]["has_zero_rated"]["value"] == "not_sure"
+    # v1 history entry records every answer, structured
+    v1 = p["updated"][0]
+    assert v1["version"] == 1 and v1["by_name"] == "Priya Nair"
+    by_field = {c["field"]: c for c in v1["changes"]}
+    assert by_field["has_zero_rated"] == {"field": "has_zero_rated", "old": None,
+                                          "new": "Not sure", "note": None}
+    assert by_field["open_fta_matters"]["new"] == "No"
     f = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
     assert f["profile"]["version"] == 1  # returning visits skip straight to periods
     assert any("VAT client profile v1 recorded" in e["text"] and "Applied to this filing" in e["text"]
@@ -408,8 +417,10 @@ def test_wizard_gate_and_profile_change_events(client):
     assert r.status_code == 200, r.text
     p = r.json()
     assert p["version"] == 2
-    assert any('has_exempt No → Yes — note: "Now leasing residential units"' in c
-               for c in p["updated"][-1]["changes"])
+    # structured version row: {field, old → new, note}
+    row = next(c for c in p["updated"][-1]["changes"] if c["field"] == "has_exempt")
+    assert row == {"field": "has_exempt", "old": "No", "new": "Yes",
+                   "note": "Now leasing residential units"}
     f = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
     assert any('Profile updated to v2' in e["text"] and 'has_exempt No → Yes' in e["text"]
                for e in f["events"])
@@ -464,20 +475,23 @@ def test_compliance_rules_unexpected_rows_and_mandatory_ticks(client):
     assert checks["margin_unexpected"]["kind"] == "warning"
     assert checks["rcm_import_unexpected"]["kind"] == "warning"
     assert checks["exempt_apportionment"]["kind"] == "confirmation"
+    assert checks["zero_rated_evidence"]["kind"] == "confirmation"  # export-evidence tick (Art. 45)
+    assert "90-day rule" in checks["zero_rated_evidence"]["text"]
     assert "zero_rated_expected_missing" not in checks  # zero-rated rows ARE present
 
-    # mandatory-tick gate: untucked confirmation blocks even with a warning note
+    # mandatory-tick gate: unticked confirmation blocks even with a warning note
     r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
                     json={"warning_note": "Ledger verified with client"}, headers=H(ctx, "staff"))
     assert r.status_code == 409 and "exempt_apportionment" in r.json()["detail"]["reason"]
     r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
-                    json={"confirmations": ["exempt_apportionment"],
+                    json={"confirmations": ["exempt_apportionment", "zero_rated_evidence"],
                           "warning_note": "Ledger verified with client — profile to be updated"},
                     headers=H(ctx, "staff"))
     assert r.status_code == 200, r.text
     tick = next(c for c in r.json()["computation"]["checks"] if c["id"] == "exempt_apportionment")
     assert tick["ticked_by_name"] == "Priya Nair" and tick["ticked_at"]
-    assert any("Compliance confirmations ticked by Priya Nair: exempt_apportionment" in e["text"]
+    assert any("Compliance confirmations ticked by Priya Nair" in e["text"]
+               and "exempt_apportionment" in e["text"] and "zero_rated_evidence" in e["text"]
                for e in r.json()["events"])
 
 
@@ -502,13 +516,13 @@ def test_vat201_splits_completion_record_and_stars(client):
     # profile matches the data → confirmations only, no warnings
     kinds = {x["id"]: x["kind"] for x in c["checks"]}
     assert kinds == {"margin_confirmation": "confirmation", "rcm_confirmation": "confirmation",
-                     "exempt_apportionment": "confirmation"}
+                     "zero_rated_evidence": "confirmation", "exempt_apportionment": "confirmation"}
 
     r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation", json={}, headers=H(ctx, "staff"))
     assert r.status_code == 409  # mandatory ticks missing
     r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
                     json={"confirmations": ["margin_confirmation", "rcm_confirmation",
-                                            "exempt_apportionment"]},
+                                            "zero_rated_evidence", "exempt_apportionment"]},
                     headers=H(ctx, "staff"))
     assert r.status_code == 200, r.text
 
@@ -536,6 +550,85 @@ def test_vat201_splits_completion_record_and_stars(client):
     staff_row = next(e for e in emp if e["user_id"] == ctx["staff"]["id"])
     assert staff_row["duty_count"] >= 1
     assert any(ev["source"] == "duty" for ev in staff_row["recent_events"])
+
+
+def test_stagger_drives_period_derivation_and_realigns(client):
+    ctx = setup_firm(client)
+    cid = make_client()
+    duty = make_vat_duty(client, ctx, next_due="2026-08-28T00:00:00Z", client_id=cid)
+
+    # profile recorded BEFORE opening: stagger Feb/May/Aug/Nov → period ends on the latest
+    # stagger month-end before the Aug due month = 31 May
+    r = client.post(f"/vat-engine/clients/{cid}/profile",
+                    json={"business_category": "Trading", "tax_period_stagger": "feb_may_aug_nov",
+                          "flags": {}}, headers=H(ctx, "staff"))
+    assert r.status_code == 201, r.text
+    f = open_filing(client, ctx, duty["id"])
+    assert f["period_start"] == "2026-03-01" and f["period_end"] == "2026-05-31"
+    assert f["prev_period_start"] == "2025-12-01"
+    assert any("stagger Feb/May/Aug/Nov from profile v1" in e["text"] for e in f["events"])
+
+    # stagger change re-aligns an open filing that hasn't started collecting
+    r = client.patch(f"/vat-engine/clients/{cid}/profile",
+                     json={"business_category": "Trading", "tax_period_stagger": "jan_apr_jul_oct",
+                           "flags": {}}, headers=H(ctx, "manager"))
+    assert r.status_code == 200, r.text
+    f = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+    assert f["period_start"] == "2026-05-01" and f["period_end"] == "2026-07-31"
+    assert any("re-aligned to the profile's tax period stagger (Jan/Apr/Jul/Oct)" in e["text"]
+               for e in f["events"])
+    # the version row records the stagger change with labels
+    prof = client.get(f"/vat-engine/clients/{cid}/profile", headers=H(ctx, "staff")).json()
+    row = next(c for c in prof["updated"][-1]["changes"] if c["field"] == "tax_period_stagger")
+    assert row["old"] == "Feb/May/Aug/Nov" and row["new"] == "Jan/Apr/Jul/Oct"
+
+    # monthly stagger → one-month periods regardless of the duty cadence
+    cid2_duty = make_vat_duty(client, ctx, next_due="2026-08-28T00:00:00Z")
+    f2 = open_filing(client, ctx, cid2_duty["id"])
+    assert f2["period_start"] == "2026-05-01"  # no profile → cadence-based, unchanged behavior
+
+
+def test_out_of_scope_category_flow(client):
+    ctx = setup_firm(client)
+    ledger = [
+        ["S-1", date(2026, 5, 5), "Std Co", "T1", "Dubai", 1000, 50, "Output", "Standard (5%)"],
+        ["DZ-1", date(2026, 5, 6), "JAFZA Co", "T2", "Dubai", 9000, 0, "Output",
+         "Out of scope (designated zone)"],
+    ]
+    register = [
+        ["S-1", date(2026, 5, 5), "Std Co", "Dubai", 1000, 50, "", ""],
+        ["DZ-1", date(2026, 5, 6), "JAFZA Co", "Dubai", 9000, 0, "", "Out of scope (designated zone)"],
+    ]
+    # profile says designated_zone No → out-of-scope rows raise the mismatch warning
+    _, _, f = setup_client_filing(client, ctx, ledger=ledger, register=register,
+                                  profile_flags=flags(designated_zone="no"))
+    assert {i["invoice_no"]: i["category"] for i in f["items"] if i["source"] == "ledger"} == \
+        {"S-1": "standard", "DZ-1": "out_of_scope"}
+    r = client.post(f"/vat-engine/filings/{f['id']}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    c = r.json()["computation"]
+    # out-of-scope reported outside the return boxes: no output VAT, no standard sales
+    assert c["out_of_scope"] == {"sales": 9000.0, "rows": 1}
+    assert c["taxable_sales"] == 1000.0 and c["output_vat"] == 50.0
+    checks = {x["id"]: x["kind"] for x in c["checks"]}
+    assert checks["out_of_scope_unexpected"] == "warning"
+
+    # flip the profile: designated_zone = Not sure → treated as Yes, warning disappears
+    r = client.patch(f"/vat-engine/clients/{f['client_id']}/profile",
+                     json={"business_category": "Trading",
+                           "flags": flags(designated_zone="not_sure")}, headers=H(ctx, "staff"))
+    assert r.status_code == 200 and r.json()["flags"]["designated_zone"]["value"] == "not_sure"
+    # re-draft (still at computation_draft → must go back? recon state is gone) — new filing instead:
+    # simply assert the checks engine directly via a fresh draft on a second duty
+    duty2 = make_vat_duty(client, ctx, client_id=f["client_id"])
+    f2 = open_filing(client, ctx, duty2["id"])
+    upload_ledger(client, ctx, f2["id"], fill_template(get_template(client, ctx, "ledger"), ledger))
+    f2 = upload_register(client, ctx, f2["id"],
+                         fill_template(get_template(client, ctx, "invoice-register"), register))
+    r = client.post(f"/vat-engine/filings/{f2['id']}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    ids = [x["id"] for x in r.json()["computation"]["checks"]]
+    assert "out_of_scope_unexpected" not in ids  # not_sure treated as Yes
 
 
 def test_tenancy_isolation(client):
