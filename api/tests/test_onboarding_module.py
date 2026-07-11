@@ -292,7 +292,8 @@ def test_completion_creates_duty_and_guards(client):
     out = ob_act(client, ctx, "staff", oid, "complete", body)
     ob = out["onboarding"]
     assert ob["status"] == "complete" and ob["holder"] is None and ob["duty_id"] == out["duty"]["id"]
-    assert any("Onboarding complete — recurring duty created: VAT Filing, quarterly, first due" in e["text"]
+    assert any("ONBOARDING COMPLETE — VAT Filing for Gulf Horizon Trading LLC in " in e["text"]
+               and "Trail sealed. Recurring duty created: VAT Filing, quarterly, first due" in e["text"]
                for e in ob["events"])
 
     # the duty landed in the deadline engine, correctly shaped

@@ -109,12 +109,17 @@ class ProposalEvent(Base):
 
 
 class HolderLog(Base):
+    """Holding spans for proposals AND onboardings — exactly one of proposal_id /
+    onboarding_id is set per row."""
+
     __tablename__ = "holder_log"
-    __table_args__ = (Index("ix_holder_log_proposal_id", "proposal_id"),)
+    __table_args__ = (Index("ix_holder_log_proposal_id", "proposal_id"),
+                      Index("ix_holder_log_onboarding_id", "onboarding_id"))
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
-    proposal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("proposals.id"))
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("proposals.id"))
+    onboarding_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("onboardings.id"))
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     started_at: Mapped[datetime] = mapped_column(TS)
     ended_at: Mapped[datetime | None] = mapped_column(TS)
@@ -150,6 +155,7 @@ class Onboarding(Base):
     holder: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     holder_since: Mapped[datetime | None] = mapped_column(TS)
     duty_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("duties.id"))
+    stars: Mapped[list | None] = mapped_column(JSONB)  # at completion: [{user_id, stars, total_held_ms, holdings}]
     created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
     completed_at: Mapped[datetime | None] = mapped_column(TS)
 

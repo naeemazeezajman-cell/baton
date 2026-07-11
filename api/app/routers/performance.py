@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Client, Duty, DutyCompletion, HolderLog, Payment, Proposal, User
+from ..models import Client, Duty, DutyCompletion, HolderLog, Onboarding, Payment, Proposal, User
 from ..security import require_roles
 from ..tenancy import get_scoped_or_404, tenant_select
 from .proposals import CLOSED_STATUSES, STARS_SCALE_TEXT as PROPOSAL_STARS_SCALE_TEXT, stars_for
@@ -20,6 +20,7 @@ COMPLETED_STATUSES = ("el_sent", "onboarding_complete")
 
 DUTY_STARS_SCALE_TEXT = ("completed on/before due ★5 · ≤1d late ★4 · ≤3d late ★3 · ≤7d late ★2 · beyond ★1 · "
                          "declared without proof capped at ★3")
+ONBOARDING_STARS_SCALE_TEXT = f"avg holding time per pass — {PROPOSAL_STARS_SCALE_TEXT}"
 INVOICING_STARS_SCALE_TEXT = ("invoice raised on/before due ★5 · ≤1d late ★4 · ≤3d late ★3 · ≤7d late ★2 · "
                               "beyond ★1 · declared raised outside Baton capped at ★3")
 
@@ -125,13 +126,34 @@ def client_performance(client_id: uuid.UUID, user: User = Depends(require_roles(
         })
     cycles.sort(key=lambda c: c["completed_at"])
 
+    # completed onboardings — service, staff, duration, per-participant holding-time stars
+    onboardings = []
+    completed_obs = db.scalars(tenant_select(Onboarding, user).where(
+        Onboarding.client_id == client.id, Onboarding.status == "complete")).all()
+    for ob in sorted(completed_obs, key=lambda o: o.completed_at or o.created_at):
+        per = []
+        for e in ob.stars or []:
+            u = users_by_id.get(uuid.UUID(e["user_id"]))
+            per.append({**e, "name": u.name if u else "—"})
+        staff = users_by_id.get(ob.staff_id)
+        onboardings.append({
+            "service": ob.service,
+            "staff_id": ob.staff_id, "staff_name": staff.name if staff else "—",
+            "completed_at": ob.completed_at,
+            "total_ms": int(((ob.completed_at - ob.created_at).total_seconds() * 1000)
+                            if ob.completed_at else 0),
+            "per_participant": per,
+        })
+
     return {
         "client": {"id": client.id, "ref": client.ref, "name": client.name},
         "proposal_cycle": cycles[0] if cycles else None,  # original engagement (back-compat)
         "proposal_cycles": cycles,
+        "onboardings": onboardings,
         "tasks": tasks,
         "duty_stars_scale_text": DUTY_STARS_SCALE_TEXT,
         "proposal_stars_scale_text": PROPOSAL_STARS_SCALE_TEXT,
+        "onboarding_stars_scale_text": ONBOARDING_STARS_SCALE_TEXT,
     }
 
 
@@ -166,9 +188,21 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
             "at": c.completed_at, "stars": duty_stars(c.late_ms, c.method),
         })
 
+    clients_by_id = {c.id: c for c in db.scalars(tenant_select(Client, user)).all()}
+
+    # onboarding star events: one per participant per completed onboarding (stored at sealing)
+    onboarding_events: dict = {}
+    for ob in db.scalars(tenant_select(Onboarding, user).where(
+            Onboarding.status == "complete", Onboarding.stars.is_not(None))).all():
+        cl = clients_by_id.get(ob.client_id)
+        for e in ob.stars or []:
+            onboarding_events.setdefault(uuid.UUID(e["user_id"]), []).append({
+                "source": "onboarding", "label": f"Onboarding — {ob.service}, {cl.name if cl else '—'}",
+                "at": ob.completed_at, "stars": e["stars"],
+            })
+
     # invoicing star events: one per raised invoice, credited to the raiser
     invoicing_events: dict = {}
-    clients_by_id = {c.id: c for c in db.scalars(tenant_select(Client, user)).all()}
     for pay in db.scalars(tenant_select(Payment, user).where(Payment.invoice_raised_at.is_not(None))).all():
         inv = pay.invoice or {}
         if not inv.get("by"):
@@ -190,8 +224,9 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
     for u in users:
         pe = prop_events.get(u.id, [])
         de = duty_events.get(u.id, [])
+        oe = onboarding_events.get(u.id, [])
         ie = invoicing_events.get(u.id, [])
-        all_events = sorted([*pe, *de, *ie], key=lambda e: e["at"], reverse=True)
+        all_events = sorted([*pe, *de, *oe, *ie], key=lambda e: e["at"], reverse=True)
         mean = lambda xs: (sum(xs) / len(xs)) if xs else None  # noqa: E731
         held = sum(1 for p in open_props if p.holder == u.id)
         open_d = sum(1 for d in open_duties if d.staff_id == u.id)
@@ -201,6 +236,8 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
             "proposal_count": len(pe),
             "duties_avg_stars": mean([e["stars"] for e in de]),
             "duty_count": len(de),
+            "onboarding_avg_stars": mean([e["stars"] for e in oe]),
+            "onboarding_count": len(oe),
             "invoicing_avg_stars": mean([e["stars"] for e in ie]),
             "invoicing_count": len(ie),
             "overall_avg": mean([e["stars"] for e in all_events]),
@@ -214,5 +251,6 @@ def employees_performance(user: User = Depends(require_roles("Admin", "Manager")
         "employees": employees,
         "proposal_stars_scale_text": PROPOSAL_STARS_SCALE_TEXT,
         "duty_stars_scale_text": DUTY_STARS_SCALE_TEXT,
+        "onboarding_stars_scale_text": ONBOARDING_STARS_SCALE_TEXT,
         "invoicing_stars_scale_text": INVOICING_STARS_SCALE_TEXT,
     }

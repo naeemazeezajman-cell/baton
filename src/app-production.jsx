@@ -2872,8 +2872,24 @@ function OnboardingView({ oid, me, byId, back }) {
         )}
 
         {ob.status === "complete" && (
-          <div className="mt-4 text-sm px-3 py-2.5 rounded-lg font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-            ✓ Onboarding complete — the recurring duty is live in the deadline engine. Trail sealed below.
+          <div className="mt-4 rounded-lg border p-3.5" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}>
+            <div className="text-sm font-bold" style={{ color: "var(--accent)" }}>🔒 ONBOARDING COMPLETE — trail sealed</div>
+            <div className="text-xs mt-1" style={{ color: "var(--ink)" }}>
+              Documentation closed in <b className="font-mono2">{fmtDur(new Date(ob.completed_at).getTime() - new Date(ob.created_at).getTime())}</b> — the
+              recurring duty is live in the deadline engine. No further changes are possible; the trail below is read-only
+              (credential reveals stay available and are still logged).
+            </div>
+            {ob.stars && ob.stars.length > 0 && (
+              <div className="mt-2.5 flex gap-4 flex-wrap items-center text-xs">
+                <span className="text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Holding-time stars</span>
+                {ob.stars.map((s) => (
+                  <span key={s.user_id} className="flex items-center gap-1.5">
+                    {byId(s.user_id).name} <Stars n={s.stars} />
+                    <span className="font-mono2" style={{ color: "var(--mut)" }}>({fmtDur(s.total_held_ms)} over {s.holdings} pass{s.holdings !== 1 ? "es" : ""})</span>
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -2918,17 +2934,18 @@ function PerformanceScreen() {
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Employee performance</h1>
       <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Firm-wide ratings computed from every completed proposal cycle and duty completion. Visible to management only. Click a row for the person's recent star events.</p>
       <div className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
-        <div className="grid grid-cols-[1fr_130px_130px_130px_200px_110px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
-          <div>Employee</div><div>Proposals</div><div>Duties</div><div>Invoicing</div><div>Overall</div><div>Open workload</div>
+        <div className="grid grid-cols-[1fr_115px_115px_115px_115px_185px_105px] gap-3 px-5 py-2.5 text-[11px] uppercase tracking-wider border-b" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+          <div>Employee</div><div>Proposals</div><div>Duties</div><div>Onboarding</div><div>Invoicing</div><div>Overall</div><div>Open workload</div>
         </div>
         {data.employees.map((e) => {
           const isOpen = openU === e.user_id;
           return (
             <div key={e.user_id} className="border-b last:border-0" style={{ borderColor: "var(--line)" }}>
-              <button onClick={() => setOpenU(isOpen ? null : e.user_id)} className="w-full grid grid-cols-[1fr_130px_130px_130px_200px_110px] gap-3 px-5 py-3.5 text-sm text-left items-center hover:bg-gray-50">
+              <button onClick={() => setOpenU(isOpen ? null : e.user_id)} className="w-full grid grid-cols-[1fr_115px_115px_115px_115px_185px_105px] gap-3 px-5 py-3.5 text-sm text-left items-center hover:bg-gray-50">
                 <span><b>{e.name}</b><div className="text-[11px] font-normal" style={{ color: "var(--mut)" }}>{e.designation} · {e.role}</div></span>
                 <span>{avgCell(e.proposal_avg_stars, e.proposal_count)}</span>
                 <span>{avgCell(e.duties_avg_stars, e.duty_count)}</span>
+                <span>{avgCell(e.onboarding_avg_stars, e.onboarding_count)}</span>
                 <span>{avgCell(e.invoicing_avg_stars, e.invoicing_count)}</span>
                 <span>
                   {e.overall_avg == null
@@ -2943,7 +2960,7 @@ function PerformanceScreen() {
                   {e.recent_events.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No completed work yet.</div>}
                   {e.recent_events.map((ev, i) => (
                     <div key={i} className="flex items-center gap-3 py-1.5 text-xs border-b last:border-0" style={{ borderColor: "var(--line)" }}>
-                      <span className="w-16 text-[10px] uppercase font-bold" style={{ color: ev.source === "proposal" ? "var(--accent)" : ev.source === "invoicing" ? "var(--ink)" : "var(--amber)" }}>{ev.source}</span>
+                      <span className="w-20 text-[10px] uppercase font-bold" style={{ color: ev.source === "proposal" ? "var(--accent)" : ev.source === "onboarding" ? "#5C4A8A" : ev.source === "invoicing" ? "var(--ink)" : "var(--amber)" }}>{ev.source}</span>
                       <span className="flex-1">{ev.label}</span>
                       <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(new Date(ev.at).getTime())}</span>
                       <Stars n={ev.stars} />
@@ -2958,6 +2975,7 @@ function PerformanceScreen() {
       <div className="mt-3 text-[10px] space-y-0.5" style={{ color: "var(--mut)" }}>
         <div>Proposal cycles: {data.proposal_stars_scale_text}</div>
         <div>Duty completions: {data.duty_stars_scale_text}</div>
+        <div>Onboarding relays: {data.onboarding_stars_scale_text}</div>
         <div>Invoicing: {data.invoicing_stars_scale_text}</div>
       </div>
     </div>
@@ -2988,6 +3006,22 @@ function ClientPerformance({ clientId }) {
           </div>
         </div>
       ))}
+      {(r.onboardings || []).length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Completed onboardings ({r.onboardings.length})</div>
+          {r.onboardings.map((o, i) => (
+            <div key={i} className="bg-white border rounded-md px-3 py-2 mb-1.5 flex items-center gap-3 text-xs flex-wrap" style={{ borderColor: "var(--line)" }}>
+              <span className="flex-1 min-w-[150px]"><b>Onboarding — {o.service}</b><div style={{ color: "var(--mut)" }}>{o.staff_name}</div></span>
+              <span className="font-mono2" style={{ color: "var(--mut)" }}>{fmtDur(o.total_ms)} → duty live {fmtD(t(o.completed_at))}</span>
+              <span className="flex gap-3 flex-wrap">
+                {o.per_participant.map((e) => (
+                  <span key={e.user_id} className="flex items-center gap-1">{e.name} <Stars n={e.stars} /></span>
+                ))}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       <div>
         <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Task record — newest first ({r.tasks.length})</div>
         {r.tasks.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No completed duties on record for this client yet.</div>}

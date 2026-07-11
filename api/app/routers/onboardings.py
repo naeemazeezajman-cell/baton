@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Client, Duty, DutyEvent, Onboarding, OnboardingEvent, OnboardingItem, Notice, Proposal, User
+from ..models import Client, Duty, DutyEvent, HolderLog, Onboarding, OnboardingEvent, OnboardingItem, Notice, Proposal, User
 from ..security import current_user
 from ..tenancy import get_scoped_or_404, tenant_select
 from ..workflow import conflict, iso, now
@@ -81,11 +81,38 @@ def _open_items(items) -> list:
     return [i for i in items if i.status == "requested"]
 
 
-def _pass_baton(db: Session, ob: Onboarding, to_user_id, by: User, note_user_id=None, note_text=None):
+def _pass_baton(db: Session, ob: Onboarding, to_user_id, by: User, reason: str = ""):
+    """Move the baton and maintain the holder_log span record — mirrors workflow.pass_holder."""
+    open_row = db.scalar(select(HolderLog).where(HolderLog.onboarding_id == ob.id,
+                                                 HolderLog.ended_at.is_(None)))
+    if open_row:
+        open_row.ended_at = now()
+    if to_user_id:
+        db.add(HolderLog(tenant_id=ob.tenant_id, onboarding_id=ob.id, user_id=to_user_id,
+                         started_at=now(), reason=reason or "responsibility held"))
     ob.holder = to_user_id
     ob.holder_since = now()
-    if note_text and note_user_id:
-        _notify(db, ob, note_user_id, note_text)
+
+
+def _compute_stars(db: Session, ob: Onboarding) -> list[dict]:
+    """Per-participant stars from this onboarding's holding spans — proposal starsFor scale."""
+    from .proposals import stars_for
+    rows = db.scalars(select(HolderLog).where(HolderLog.onboarding_id == ob.id)
+                      .order_by(HolderLog.started_at, HolderLog.id)).all()
+    end_default = ob.completed_at or now()
+    per: dict = {}
+    for h in rows:
+        if h.user_id is None:
+            continue
+        ended = h.ended_at or end_default
+        per.setdefault(h.user_id, []).append((ended - h.started_at).total_seconds() * 1000)
+    out = []
+    for uid_, durs in per.items():
+        avg = sum(durs) / len(durs)
+        out.append({"user_id": str(uid_), "stars": stars_for(avg / 86400000),
+                    "total_held_ms": int(sum(durs)), "holdings": len(durs)})
+    out.sort(key=lambda e: (-e["stars"], e["total_held_ms"]))
+    return out
 
 
 def serialize_item(i: OnboardingItem, reveal: bool = False) -> dict:
@@ -112,7 +139,7 @@ def serialize_item(i: OnboardingItem, reveal: bool = False) -> dict:
     return out
 
 
-def serialize(db: Session, ob: Onboarding, detail: bool = False) -> dict:
+def serialize(db: Session, ob: Onboarding, detail: bool = False, viewer: User | None = None) -> dict:
     client = db.get(Client, ob.client_id)
     staff = db.get(User, ob.staff_id)
     manager_id = _manager_id(db, ob)
@@ -134,6 +161,9 @@ def serialize(db: Session, ob: Onboarding, detail: bool = False) -> dict:
         events = db.scalars(select(OnboardingEvent).where(OnboardingEvent.onboarding_id == ob.id)
                             .order_by(OnboardingEvent.at, OnboardingEvent.id)).all()
         out["events"] = [{"at": e.at, "by": e.by_user, "text": e.text_} for e in events]
+        # holding-time stars are management-only — staff never see ratings
+        if viewer is not None and viewer.role in ("Admin", "Manager"):
+            out["stars"] = ob.stars
     return out
 
 
@@ -150,6 +180,8 @@ def create_for_el_send(db: Session, p: Proposal, manager: User) -> list[Onboardi
                         holder=sid, holder_since=now())
         db.add(ob)
         db.flush()
+        db.add(HolderLog(tenant_id=ob.tenant_id, onboarding_id=ob.id, user_id=sid,
+                         started_at=now(), reason="onboarding started — initial holder"))
         _log(db, ob, None, f"Onboarding started for \"{service}\" at EL send — client documentation relay "
                            f"between {staff.name if staff else 'staff'} and {manager.name} (engagement manager). "
                            f"Request the documents and information needed to begin recurring work.")
@@ -176,7 +208,7 @@ def list_onboardings(client_id: uuid.UUID | None = None, user: User = Depends(cu
 
 @router.get("/{oid}")
 def get_onboarding(oid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return serialize(db, _get(db, oid, user), detail=True)
+    return serialize(db, _get(db, oid, user), detail=True, viewer=user)
 
 
 # ---------- staff: request rounds ----------
@@ -195,7 +227,7 @@ def add_items(oid: uuid.UUID, body: ItemsIn, user: User = Depends(current_user),
                               kind=it.kind, note=it.note, requested_by=user.id))
     _log(db, ob, user.id, f"Items requested: {', '.join(i.label + ' (' + i.kind + ')' for i in body.items)}")
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 @router.post("/{oid}/send-requests")
@@ -212,12 +244,12 @@ def send_requests(oid: uuid.UUID, user: User = Depends(current_user), db: Sessio
     if manager_id is None:
         raise conflict("No engagement manager on record for this onboarding")
     manager = db.get(User, manager_id)
-    _pass_baton(db, ob, manager_id, user)
+    _pass_baton(db, ob, manager_id, user, f"{len(open_items)} requested item(s) pending")
     _log(db, ob, user.id, f"{len(open_items)} open request(s) sent to {manager.name} — baton passes to them")
     _notify(db, ob, manager_id, f"Onboarding {serialize(db, ob)['client_name']} — {ob.service}: "
                                 f"{len(open_items)} item(s) requested by {user.name} — baton with you")
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 # ---------- manager: resolve items ----------
@@ -236,7 +268,7 @@ def _maybe_autoreturn(db: Session, ob: Onboarding, by: User):
     items = _items(db, ob)
     if not _open_items(items):
         staff = db.get(User, ob.staff_id)
-        _pass_baton(db, ob, ob.staff_id, by)
+        _pass_baton(db, ob, ob.staff_id, by, "all open items resolved — review and continue")
         _log(db, ob, None, f"All open items resolved — baton auto-returned to {staff.name if staff else 'staff'}")
         answered = [i for i in items if i.status in ("provided", "answered", "not_available")
                     and i.accepted_at is None]
@@ -302,7 +334,7 @@ def provide_item(
     it.resolved_at = now()
     _maybe_autoreturn(db, ob, user)
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 @router.post("/{oid}/items/{item_id}/not-available")
@@ -319,7 +351,7 @@ def not_available(oid: uuid.UUID, item_id: uuid.UUID, body: ReasonIn,
     _log(db, ob, user.id, f'Item "{it.label}" marked NOT AVAILABLE — reason: "{it.reason}"')
     _maybe_autoreturn(db, ob, user)
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 # ---------- staff: accept / re-request / withdraw ----------
@@ -342,7 +374,7 @@ def accept_item(oid: uuid.UUID, item_id: uuid.UUID, user: User = Depends(current
     it.accepted_at = now()
     _log(db, ob, user.id, f'Item "{it.label}" accepted by {user.name}')
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 @router.post("/{oid}/items/{item_id}/re-request")
@@ -359,7 +391,7 @@ def re_request(oid: uuid.UUID, item_id: uuid.UUID, body: ReasonIn,
     it.accepted_at = None
     _log(db, ob, user.id, f'Item "{it.label}" RE-REQUESTED — reason: "{it.reason}"')
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 @router.post("/{oid}/items/{item_id}/withdraw")
@@ -379,7 +411,7 @@ def withdraw_item(oid: uuid.UUID, item_id: uuid.UUID, body: ReasonIn,
     if ob.holder != ob.staff_id:
         _maybe_autoreturn(db, ob, user)
     db.commit()
-    return serialize(db, ob, detail=True)
+    return serialize(db, ob, detail=True, viewer=user)
 
 
 # ---------- credentials ----------
@@ -434,16 +466,24 @@ def complete_onboarding(oid: uuid.UUID, body: CompleteIn, user: User = Depends(c
                      text_=f"Duty created from completed onboarding — {body.cadence} · first tracked deadline "
                            f"{fmt_d(first_due)} · client contact: {body.contact_name.strip()} "
                            f"<{body.contact_email}>. All future deadlines are computed automatically."))
+    from datetime import timezone
+
+    from .duties import fmt_dur
+
     ob.status = "complete"
     ob.completed_at = now()
-    ob.holder = None
+    _pass_baton(db, ob, None, user)  # closes the open holding span; holder → nobody
     ob.duty_id = duty.id
-    _log(db, ob, user.id, f"Onboarding complete — recurring duty created: {ob.service}, {body.cadence}, "
-                          f"first due {fmt_d(first_due)}")
+    ob.stars = _compute_stars(db, ob)  # per-participant holding-time stars, sealed with the record
+    created = ob.created_at if ob.created_at.tzinfo else ob.created_at.replace(tzinfo=timezone.utc)
+    duration_ms = (ob.completed_at - created).total_seconds() * 1000
+    _log(db, ob, user.id, f"ONBOARDING COMPLETE — {ob.service} for {client.name} in {fmt_dur(duration_ms)}. "
+                          f"Trail sealed. Recurring duty created: {ob.service}, {body.cadence}, "
+                          f"first due {fmt_d(first_due)}.")
     manager_id = _manager_id(db, ob)
     _notify(db, ob, manager_id, f"Onboarding complete · {ob.service} for {client.name} — recurring duty "
                                 f"created ({body.cadence}, first due {fmt_d(first_due)})")
     db.commit()
-    return {"onboarding": serialize(db, ob, detail=True),
+    return {"onboarding": serialize(db, ob, detail=True, viewer=user),
             "duty": {"id": duty.id, "service": duty.service, "cadence": duty.cadence,
                      "next_due": duty.next_due, "contact": duty.contact}}
