@@ -1188,7 +1188,6 @@ function NewRequest({ users, me, firm, clients = [], onCreate }) {
   const CATALOG = firm.services && firm.services.length ? firm.services : SERVICES;
   const [mode, setMode] = useState("prospect"); // "prospect" | "client"
   const [clientId, setClientId] = useState(null);
-  const [clientQuery, setClientQuery] = useState("");
   const [prospect, setProspect] = useState({ name: "", contactPerson: "", email: "", phone: "" });
   const [sel, setSel] = useState([]);
   const [custom, setCustom] = useState("");
@@ -1203,8 +1202,6 @@ function NewRequest({ users, me, firm, clients = [], onCreate }) {
   const addCustom = () => { if (custom.trim()) { setSel((x) => [...x, custom.trim() + "‡"]); setCustom(""); } };
   const services = sel.map((s) => ({ name: s.replace("‡", ""), custom: s.endsWith("‡"), fee: fees[s]?.amt || "", basis: fees[s]?.basis || defaultBasis(s) }));
   const selClient = clients.find((c) => c.id === clientId) || null;
-  const clientMatches = clients.filter((c) =>
-    `${c.code} ${c.name}`.toLowerCase().includes(clientQuery.trim().toLowerCase()));
   const pickClient = (c) => {
     setClientId(c.id);
     setProspect({
@@ -1214,11 +1211,13 @@ function NewRequest({ users, me, firm, clients = [], onCreate }) {
       phone: c.contact?.phone || "",
     });
   };
+  const clearClient = () => {
+    setClientId(null);
+    setProspect({ name: "", contactPerson: "", email: "", phone: "" });
+  };
   const switchMode = (m) => {
     setMode(m);
-    setClientId(null);
-    setClientQuery("");
-    setProspect({ name: "", contactPerson: "", email: "", phone: "" });
+    clearClient();
   };
   const valid = prospect.name.trim() && prospect.email.trim() && sel.length > 0 && assignedTo
     && (mode === "prospect" || clientId);
@@ -1236,29 +1235,17 @@ function NewRequest({ users, me, firm, clients = [], onCreate }) {
           ))}
         </div>
 
-        {mode === "client" && !selClient && (
+        {mode === "client" && (
           <div className="mb-3">
             <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Search the firm's clients</label>
-            <input value={clientQuery} onChange={(e) => setClientQuery(e.target.value)} placeholder="Type a name or code, e.g. Gulf Horizon or CL-001" className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
-            <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border" style={{ borderColor: "var(--line)" }}>
-              {clientMatches.map((c) => (
-                <button key={c.id} onClick={() => pickClient(c)} className="w-full text-left px-3 py-2 text-sm border-b last:border-0 hover:bg-gray-50 flex items-center gap-2" style={{ borderColor: "var(--line)" }}>
-                  <span className="font-mono2 text-xs" style={{ color: "var(--accent)" }}>{c.code}</span>
-                  <span className="flex-1 truncate font-medium">{c.name}</span>
-                  <span className="text-[11px] truncate" style={{ color: "var(--mut)" }}>{c.contact?.email || ""}</span>
-                </button>
-              ))}
-              {clientMatches.length === 0 && <div className="px-3 py-3 text-xs" style={{ color: "var(--mut)" }}>No client matches "{clientQuery}".</div>}
+            <div className="mt-1">
+              <ClientCombobox clients={clients} selected={selClient} onSelect={pickClient} onClear={clearClient} />
             </div>
-          </div>
-        )}
-
-        {mode === "client" && selClient && (
-          <div className="mb-3 flex items-center gap-2 flex-wrap">
-            <span className="text-[11px] px-2 py-1 rounded-full font-bold" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-              Additional engagement for {selClient.code} — {selClient.name}
-            </span>
-            <button onClick={() => { setClientId(null); setProspect({ name: "", contactPerson: "", email: "", phone: "" }); }} className="text-[11px] underline" style={{ color: "var(--mut)" }}>change client</button>
+            {selClient && (
+              <div className="mt-1.5 text-[11px]" style={{ color: "var(--mut)" }}>
+                Additional engagement for {selClient.code} — the client name is locked to the record; contact details below are editable.
+              </div>
+            )}
           </div>
         )}
 
@@ -1347,6 +1334,75 @@ function NewRequest({ users, me, firm, clients = [], onCreate }) {
           Create request & assign
         </button>
       </div>
+    </div>
+  );
+}
+
+/* Searchable client combobox — closed by default; filters live on name OR code; capped
+   dropdown with "+N more"; arrows/Enter/Esc; selection renders a chip with × to clear.
+   Reuse this anywhere a client is picked. */
+function ClientCombobox({ clients, selected, onSelect, onClear, placeholder = "Search clients by name or code, e.g. Gulf Horizon or CL-001" }) {
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(0);
+  const query = q.trim().toLowerCase();
+  const matches = query
+    ? clients.filter((c) => `${c.code} ${c.name}`.toLowerCase().includes(query))
+    : [...clients].sort((a, b) => (b.engagedAt || 0) - (a.engagedAt || 0)).slice(0, 5);
+  const visible = matches.slice(0, 8);
+  const more = matches.length - visible.length;
+  const pick = (c) => { onSelect(c); setQ(""); setOpen(false); setHi(0); };
+
+  if (selected) {
+    return (
+      <span className="inline-flex items-center gap-2 text-xs px-3 py-1.5 rounded-full font-medium max-w-full" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+        <span className="font-mono2 font-bold shrink-0">{selected.code}</span>
+        <span className="truncate">{selected.name}</span>
+        {selected.contact?.email && <span className="truncate" style={{ opacity: 0.75 }}>· {selected.contact.email}</span>}
+        <button onClick={onClear} title="Clear and search again" className="font-bold leading-none px-0.5 shrink-0" style={{ color: "var(--red)" }}>×</button>
+      </span>
+    );
+  }
+  return (
+    <div className="relative">
+      <input
+        value={q}
+        onChange={(e) => { setQ(e.target.value); setOpen(true); setHi(0); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") { e.preventDefault(); setOpen(true); setHi((h) => Math.min(h + 1, Math.max(visible.length - 1, 0))); }
+          else if (e.key === "ArrowUp") { e.preventDefault(); setHi((h) => Math.max(h - 1, 0)); }
+          else if (e.key === "Enter") { e.preventDefault(); if (open && visible[hi]) pick(visible[hi]); }
+          else if (e.key === "Escape") setOpen(false);
+        }}
+        placeholder={placeholder}
+        className="w-full border rounded-md px-3 py-2 text-sm"
+        style={{ borderColor: "var(--line)" }}
+      />
+      {open && (
+        <div className="absolute z-30 mt-1 w-full bg-white border rounded-lg shadow-lg overflow-y-auto" style={{ borderColor: "var(--line)", maxHeight: "19rem" }}
+          onMouseDown={(e) => e.preventDefault() /* keep input focus so blur doesn't eat the click */}>
+          {!query && visible.length > 0 && (
+            <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Recent clients</div>
+          )}
+          {visible.map((c, i) => (
+            <button key={c.id} onClick={() => pick(c)} onMouseEnter={() => setHi(i)}
+              className="w-full text-left px-3 py-2 text-sm flex items-center gap-2"
+              style={{ background: i === hi ? "var(--accent-soft)" : "transparent" }}>
+              <span className="font-mono2 text-xs shrink-0" style={{ color: "var(--accent)" }}>{c.code}</span>
+              <span className="flex-1 truncate font-medium">{c.name}</span>
+              <span className="text-[11px] truncate" style={{ color: "var(--mut)" }}>{c.contact?.email || ""}</span>
+            </button>
+          ))}
+          {visible.length === 0 && <div className="px-3 py-3 text-xs" style={{ color: "var(--mut)" }}>No client matches "{q}".</div>}
+          {more > 0 && (
+            <div className="px-3 py-2 text-[11px] border-t" style={{ color: "var(--mut)", borderColor: "var(--line)" }}>
+              + {more} more — keep typing to narrow down
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
