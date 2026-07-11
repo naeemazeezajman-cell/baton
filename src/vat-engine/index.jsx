@@ -374,6 +374,7 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
   const [trailOpen, setTrailOpen] = useState(false);
   const [editProfile, setEditProfile] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [addForm, setAddForm] = useState(null); // {item, mode: "register"|"ledger"}
   const iAmStaff = me.id === f.staff_id;
 
   // first-time recognition: no VAT profile yet → the questionnaire replaces the period view
@@ -553,9 +554,9 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
                 {label}: <b className="font-mono2">{f.recon?.[k] ?? 0}</b>
               </span>
             ))}
-            {f.recon?.excel_file_id && (
-              <button onClick={() => openFileLink(f.recon.excel_file_id)} className="underline text-xs" style={{ color: "var(--accent)" }}>
-                ⬇ {f.recon.excel_name}
+            {f.recon && (
+              <button onClick={() => downloadTemplate(`/vat-engine/filings/${f.id}/recon-workbook`, f.recon.excel_name || "VAT Reconciliation.xlsx")} className="underline text-xs" style={{ color: "var(--accent)" }}>
+                ⬇ {f.recon.excel_name || "Reconciliation workbook"} (regenerated with current resolutions)
               </button>
             )}
           </div>
@@ -571,6 +572,12 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
                   {i.resolution?.action === "requested" && <span className="text-[10px] font-bold" style={{ color: "var(--amber)" }}>requested from client</span>}
                   {iAmStaff && !["excluded", "resolved"].includes(i.resolution?.action) && (
                     <span className="flex gap-2">
+                      {i.bucket === "ledger_only" && (
+                        <button onClick={() => setAddForm({ item: i, mode: "register" })} className="underline font-semibold" style={{ color: "var(--accent)" }}>invoice found — add to register…</button>
+                      )}
+                      {i.bucket === "invoice_only" && (
+                        <button onClick={() => setAddForm({ item: i, mode: "ledger" })} className="underline font-semibold" style={{ color: "var(--accent)" }}>missing from ledger — add entry…</button>
+                      )}
                       <button onClick={() => setModal({ type: "missing_invoice", item: i })} className="underline" style={{ color: "var(--amber)" }}>request invoice</button>
                       {i.resolution?.action === "requested" && (
                         <button onClick={() => run(() => api.post(`/vat-engine/filings/${f.id}/items/${i.id}/resolve`))} className="underline" style={{ color: "var(--accent)" }}>mark resolved</button>
@@ -580,6 +587,9 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
                         if (reason?.trim()) run(() => api.post(`/vat-engine/filings/${f.id}/items/${i.id}/exclude`, { reason: reason.trim() }));
                       }} className="underline" style={mut}>exclude…</button>
                     </span>
+                  )}
+                  {addForm?.item?.id === i.id && (
+                    <AddResolutionForm f={f} item={i} mode={addForm.mode} run={run} busy={busy} onDone={() => setAddForm(null)} />
                   )}
                 </div>
               ))}
@@ -667,6 +677,78 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
 }
 
 const EMIRATES = ["Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"];
+const SUPPLY_CATEGORY_OPTIONS = [["standard", "Standard (5%)"], ["zero_rated", "Zero-rated (0%)"],
+  ["exempt", "Exempt"], ["margin", "Margin scheme"], ["rcm_import", "RCM-Import"],
+  ["out_of_scope", "Out of scope (designated zone)"]];
+
+/* Per-difference resolution mini-forms: (a) invoice found → add to register (evidence
+   REQUIRED); (b) missing from client ledger → add ledger entry (correction note MANDATORY,
+   surfaces on the Ledger corrections sheet + the computation email). */
+function AddResolutionForm({ f, item, mode, run, busy, onDone }) {
+  const [v, setV] = useState({
+    invoice_no: item.invoice_no, invoice_date: item.invoice_date, party: item.party,
+    emirate: item.emirate, net: item.net, vat: item.vat,
+    type: item.type || "Output", category: item.category || "standard", note: "",
+  });
+  const [files, setFiles] = useState([]);
+  const set = (k) => (e) => setV({ ...v, [k]: e.target.value });
+  const valid = v.invoice_no && v.invoice_date && v.party
+    && (mode === "register" ? files.length > 0 : v.note.trim());
+  const submit = () => {
+    if (mode === "register") {
+      const fd = new FormData();
+      for (const k of ["invoice_no", "invoice_date", "party", "emirate", "net", "vat", "note"]) fd.append(k, v[k]);
+      for (const x of files) fd.append("evidence", x, x.name);
+      run(() => api.postForm(`/vat-engine/filings/${f.id}/items/${item.id}/add-to-register`, fd)).then(onDone).catch(() => {});
+    } else {
+      run(() => api.post(`/vat-engine/filings/${f.id}/items/${item.id}/add-to-ledger`, {
+        invoice_no: v.invoice_no, invoice_date: v.invoice_date, party: v.party, emirate: v.emirate,
+        net: Number(v.net), vat: Number(v.vat), type: v.type, category: v.category, note: v.note.trim(),
+      })).then(onDone).catch(() => {});
+    }
+  };
+  return (
+    <div className="w-full mt-2 border-t pt-2" style={{ borderColor: "var(--line)" }}>
+      <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>
+        {mode === "register" ? "Invoice found — add to register (invoice file required as evidence)"
+          : "Missing from client ledger — add ledger entry (correction note mandatory; the client will be told to book it)"}
+      </div>
+      <div className="flex gap-1.5 flex-wrap items-center text-[11px]">
+        <input value={v.invoice_no} onChange={set("invoice_no")} placeholder="Invoice No" className="border rounded px-1.5 py-1 w-28" style={{ borderColor: "var(--line)" }} />
+        <input type="date" value={v.invoice_date} onChange={set("invoice_date")} className="border rounded px-1.5 py-1" style={{ borderColor: "var(--line)" }} />
+        <input value={v.party} onChange={set("party")} placeholder="Party" className="border rounded px-1.5 py-1 w-36" style={{ borderColor: "var(--line)" }} />
+        <select value={v.emirate} onChange={set("emirate")} className="border rounded px-1 py-1" style={{ borderColor: "var(--line)" }}>
+          {EMIRATES.map((e) => <option key={e}>{e}</option>)}
+        </select>
+        <input value={v.net} onChange={set("net")} placeholder="Net" className="border rounded px-1.5 py-1 w-20" style={{ borderColor: "var(--line)" }} />
+        <input value={v.vat} onChange={set("vat")} placeholder="VAT" className="border rounded px-1.5 py-1 w-20" style={{ borderColor: "var(--line)" }} />
+        {mode === "ledger" && (
+          <>
+            <select value={v.type} onChange={set("type")} className="border rounded px-1 py-1" style={{ borderColor: "var(--line)" }}>
+              <option>Output</option><option>Input</option>
+            </select>
+            <select value={v.category} onChange={set("category")} className="border rounded px-1 py-1" style={{ borderColor: "var(--line)" }}>
+              {SUPPLY_CATEGORY_OPTIONS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+            </select>
+          </>
+        )}
+        {mode === "register" && (
+          <label className="px-2 py-1 rounded border cursor-pointer" style={{ borderColor: "var(--line)", color: files.length ? "var(--accent)" : "var(--mut)" }}>
+            {files.length ? `📎 ${files.length} file(s)` : "+ invoice file *"}
+            <input type="file" accept=".pdf,.png,.jpg,.jpeg" multiple className="hidden" onChange={(e) => setFiles([...files, ...e.target.files])} />
+          </label>
+        )}
+      </div>
+      <div className="flex gap-1.5 mt-1.5 items-center">
+        <input value={v.note} onChange={set("note")}
+          placeholder={mode === "ledger" ? 'Mandatory correction note — e.g. "client ledger omitted this invoice — to be booked in client\'s records"' : "Note (optional)"}
+          className="flex-1 border rounded px-2 py-1 text-[11px]" style={{ borderColor: mode === "ledger" ? "#E4C99A" : "var(--line)", background: mode === "ledger" ? "var(--amber-soft)" : "#fff" }} />
+        <Btn disabled={busy || !valid} onClick={submit}>{mode === "register" ? "Add to register → re-match" : "Add ledger entry → re-match"}</Btn>
+        <button onClick={onDone} className="text-[11px] underline" style={{ color: "var(--mut)" }}>cancel</button>
+      </div>
+    </div>
+  );
+}
 
 /* AI invoice extraction — upload, per-file status chips, and the MANDATORY review table.
    Low-confidence / unreadable cells render amber; only reviewed+confirmed rows reconcile. */

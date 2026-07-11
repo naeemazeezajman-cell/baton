@@ -263,6 +263,18 @@ class ConfirmExtractionsIn(BaseModel):
     rows: list[ExtractionRowIn] = Field(min_length=1)
 
 
+class AddToLedgerIn(BaseModel):
+    invoice_no: str = Field(min_length=1)
+    invoice_date: str  # ISO date
+    party: str = Field(min_length=1)
+    emirate: str
+    net: float
+    vat: float
+    type: Literal["Output", "Input"]
+    category: str = "standard"
+    note: str = Field(min_length=1)  # MANDATORY correction note — the client's books get fixed too
+
+
 # ---------- helpers ----------
 
 def _log(db: Session, f: VatFiling, by_user, txt: str):
@@ -1068,7 +1080,7 @@ def _reconcile(db: Session, f: VatFiling, user: User):
 
     ledger_only = [i for i in ledger if i.bucket == "ledger_only"]
     invoice_only = unused
-    excel = _recon_workbook(f, matched, ledger_only, invoice_only, out_of_window)
+    excel = _recon_workbook(f, items)
     fname = f"VAT Reconciliation {f.period_start:%b} - {f.period_end:%b %Y}.xlsx"
     stored = _store_bytes(db, user, "client", f.client_id or f.id, fname, excel)
     f.recon = {
@@ -1088,31 +1100,51 @@ def _reconcile(db: Session, f: VatFiling, user: User):
             else "No differences — the computation is unlocked."))
 
 
-def _recon_workbook(f: VatFiling, matched, ledger_only, invoice_only, out_of_window) -> bytes:
+ORIGIN_LABELS = {"register": "Register", "ai_extracted": "AI-extracted",
+                 "added_at_recon": "Added at recon", "ledger_correction": "Ledger correction"}
+
+
+def _recon_workbook(f: VatFiling, items) -> bytes:
+    """Built from the CURRENT items — regenerates on download, reflecting every resolution
+    (excluded / resolved / added rows) with its origin, plus the Ledger corrections sheet."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
 
     AMBER = PatternFill("solid", fgColor="FDE9C8")
     HEAD = Font(bold=True)
     COLS = ["Source", "Origin", "Row", "Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT",
-            "Type", "Bucket"]
+            "Type", "Bucket", "Resolution"]
 
     def origin_label(i):
-        if i.source == "ledger":
+        if i.source == "ledger" and i.origin == "register":
             return "Ledger"
-        return "AI-extracted" if i.origin == "ai_extracted" else "Register"
+        return ORIGIN_LABELS.get(i.origin, i.origin)
 
-    def put_rows(ws, items, fill=None):
+    def res_label(i):
+        r = i.resolution or {}
+        if r.get("action") == "excluded":
+            return f"excluded — {r.get('reason', '')}"
+        if r.get("action"):
+            return r["action"]
+        return ""
+
+    def put_rows(ws, rows, fill=None):
         ws.append(COLS)
         for c in ws[1]:
             c.font = HEAD
-        for i in items:
+        for i in rows:
             ws.append([i.source, origin_label(i), i.row_no, i.invoice_no,
                        i.invoice_date.strftime("%d/%m/%Y"), i.party,
-                       i.emirate, float(i.net), float(i.vat), i.type_ or "", i.bucket])
+                       i.emirate, float(i.net), float(i.vat), i.type_ or "", i.bucket or "",
+                       res_label(i)])
             if fill:
                 for c in ws[ws.max_row]:
                     c.fill = fill
+
+    matched = [i for i in items if i.bucket == "matched"]
+    diffs = [i for i in items if i.bucket in ("ledger_only", "invoice_only")]
+    oow = [i for i in items if i.bucket == "out_of_window"]
+    corrections = [i for i in items if i.origin == "ledger_correction"]
 
     wb = Workbook()
     ws = wb.active
@@ -1122,16 +1154,38 @@ def _recon_workbook(f: VatFiling, matched, ledger_only, invoice_only, out_of_win
     ws.append([f"Period: {_period_label(f)}"])
     ws.append([f"Window rule: invoices dated before {f.prev_period_start:%d %b %Y} are excluded (VAT rule)"])
     ws.append([])
-    ws.append(["Matched", len(matched)])
-    ws.append(["In ledger, not in invoices", len(ledger_only)])
-    ws.append(["In invoices, not in ledger", len(invoice_only)])
-    ws.append(["Out of window (VAT rule)", len(out_of_window)])
-    put_rows(wb.create_sheet("Matched"), [x for pair in matched for x in pair])
-    put_rows(wb.create_sheet("Differences"), [*ledger_only, *invoice_only], fill=AMBER)
-    put_rows(wb.create_sheet("Excluded"), out_of_window)
+    ws.append(["Matched", len(matched) // 2])
+    ws.append(["In ledger, not in invoices", sum(1 for i in diffs if i.bucket == "ledger_only")])
+    ws.append(["In invoices, not in ledger", sum(1 for i in diffs if i.bucket == "invoice_only")])
+    ws.append(["Out of window (VAT rule)", len(oow)])
+    ws.append(["Ledger corrections (to be booked by the client)", len(corrections)])
+    put_rows(wb.create_sheet("Matched"), matched)
+    put_rows(wb.create_sheet("Differences"), diffs, fill=AMBER)
+    put_rows(wb.create_sheet("Excluded"), oow)
+    cw = wb.create_sheet("Ledger corrections")
+    cw.append(["Invoices added to the VAT workings that must also be booked in the client's ledger:"])
+    cw["A1"].font = Font(italic=True, size=9)
+    put_rows_start = cw.max_row
+    cw.append(COLS + ["Correction note"])
+    for c in cw[put_rows_start + 1]:
+        c.font = HEAD
+    for i in corrections:
+        cw.append([i.source, origin_label(i), i.row_no, i.invoice_no,
+                   i.invoice_date.strftime("%d/%m/%Y"), i.party, i.emirate, float(i.net),
+                   float(i.vat), i.type_ or "", i.bucket or "", res_label(i),
+                   (i.resolution or {}).get("correction_note") or i.notes or ""])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _refresh_recon_counts(db: Session, f: VatFiling):
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)).all()
+    f.recon = {**(f.recon or {}),
+               "matched": sum(1 for i in items if i.source == "ledger" and i.bucket == "matched"),
+               "ledger_only": sum(1 for i in items if i.bucket == "ledger_only"),
+               "invoice_only": sum(1 for i in items if i.bucket == "invoice_only"),
+               "out_of_window": sum(1 for i in items if i.bucket == "out_of_window")}
 
 
 def _item(db: Session, f: VatFiling, item_id: uuid.UUID) -> VatFilingItem:
@@ -1191,6 +1245,123 @@ def exclude_item(fid: uuid.UUID, item_id: uuid.UUID, body: ReasonIn,
                          f'mandatory reason: "{body.reason.strip()}"')
     db.commit()
     return serialize(db, f, detail=True)
+
+
+def _targeted_match(it: VatFilingItem, new_item: VatFilingItem) -> bool:
+    """Re-run matching for this pair only (same key as the full recon)."""
+    if (new_item.invoice_no_norm == it.invoice_no_norm
+            and round(abs(float(new_item.vat) - float(it.vat)), 2) <= VAT_TOLERANCE):
+        it.bucket = new_item.bucket = "matched"
+        it.resolution = None
+        return True
+    new_item.bucket = "invoice_only" if new_item.source == "invoice" else "ledger_only"
+    return False
+
+
+@router.post("/filings/{fid}/items/{item_id}/add-to-register")
+def add_to_register(
+    fid: uuid.UUID, item_id: uuid.UUID,
+    invoice_no: str = Form(...), invoice_date: str = Form(...), party: str = Form(...),
+    emirate: str = Form(...), net: float = Form(...), vat: float = Form(...),
+    note: str = Form(""),
+    evidence: list[UploadFile] = FileParam(default=[]),
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    """'Invoice found — add to register': resolves an in-ledger-not-in-invoices difference
+    by adding the obtained invoice as a register item (origin=added_at_recon). The invoice
+    file is REQUIRED evidence."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    it = _item(db, f, item_id)
+    if it.bucket != "ledger_only":
+        raise conflict("Only in-ledger-not-in-invoices differences can be resolved this way")
+    if not evidence:
+        raise HTTPException(status_code=422, detail="The obtained invoice file (PDF/image) is required as evidence")
+    matched_emirate = next((e for e in EMIRATES if e.lower() == emirate.strip().lower()), None)
+    if matched_emirate is None:
+        raise HTTPException(status_code=422, detail=f"emirate must be one of {', '.join(EMIRATES)}")
+    try:
+        inv_date = date.fromisoformat(invoice_date)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invoice_date must be YYYY-MM-DD")
+    stored = [_store_upload(db, user, "vat_filing", f.id, e) for e in evidence]
+    names = ", ".join(s.name for s in stored)
+    new_item = VatFilingItem(
+        tenant_id=f.tenant_id, filing_id=f.id, source="invoice", origin="added_at_recon", row_no=0,
+        invoice_no=invoice_no.strip(), invoice_no_norm=_norm_invoice_no(invoice_no),
+        invoice_date=inv_date, party=party.strip(), trn=None, emirate=matched_emirate,
+        net=round(net, 2), vat=round(vat, 2), type_=None, category=it.category,
+        notes=f"Added at reconciliation — evidence: {names}" + (f" · {note.strip()}" if note.strip() else ""))
+    db.add(new_item)
+    db.flush()
+    if _targeted_match(it, new_item):
+        _log(db, f, user.id, f"Difference resolved — invoice {invoice_no.strip()} obtained and added to "
+                             f"register by {user.name}, evidence attached ({names}).")
+    else:
+        _log(db, f, user.id, f"Invoice {invoice_no.strip()} added to register by {user.name} (evidence: "
+                             f"{names}) — but it does NOT match the ledger row (invoice no / VAT differ): "
+                             f"a new difference is open.")
+    _refresh_recon_counts(db, f)
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/items/{item_id}/add-to-ledger")
+def add_to_ledger(fid: uuid.UUID, item_id: uuid.UUID, body: AddToLedgerIn,
+                  user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """'Missing from client ledger — add ledger entry': resolves an in-invoices-not-in-ledger
+    difference with a ledger item (origin=ledger_correction) + MANDATORY correction note.
+    The correction lands on the workbook's 'Ledger corrections' sheet and in the computation
+    email so the client's books get fixed too."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    it = _item(db, f, item_id)
+    if it.bucket != "invoice_only":
+        raise conflict("Only in-invoices-not-in-ledger differences can be resolved this way")
+    if body.category not in SUPPLY_CATEGORIES:
+        raise HTTPException(status_code=422, detail=f"category must be one of {sorted(SUPPLY_CATEGORIES)}")
+    matched_emirate = next((e for e in EMIRATES if e.lower() == body.emirate.strip().lower()), None)
+    if matched_emirate is None:
+        raise HTTPException(status_code=422, detail=f"emirate must be one of {', '.join(EMIRATES)}")
+    try:
+        inv_date = date.fromisoformat(body.invoice_date)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invoice_date must be YYYY-MM-DD")
+    new_item = VatFilingItem(
+        tenant_id=f.tenant_id, filing_id=f.id, source="ledger", origin="ledger_correction", row_no=0,
+        invoice_no=body.invoice_no.strip(), invoice_no_norm=_norm_invoice_no(body.invoice_no),
+        invoice_date=inv_date, party=body.party.strip(), trn=None, emirate=matched_emirate,
+        net=round(body.net, 2), vat=round(body.vat, 2), type_=body.type, category=body.category,
+        notes=body.note.strip(),
+        resolution={"action": "resolved", "via": "ledger_correction",
+                    "correction_note": body.note.strip(), "by": str(user.id), "at": iso(now())})
+    db.add(new_item)
+    db.flush()
+    if _targeted_match(it, new_item):
+        _log(db, f, user.id, f"Difference resolved — missing ledger entry added by {user.name} for invoice "
+                             f'{body.invoice_no.strip()} ({body.type}, {SUPPLY_CATEGORIES[body.category]}) — '
+                             f'correction note: "{body.note.strip()}". The client must book this in their '
+                             f"ledger (listed on the Ledger corrections sheet and in the computation email).")
+    else:
+        _log(db, f, user.id, f"Ledger entry {body.invoice_no.strip()} added by {user.name} — but it does "
+                             f"NOT match the register row (invoice no / VAT differ): a new difference is open.")
+    _refresh_recon_counts(db, f)
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.get("/filings/{fid}/recon-workbook")
+def recon_workbook(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Regenerated on every download — reflects the current resolutions and their origins."""
+    f = _get(db, fid, user)
+    if not f.recon:
+        raise conflict("No reconciliation has run yet")
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)
+                       .order_by(VatFilingItem.source, VatFilingItem.row_no)).all()
+    return _xlsx_response(_recon_workbook(f, items),
+                          f.recon.get("excel_name") or "VAT Reconciliation.xlsx")
 
 
 # ---------- client requests (stage 1 & 2, template attached) ----------
@@ -1332,6 +1503,12 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
                "rcm_import": len(rcm_rows), "out_of_scope": len(oos)}
     profile = _get_profile(db, f.tenant_id, f.client_id)
     checks = _compliance_checks(profile, present)
+    # refresh the registry copy of the workbook — the stored version reflects final resolutions
+    if f.recon:
+        stored_x = _store_bytes(db, user, "client", f.client_id or f.id,
+                                f.recon.get("excel_name") or "VAT Reconciliation.xlsx",
+                                _recon_workbook(f, items))
+        f.recon = {**f.recon, "excel_file_id": str(stored_x.id)}
     excluded = sum(1 for i in items if (i.resolution or {}).get("action") == "excluded")
     f.computation = {
         "period": _period_label(f), "at": iso(now()), "by": str(user.id),
@@ -1485,7 +1662,16 @@ def send_computation(fid: uuid.UUID, body: MailIn, user: User = Depends(current_
     pdf_row = db.get(FileModel, uuid.UUID(pdf_id)) if pdf_id else None
     link = f"\n\nComputation ({f.computation['pdf_name']}) — download link (valid {blobs.LINK_TTL_MIN} minutes):\n" \
            f"{_file_link(pdf_row)}" if pdf_row else ""
-    emails.send_client(str(body.to), body.subject, body.body + link)
+    corrections = db.scalars(select(VatFilingItem).where(
+        VatFilingItem.filing_id == f.id, VatFilingItem.origin == "ledger_correction")).all()
+    corr_txt = ""
+    if corrections:
+        corr_txt = ("\n\nThe following invoices were added to the VAT workings and should be booked "
+                    "in your ledger:\n" + "\n".join(
+                        f"- {i.invoice_no} — {i.party}, net AED {float(i.net):,.2f}, "
+                        f"VAT AED {float(i.vat):,.2f} ({(i.resolution or {}).get('correction_note') or i.notes})"
+                        for i in corrections))
+    emails.send_client(str(body.to), body.subject, body.body + corr_txt + link)
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="computation",
                             to_email=str(body.to), subject=body.subject, by_user=user.id))
     _log(db, f, user.id, f'Computation emailed to the client at {body.to} — subject: "{body.subject}" '

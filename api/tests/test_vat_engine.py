@@ -218,7 +218,7 @@ def test_recon_buckets_tolerance_and_window_rule(client):
                                  {"i": f["recon"]["excel_file_id"]}).scalar()
     from app import blobs
     wb = load_workbook(_io.BytesIO(blobs.read_blob(blob_path)))
-    assert wb.sheetnames == ["Summary", "Matched", "Differences", "Excluded"]
+    assert wb.sheetnames == ["Summary", "Matched", "Differences", "Excluded", "Ledger corrections"]
 
 
 def test_computation_gate_blocks_until_resolved(client):
@@ -631,6 +631,105 @@ def test_out_of_scope_category_flow(client):
     assert r.status_code == 200, r.text
     ids = [x["id"] for x in r.json()["computation"]["checks"]]
     assert "out_of_scope_unexpected" not in ids  # not_sure treated as Yes
+
+
+def test_add_to_register_and_add_to_ledger_resolutions(client, monkeypatch):
+    ctx = setup_firm(client)
+    _, f = drive_to_reconciled(client, ctx)
+    fid = f["id"]
+    items = {(i["source"], i["invoice_no"]): i for i in f["items"]}
+    assert f["unresolved_differences"] == 4  # l:INV-003, l:INV-004, i:INV-003, i:INV-900
+
+    # (a) invoice found — evidence REQUIRED
+    lid4 = items[("ledger", "INV-004")]["id"]
+    form4 = {"invoice_no": "INV-004", "invoice_date": "2026-05-20", "party": "Delta Est",
+             "emirate": "Ajman", "net": "500", "vat": "25", "note": "obtained from client by phone"}
+    r = client.post(f"/vat-engine/filings/{fid}/items/{lid4}/add-to-register", data=form4,
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 422 and "required as evidence" in r.json()["detail"]
+    r = client.post(f"/vat-engine/filings/{fid}/items/{lid4}/add-to-register", data=form4,
+                    files=[("evidence", ("inv-004.pdf", b"%PDF obtained", "application/pdf"))],
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    f = r.json()
+    by = {(i["source"], i["invoice_no"], i["origin"]): i for i in f["items"]}
+    assert by[("ledger", "INV-004", "register")]["bucket"] == "matched"
+    added = by[("invoice", "INV-004", "added_at_recon")]
+    assert added["bucket"] == "matched" and "evidence: inv-004.pdf" in added["notes"]
+    assert f["unresolved_differences"] == 3  # gate re-evaluated immediately
+    assert any("Difference resolved — invoice INV-004 obtained and added to register by Priya Nair, "
+               "evidence attached" in e["text"] for e in f["events"])
+
+    # gate REOPENS when the added invoice doesn't actually match
+    lid3 = items[("ledger", "INV-003")]["id"]
+    r = client.post(f"/vat-engine/filings/{fid}/items/{lid3}/add-to-register",
+                    data={**form4, "invoice_no": "INV-003", "vat": "999"},
+                    files=[("evidence", ("inv-003.pdf", b"%PDF", "application/pdf"))],
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200
+    f = r.json()
+    assert f["unresolved_differences"] == 4  # new invoice_only difference opened
+    assert any("does NOT match the ledger row" in e["text"] for e in f["events"])
+
+    # (b) missing from client ledger — correction note MANDATORY (schema-enforced)
+    iid900 = items[("invoice", "INV-900")]["id"]
+    body900 = {"invoice_no": "INV-900", "invoice_date": "2026-06-20", "party": "Mystery Co",
+               "emirate": "Dubai", "net": 700, "vat": 35, "type": "Output", "category": "standard",
+               "note": ""}
+    r = client.post(f"/vat-engine/filings/{fid}/items/{iid900}/add-to-ledger", json=body900,
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 422  # empty note refused
+    body900["note"] = "client ledger omitted this invoice — to be booked in client's records"
+    r = client.post(f"/vat-engine/filings/{fid}/items/{iid900}/add-to-ledger", json=body900,
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    f = r.json()
+    corr = next(i for i in f["items"] if i["origin"] == "ledger_correction")
+    assert corr["source"] == "ledger" and corr["bucket"] == "matched" and corr["type"] == "Output"
+    assert f["unresolved_differences"] == 3
+    assert any("missing ledger entry added by Priya Nair for invoice INV-900" in e["text"]
+               for e in f["events"])
+
+    # close the remaining differences → gate opens
+    remaining = [i for i in f["items"] if i["bucket"] in ("ledger_only", "invoice_only")
+                 and (i.get("resolution") or {}).get("action") not in ("excluded", "resolved")]
+    assert len(remaining) == 3
+    for i in remaining:
+        r = client.post(f"/vat-engine/filings/{fid}/items/{i['id']}/exclude",
+                        json={"reason": f"not part of this filing — {i['invoice_no']}"},
+                        headers=H(ctx, "staff"))
+        assert r.status_code == 200
+    r = client.post(f"/vat-engine/filings/{fid}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+
+    # the regenerated workbook reflects resolutions + the Ledger corrections sheet
+    from openpyxl import load_workbook
+    r = client.get(f"/vat-engine/filings/{fid}/recon-workbook", headers=H(ctx, "staff"))
+    assert r.status_code == 200
+    wb = load_workbook(io.BytesIO(r.content))
+    assert "Ledger corrections" in wb.sheetnames
+    cw = wb["Ledger corrections"]
+    corr_rows = [[cw.cell(row=r_, column=c).value for c in range(1, 14)]
+                 for r_ in range(3, cw.max_row + 1)]
+    assert any(row[3] == "INV-900" and "to be booked in client's records" in (row[12] or "")
+               for row in corr_rows)
+    diff_ws = wb["Differences"]
+    assert diff_ws.cell(row=1, column=12).value == "Resolution"
+    origins = {wb["Matched"].cell(row=r_, column=2).value for r_ in range(2, wb["Matched"].max_row + 1)}
+    assert {"Added at recon", "Ledger correction"} <= origins
+
+    # the computation email tells the client to book the correction
+    sent = {}
+    monkeypatch.setattr(vat_engine.emails, "send_client",
+                        lambda to, subject, body: sent.update(to=to, body=body))
+    r = client.post(f"/vat-engine/filings/{fid}/confirm-computation", json={}, headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/vat-engine/filings/{fid}/send-computation",
+                    json={"to": "accounts@gulfhorizon.ae", "subject": "VAT computation",
+                          "body": "Please approve."}, headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    assert "The following invoices were added to the VAT workings and should be booked in your ledger" in sent["body"]
+    assert "INV-900" in sent["body"] and "to be booked in client's records" in sent["body"]
 
 
 # ---------- AI invoice extraction (mandatory human review) ----------
