@@ -102,25 +102,33 @@ def client_performance(client_id: uuid.UUID, user: User = Depends(require_roles(
             "stars": duty_stars(c.late_ms, c.method),
         })
 
-    cycle = None
-    if client.from_proposal:
-        p = db.get(Proposal, client.from_proposal)
-        if p and p.status in COMPLETED_STATUSES and p.onboarding_completed_at:
-            per = _cycle_per_employee(db, p)
-            for e in per:
-                u = users_by_id.get(e["user_id"])
-                e["name"] = u.name if u else "—"
-            per.sort(key=lambda e: (-e["stars"], e["total_held_ms"]))
-            cycle = {
-                "ref": p.ref,
-                "total_ms": int((p.onboarding_completed_at - p.created_at).total_seconds() * 1000),
-                "completed_at": p.onboarding_completed_at,
-                "per_employee": per,
-            }
+    # every engagement for this client — the original conversion proposal plus any
+    # additional-engagement proposals linked at creation
+    props = {p.id: p for p in db.scalars(tenant_select(Proposal, user).where(
+        (Proposal.client_id == client.id) | (Proposal.id == client.from_proposal)
+    )).all()}
+    cycles = []
+    for p in props.values():
+        if p.status not in COMPLETED_STATUSES or not p.onboarding_completed_at:
+            continue
+        per = _cycle_per_employee(db, p)
+        for e in per:
+            u = users_by_id.get(e["user_id"])
+            e["name"] = u.name if u else "—"
+        per.sort(key=lambda e: (-e["stars"], e["total_held_ms"]))
+        cycles.append({
+            "ref": p.ref,
+            "services": [s.get("name") for s in (p.services or [])],
+            "total_ms": int((p.onboarding_completed_at - p.created_at).total_seconds() * 1000),
+            "completed_at": p.onboarding_completed_at,
+            "per_employee": per,
+        })
+    cycles.sort(key=lambda c: c["completed_at"])
 
     return {
         "client": {"id": client.id, "ref": client.ref, "name": client.name},
-        "proposal_cycle": cycle,
+        "proposal_cycle": cycles[0] if cycles else None,  # original engagement (back-compat)
+        "proposal_cycles": cycles,
         "tasks": tasks,
         "duty_stars_scale_text": DUTY_STARS_SCALE_TEXT,
         "proposal_stars_scale_text": PROPOSAL_STARS_SCALE_TEXT,

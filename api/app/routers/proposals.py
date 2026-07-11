@@ -66,6 +66,7 @@ class ProposalCreateIn(BaseModel):
     assigned_to: uuid.UUID
     notes: str | None = None
     payment_terms_rough: str | None = None
+    client_id: uuid.UUID | None = None  # existing-client mode: additional engagement for this client
 
 
 class AssignIn(BaseModel):
@@ -220,6 +221,9 @@ def _serialize(p: Proposal, db: Session | None = None, include_events: bool = Tr
         "part1_completed_at": p.onboarding_completed_at,
     }
     if db is not None:
+        if p.client_id:
+            c = db.get(Client, p.client_id)
+            out["client_ref"] = c.ref if c else None
         if include_events:
             events = db.scalars(
                 select(ProposalEvent).where(ProposalEvent.proposal_id == p.id).order_by(ProposalEvent.at, ProposalEvent.id)
@@ -267,29 +271,52 @@ def create_proposal(
 ):
     drafter = _user(db, user, body.assigned_to)
 
-    # duplicate-prospect guard: refuse while an open matter exists for the same prospect
-    # (case-insensitive, whitespace-normalized); prior lost matters only flag a warning
-    target = _norm_name(body.prospect.name)
-    same_prospect = [
-        x for x in db.scalars(tenant_select(Proposal, user)).all()
-        if _norm_name((x.prospect or {}).get("name")) == target
-    ]
-    open_same = [x for x in same_prospect if x.status not in CLOSED_STATUSES]
-    if open_same:
-        raise conflict(
-            f'An open proposal already exists for "{body.prospect.name.strip()}": '
-            f"{open_same[0].ref} (status: {open_same[0].status}). Open it instead of creating a duplicate."
-        )
-    prior_lost = [x for x in same_prospect if x.status == "lost"]
+    prospect = body.prospect.model_dump()
+    existing_client = None
+    prior_lost = []
+    if body.client_id:
+        # existing-client mode: the client's existence is never a duplicate — only an OPEN
+        # proposal already linked to that client blocks a new engagement
+        existing_client = get_scoped_or_404(db, Client, body.client_id, user)
+        open_for_client = [
+            x for x in db.scalars(tenant_select(Proposal, user)
+                                  .where(Proposal.client_id == existing_client.id)).all()
+            if x.status not in CLOSED_STATUSES
+        ]
+        if open_for_client:
+            raise conflict(
+                f"An open proposal already exists for client {existing_client.ref} — {existing_client.name}: "
+                f"{open_for_client[0].ref} (status: {open_for_client[0].status}). "
+                f"Open it instead of creating a duplicate."
+            )
+        prospect["name"] = existing_client.name  # locked to the client record
+        for k in ("email", "phone", "contactPerson"):
+            prospect[k] = prospect.get(k) or (existing_client.contact or {}).get(k)
+    else:
+        # duplicate-prospect guard: refuse while an open matter exists for the same prospect
+        # (case-insensitive, whitespace-normalized); prior lost matters only flag a warning
+        target = _norm_name(body.prospect.name)
+        same_prospect = [
+            x for x in db.scalars(tenant_select(Proposal, user)).all()
+            if _norm_name((x.prospect or {}).get("name")) == target
+        ]
+        open_same = [x for x in same_prospect if x.status not in CLOSED_STATUSES]
+        if open_same:
+            raise conflict(
+                f'An open proposal already exists for "{body.prospect.name.strip()}": '
+                f"{open_same[0].ref} (status: {open_same[0].status}). Open it instead of creating a duplicate."
+            )
+        prior_lost = [x for x in same_prospect if x.status == "lost"]
 
     count = db.scalar(select(func.count()).select_from(Proposal).where(Proposal.tenant_id == user.tenant_id))
     ref = f"P-{count + 1:03d}"
     p = Proposal(
         tenant_id=user.tenant_id, ref=ref,
-        prospect=body.prospect.model_dump(),
+        prospect=prospect,
         services=[s.model_dump() for s in body.services],
         payment_terms_rough=body.payment_terms_rough,
         status="assigned", assigned_to=drafter.id, requested_by=user.id,
+        client_id=existing_client.id if existing_client else None,
         checklist=[], versions=[], el={}, signatures={},
         draft={
             "lines": [
@@ -302,17 +329,23 @@ def create_proposal(
     )
     db.add(p)
     db.flush()
-    log_event(db, p, user.id, f'Proposal request created for prospect "{body.prospect.name}"')
+    if existing_client:
+        log_event(db, p, user.id, f"Additional engagement proposal created for existing client "
+                                  f"{existing_client.ref} — {existing_client.name}")
+    else:
+        log_event(db, p, user.id, f'Proposal request created for prospect "{prospect["name"]}"')
     svc = ", ".join(s.name + (" (custom)" if s.custom else "") for s in body.services)
     log_event(db, p, user.id, f"Services requested: {svc}")
     pass_holder(db, p, drafter, user, "assigned to draft the proposal")
     log_event(db, p, None, f'Auto-email sent to {drafter.email} — "You have been assigned proposal {ref}"', kind="email")
-    _notify(db, p, drafter.id, f"You were assigned {ref} — proposal for {body.prospect.name}")
+    _notify(db, p, drafter.id, f"You were assigned {ref} — proposal for {prospect['name']}")
     if prior_lost:
         log_event(db, p, None, f"Note: this prospect was previously proposed and LOST ({prior_lost[-1].ref}). "
                                f"Prior history remains on record.")
     db.commit()
     out = _serialize(p)
+    if existing_client:
+        out["client_ref"] = existing_client.ref
     if prior_lost:
         out["previously_lost"] = True
         out["prior_ref"] = prior_lost[-1].ref
@@ -820,23 +853,28 @@ def upload_signed(pid: uuid.UUID, file: UploadFile, user: User = Depends(current
     p = _get(db, pid, user)
     _require_requester(p, user)
     require_status(p, "proposal_sent")
-    if p.client_id:
-        raise conflict("This proposal has already been converted to a client")
     latest = _latest_version(p)
     f = store_upload(db, user, "proposal", p.id, file)
-    count = db.scalar(select(func.count()).select_from(Client).where(Client.tenant_id == user.tenant_id))
-    client = Client(
-        tenant_id=user.tenant_id, ref=f"CL-{count + 1:03d}", name=p.prospect.get("name"),
-        contact=p.prospect, from_proposal=p.id, confirmation_basis="signed_upload",
-    )
-    db.add(client)
-    db.flush()
-    p.client_id = client.id
+    if p.client_id:
+        # existing-client engagement: no new client row — link and log
+        client = db.get(Client, p.client_id)
+        log_event(db, p, user.id, f"Client-signed proposal uploaded: {f.name}. "
+                                  f"Additional engagement confirmed for {client.ref} — {client.name}; "
+                                  f"no new client record created.")
+    else:
+        count = db.scalar(select(func.count()).select_from(Client).where(Client.tenant_id == user.tenant_id))
+        client = Client(
+            tenant_id=user.tenant_id, ref=f"CL-{count + 1:03d}", name=p.prospect.get("name"),
+            contact=p.prospect, from_proposal=p.id, confirmation_basis="signed_upload",
+        )
+        db.add(client)
+        db.flush()
+        p.client_id = client.id
+        log_event(db, p, user.id, f"Client-signed proposal uploaded: {f.name}. Client confirmation established — "
+                                  f"prospect converted to CLIENT {client.ref}.")
     p.el = {"note": "", "advance_pct": 0, "signatory_id": None, "signature": None, "sent_at": None,
             "assignments": {}, "client_signed": {"file_id": str(f.id), "name": f.name, "at": iso(now())}}
     p.status = "el_staffing"
-    log_event(db, p, user.id, f"Client-signed proposal uploaded: {f.name}. Client confirmation established — "
-                              f"prospect converted to CLIENT {client.ref}.")
     log_event(db, p, None, "Engagement letter auto-prepared from the signed proposal. "
                            "Next: assign technical staff per activity, then route for senior signature.")
     db.commit()
@@ -868,8 +906,6 @@ def confirm_unsigned(
     without-proof discipline. The signed EL becomes the binding acceptance record."""
     p = _get(db, pid, user)
     require_status(p, "proposal_sent")
-    if p.client_id:
-        raise conflict("This proposal has already been converted to a client")
     if basis not in CONFIRMATION_BASES:
         raise HTTPException(status_code=422, detail=f"basis must be one of {sorted(CONFIRMATION_BASES)}")
     if not note.strip():
@@ -878,23 +914,31 @@ def confirm_unsigned(
     latest = _latest_version(p)
 
     stored = [store_upload(db, user, "proposal", p.id, f) for f in evidence]
-    count = db.scalar(select(func.count()).select_from(Client).where(Client.tenant_id == user.tenant_id))
-    client = Client(
-        tenant_id=user.tenant_id, ref=f"CL-{count + 1:03d}", name=p.prospect.get("name"),
-        contact=p.prospect, from_proposal=p.id, confirmation_basis=basis,
-    )
-    db.add(client)
-    db.flush()
-    p.client_id = client.id
+    ev_txt = f' Evidence on file: {", ".join(f.name for f in stored)}.' if stored else ""
+    if p.client_id:
+        # existing-client engagement: no new client row — link and log
+        client = db.get(Client, p.client_id)
+        log_event(db, p, user.id,
+                  f'CLIENT CONFIRMATION RECORDED WITHOUT SIGNED PROPOSAL — basis: {label}; note: "{note.strip()}".'
+                  f"{ev_txt} Additional engagement confirmed for {client.ref} — {client.name}; "
+                  f"no new client record created.")
+    else:
+        count = db.scalar(select(func.count()).select_from(Client).where(Client.tenant_id == user.tenant_id))
+        client = Client(
+            tenant_id=user.tenant_id, ref=f"CL-{count + 1:03d}", name=p.prospect.get("name"),
+            contact=p.prospect, from_proposal=p.id, confirmation_basis=basis,
+        )
+        db.add(client)
+        db.flush()
+        p.client_id = client.id
+        log_event(db, p, user.id,
+                  f'CLIENT CONFIRMATION RECORDED WITHOUT SIGNED PROPOSAL — basis: {label}; note: "{note.strip()}".'
+                  f"{ev_txt} Client confirmation established — prospect converted to CLIENT {client.ref}.")
     p.el = {"note": "", "advance_pct": 0, "signatory_id": None, "signature": None, "sent_at": None,
             "assignments": {},
             "client_confirmation": {"basis": basis, "label": label, "note": note.strip(), "at": iso(now()),
                                     "evidence": [{"file_id": str(f.id), "name": f.name} for f in stored]}}
     p.status = "el_staffing"
-    ev_txt = f' Evidence on file: {", ".join(f.name for f in stored)}.' if stored else ""
-    log_event(db, p, user.id,
-              f'CLIENT CONFIRMATION RECORDED WITHOUT SIGNED PROPOSAL — basis: {label}; note: "{note.strip()}".'
-              f"{ev_txt} Client confirmation established — prospect converted to CLIENT {client.ref}.")
     log_event(db, p, None, "Engagement letter auto-prepared. Next: assign technical staff per activity, "
                            "then route for senior signature. The signed engagement letter will serve as "
                            "the binding client acceptance record.")

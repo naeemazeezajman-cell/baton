@@ -59,7 +59,7 @@ def test_full_relay_round_trip(client):
     o = ob_act(client, ctx, "staff", oid, "send-requests")
     assert o["holder"] == ctx["manager"]["id"]
     mgr_notices = client.get("/notices", headers=ctx["manager"]["headers"]).json()
-    assert any("requested 3 item(s)" in n["text"] and "baton is with you" in n["text"] for n in mgr_notices)
+    assert any("3 item(s) requested" in n["text"] and "baton with you" in n["text"] for n in mgr_notices)
 
     items = {i["label"]: i for i in o["items"]}
     # manager cannot resolve while... staff cannot provide at all
@@ -86,7 +86,7 @@ def test_full_relay_round_trip(client):
     assert o["open_items"] == 0
     assert o["holder"] == ctx["staff"]["id"]  # auto-returned
     staff_notices = client.get("/notices", headers=ctx["staff"]["headers"]).json()
-    assert any("all requested items resolved" in n["text"] for n in staff_notices)
+    assert any("3 item(s) answered — baton with you" in n["text"] for n in staff_notices)
     assert any("baton auto-returned" in e["text"] for e in o["events"])
 
     # staff accepts one and re-requests another with a reason
@@ -169,6 +169,42 @@ def test_credential_masked_and_reveal_logged(client):
     # accountant may not reveal
     assert client.get(f"/onboardings/{oid}/items/{item_id}/reveal",
                       headers=ctx["accountant"]["headers"]).status_code == 409
+
+
+def test_baton_pass_notices_both_directions(client):
+    """Every onboarding baton pass writes a notices row to the receiving holder:
+    creation → staff, send-requests → manager, resolve-all (auto-return) → staff."""
+    ctx = setup_firm(client)
+    _, obs = start_onboardings(client, ctx)
+
+    # initial pass: each onboarding starts with the baton at staff — staff is notified
+    staff_notices = client.get("/notices", headers=ctx["staff"]["headers"]).json()
+    for o in obs:
+        assert any(f"Onboarding Gulf Horizon Trading LLC — {o['service']}: started — baton with you" in n["text"]
+                   for n in staff_notices), o["service"]
+
+    ob = next(o for o in obs if o["service"] == "VAT Filing")
+    oid = ob["id"]
+    o = ob_act(client, ctx, "staff", oid, "items", {"items": [
+        {"label": "Confirm TRN", "kind": "information"},
+        {"label": "Confirm VAT stagger", "kind": "information"},
+    ]})
+    item_ids = [i["id"] for i in o["items"]]
+
+    # staff → manager: manager is notified with the count
+    ob_act(client, ctx, "staff", oid, "send-requests")
+    mgr_notices = client.get("/notices", headers=ctx["manager"]["headers"]).json()
+    assert any("Onboarding Gulf Horizon Trading LLC — VAT Filing: 2 item(s) requested by Priya Nair "
+               "— baton with you" in n["text"] for n in mgr_notices)
+
+    # manager → staff: resolving the last open item auto-returns and notifies with the count
+    client.post(f"/onboardings/{oid}/items/{item_ids[0]}/provide",
+                data={"answer_text": "TRN 100-1234-5678-901"}, headers=ctx["manager"]["headers"])
+    client.post(f"/onboardings/{oid}/items/{item_ids[1]}/provide",
+                data={"answer_text": "Quarterly, stagger 1"}, headers=ctx["manager"]["headers"])
+    staff_notices = client.get("/notices", headers=ctx["staff"]["headers"]).json()
+    assert any("Onboarding Gulf Horizon Trading LLC — VAT Filing: 2 item(s) answered — baton with you" in n["text"]
+               for n in staff_notices)
 
 
 def test_legacy_blob_credential_still_readable(client):

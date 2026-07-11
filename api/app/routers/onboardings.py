@@ -139,6 +139,8 @@ def serialize(db: Session, ob: Onboarding, detail: bool = False) -> dict:
 
 def create_for_el_send(db: Session, p: Proposal, manager: User) -> list[Onboarding]:
     """Called from /el-send: one onboarding per staffed activity."""
+    client = db.get(Client, p.client_id) if p.client_id else None
+    client_name = client.name if client else (p.prospect or {}).get("name", "client")
     created = []
     for service, staff_id in (p.el or {}).get("assignments", {}).items():
         sid = uuid.UUID(staff_id)
@@ -151,6 +153,9 @@ def create_for_el_send(db: Session, p: Proposal, manager: User) -> list[Onboardi
         _log(db, ob, None, f"Onboarding started for \"{service}\" at EL send — client documentation relay "
                            f"between {staff.name if staff else 'staff'} and {manager.name} (engagement manager). "
                            f"Request the documents and information needed to begin recurring work.")
+        # every baton pass notifies the receiving holder — including the initial pass to staff
+        _notify(db, ob, sid, f"Onboarding {client_name} — {service}: started — baton with you. "
+                             f"Request the documents needed to begin recurring work.")
         created.append(ob)
     return created
 
@@ -209,8 +214,8 @@ def send_requests(oid: uuid.UUID, user: User = Depends(current_user), db: Sessio
     manager = db.get(User, manager_id)
     _pass_baton(db, ob, manager_id, user)
     _log(db, ob, user.id, f"{len(open_items)} open request(s) sent to {manager.name} — baton passes to them")
-    _notify(db, ob, manager_id, f"Onboarding · {ob.service} for {serialize(db, ob)['client_name']}: "
-                                f"{user.name} requested {len(open_items)} item(s) — the baton is with you")
+    _notify(db, ob, manager_id, f"Onboarding {serialize(db, ob)['client_name']} — {ob.service}: "
+                                f"{len(open_items)} item(s) requested by {user.name} — baton with you")
     db.commit()
     return serialize(db, ob, detail=True)
 
@@ -233,8 +238,13 @@ def _maybe_autoreturn(db: Session, ob: Onboarding, by: User):
         staff = db.get(User, ob.staff_id)
         _pass_baton(db, ob, ob.staff_id, by)
         _log(db, ob, None, f"All open items resolved — baton auto-returned to {staff.name if staff else 'staff'}")
-        _notify(db, ob, ob.staff_id, f"Onboarding · {ob.service} for {serialize(db, ob)['client_name']}: "
-                                     f"all requested items resolved — review and continue")
+        answered = [i for i in items if i.status in ("provided", "answered", "not_available")
+                    and i.accepted_at is None]
+        client_name = serialize(db, ob)["client_name"]
+        _notify(db, ob, ob.staff_id,
+                f"Onboarding {client_name} — {ob.service}: {len(answered)} item(s) answered — baton with you"
+                if answered else
+                f"Onboarding {client_name} — {ob.service}: all open requests closed — baton with you")
 
 
 @router.post("/{oid}/items/{item_id}/provide")

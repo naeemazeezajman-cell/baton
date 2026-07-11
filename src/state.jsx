@@ -52,6 +52,7 @@ function mapProposal(a, docs = []) {
     holder: a.holder,
     signatoryId: a.signatory_id,
     clientId: a.client_id,
+    clientRef: a.client_ref || null,
     status: a.status,
     proposalSentAt: ms(a.proposal_sent_at),
     checklist: (a.checklist || []).map((s) => ({
@@ -299,11 +300,14 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
         services: form.services,
         assigned_to: form.assignedTo,
         payment_terms_rough: form.paymentTerms || null,
+        client_id: form.clientId || null,
       });
       for (const d of form.docs) await uploadRaw("proposal", created.id)(d);
-      pushToast(created.previously_lost
-        ? `Request ${created.ref} created — note: this prospect was previously proposed and LOST (${created.prior_ref}); prior history retained.`
-        : `Request ${created.ref} created · auto-email sent to the drafter`);
+      pushToast(form.clientId
+        ? `Request ${created.ref} created — additional engagement for ${created.client_ref || "the existing client"}`
+        : created.previously_lost
+          ? `Request ${created.ref} created — note: this prospect was previously proposed and LOST (${created.prior_ref}); prior history retained.`
+          : `Request ${created.ref} created · auto-email sent to the drafter`);
       return created;
     }),
 

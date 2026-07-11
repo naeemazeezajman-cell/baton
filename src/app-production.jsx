@@ -440,7 +440,7 @@ function Shell() {
             {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
             {route.screen === "performance" && isMgr && <PerformanceScreen />}
             {route.screen === "onboarding" && route.id && <OnboardingView oid={route.id} me={me} byId={byId} back={() => setRoute({ screen: "dashboard" })} />}
-            {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
+            {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} clients={clients} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
             {route.screen === "detail" && (
               <Detail p={proposals.find((x) => x.id === route.id)} me={me} byId={byId} now={now} firm={firm} users={users} clients={clients} workloadOf={workloadOf}
                 actions={actions}
@@ -961,8 +961,8 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
         {clients.length === 0 && <div className="p-8 text-center text-sm" style={{ color: "var(--mut)" }}>No clients yet — upload a client-signed proposal to convert a prospect.</div>}
         {clients.map((c) => {
           const h = healthOf(c.id);
-          const pr = proposals.find((p) => p.id === c.pid);
-          const team = Object.entries(pr?.el?.assignments || {});
+          const engagements = proposals.filter((p) => p.clientId === c.id);
+          const team = [...new Map(engagements.flatMap((p) => Object.entries(p.el?.assignments || {}))).entries()];
           return (
             <div key={c.id} className="border-b last:border-0" style={{ borderColor: "var(--line)" }}>
             <div onClick={() => openP(c.pid)} role="button" tabIndex={0} className="w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left hover:bg-gray-50 items-center cursor-pointer">
@@ -982,7 +982,17 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
             <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtD(c.engagedAt)}</span>
             <span className="text-[11px] px-2 py-0.5 rounded-full font-bold text-center" style={{ background: h.badge[1] + "18", color: h.badge[1] }}>{h.badge[0]}</span>
             </div>
-            <div className="px-5 pb-2 -mt-1.5 flex gap-4">
+            {engagements.length > 0 && (
+              <div className="px-5 pb-1 -mt-1 flex gap-1.5 flex-wrap items-center">
+                <span className="text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Engagements ({engagements.length})</span>
+                {engagements.map((p) => (
+                  <button key={p.id} onClick={() => openP(p.id)} className="text-[11px] px-2 py-0.5 rounded-full border font-mono2 hover:bg-gray-50" style={{ borderColor: "var(--line)", color: "var(--ink)" }}>
+                    {p.id} · {STATUS_MAP[p.status]?.[0] || p.status}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="px-5 pb-2 flex gap-4">
               {canPerf && (
                 <button onClick={() => setPerfOpen(perfOpen === c.id ? null : c.id)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>
                   {perfOpen === c.id ? "Hide performance & task history ▾" : "★ Performance & task history ▸"}
@@ -1171,8 +1181,11 @@ function PayRow({ x, now, raiseInvoice, recordReceipt, actionable }) {
 
 /* ================================================================== */
 
-function NewRequest({ users, me, firm, onCreate }) {
+function NewRequest({ users, me, firm, clients = [], onCreate }) {
   const CATALOG = firm.services && firm.services.length ? firm.services : SERVICES;
+  const [mode, setMode] = useState("prospect"); // "prospect" | "client"
+  const [clientId, setClientId] = useState(null);
+  const [clientQuery, setClientQuery] = useState("");
   const [prospect, setProspect] = useState({ name: "", contactPerson: "", email: "", phone: "" });
   const [sel, setSel] = useState([]);
   const [custom, setCustom] = useState("");
@@ -1186,20 +1199,81 @@ function NewRequest({ users, me, firm, onCreate }) {
   const toggle = (s) => setSel((x) => (x.includes(s) ? x.filter((y) => y !== s) : [...x, s]));
   const addCustom = () => { if (custom.trim()) { setSel((x) => [...x, custom.trim() + "‡"]); setCustom(""); } };
   const services = sel.map((s) => ({ name: s.replace("‡", ""), custom: s.endsWith("‡"), fee: fees[s]?.amt || "", basis: fees[s]?.basis || defaultBasis(s) }));
-  const valid = prospect.name.trim() && prospect.email.trim() && sel.length > 0 && assignedTo;
+  const selClient = clients.find((c) => c.id === clientId) || null;
+  const clientMatches = clients.filter((c) =>
+    `${c.code} ${c.name}`.toLowerCase().includes(clientQuery.trim().toLowerCase()));
+  const pickClient = (c) => {
+    setClientId(c.id);
+    setProspect({
+      name: c.name,
+      contactPerson: c.contact?.contactPerson || "",
+      email: c.contact?.email || "",
+      phone: c.contact?.phone || "",
+    });
+  };
+  const switchMode = (m) => {
+    setMode(m);
+    setClientId(null);
+    setClientQuery("");
+    setProspect({ name: "", contactPerson: "", email: "", phone: "" });
+  };
+  const valid = prospect.name.trim() && prospect.email.trim() && sel.length > 0 && assignedTo
+    && (mode === "prospect" || clientId);
 
   return (
     <div className="max-w-3xl mx-auto">
       <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>New proposal request</h1>
       <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>Raised after a prospect meeting. Assignment sends an auto-email and starts the clock.</p>
 
-      <Card title="1 · Prospect details">
-        <div className="grid grid-cols-2 gap-3">
-          <Inp label="Prospect / company name *" v={prospect.name} set={(v) => setProspect({ ...prospect, name: v })} ph="e.g. Gulf Horizon Trading FZE" />
-          <Inp label="Contact person" v={prospect.contactPerson} set={(v) => setProspect({ ...prospect, contactPerson: v })} />
-          <Inp label="Contact email * (proposal & EL will be emailed here)" v={prospect.email} set={(v) => setProspect({ ...prospect, email: v })} />
-          <Inp label="Phone" v={prospect.phone} set={(v) => setProspect({ ...prospect, phone: v })} />
+      <Card title="1 · Who is this for?">
+        <div className="flex gap-2 mb-3">
+          {[["prospect", "New prospect"], ["client", "Existing client"]].map(([m, l]) => (
+            <button key={m} onClick={() => switchMode(m)} className="px-3.5 py-1.5 rounded-full text-xs font-semibold border transition"
+              style={mode === m ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { borderColor: "var(--line)", color: "var(--mut)" }}>{l}</button>
+          ))}
         </div>
+
+        {mode === "client" && !selClient && (
+          <div className="mb-3">
+            <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Search the firm's clients</label>
+            <input value={clientQuery} onChange={(e) => setClientQuery(e.target.value)} placeholder="Type a name or code, e.g. Gulf Horizon or CL-001" className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+            <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border" style={{ borderColor: "var(--line)" }}>
+              {clientMatches.map((c) => (
+                <button key={c.id} onClick={() => pickClient(c)} className="w-full text-left px-3 py-2 text-sm border-b last:border-0 hover:bg-gray-50 flex items-center gap-2" style={{ borderColor: "var(--line)" }}>
+                  <span className="font-mono2 text-xs" style={{ color: "var(--accent)" }}>{c.code}</span>
+                  <span className="flex-1 truncate font-medium">{c.name}</span>
+                  <span className="text-[11px] truncate" style={{ color: "var(--mut)" }}>{c.contact?.email || ""}</span>
+                </button>
+              ))}
+              {clientMatches.length === 0 && <div className="px-3 py-3 text-xs" style={{ color: "var(--mut)" }}>No client matches "{clientQuery}".</div>}
+            </div>
+          </div>
+        )}
+
+        {mode === "client" && selClient && (
+          <div className="mb-3 flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] px-2 py-1 rounded-full font-bold" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+              Additional engagement for {selClient.code} — {selClient.name}
+            </span>
+            <button onClick={() => { setClientId(null); setProspect({ name: "", contactPerson: "", email: "", phone: "" }); }} className="text-[11px] underline" style={{ color: "var(--mut)" }}>change client</button>
+          </div>
+        )}
+
+        {(mode === "prospect" || selClient) && (
+          <div className="grid grid-cols-2 gap-3">
+            {mode === "client" ? (
+              <div>
+                <label className="text-xs font-semibold" style={{ color: "var(--mut)" }}>Client name (from the client record)</label>
+                <input value={prospect.name} disabled className="mt-1 w-full border rounded-md px-3 py-2 text-sm opacity-70" style={{ borderColor: "var(--line)", background: "var(--paper)" }} />
+              </div>
+            ) : (
+              <Inp label="Prospect / company name *" v={prospect.name} set={(v) => setProspect({ ...prospect, name: v })} ph="e.g. Gulf Horizon Trading FZE" />
+            )}
+            <Inp label="Contact person" v={prospect.contactPerson} set={(v) => setProspect({ ...prospect, contactPerson: v })} />
+            <Inp label="Contact email * (proposal & EL will be emailed here)" v={prospect.email} set={(v) => setProspect({ ...prospect, email: v })} />
+            <Inp label="Phone" v={prospect.phone} set={(v) => setProspect({ ...prospect, phone: v })} />
+          </div>
+        )}
       </Card>
 
       <Card title="2 · Services to include *" sub="Pick from the firm's catalog, or type a custom service. Custom entries are flagged to Admin as catalog candidates.">
@@ -1266,7 +1340,7 @@ function NewRequest({ users, me, firm, onCreate }) {
       </Card>
 
       <div className="mt-5 flex justify-end">
-        <button disabled={!valid} onClick={() => onCreate({ prospect, services, paymentTerms, notes, docs, assignedTo })} className="px-5 py-2.5 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+        <button disabled={!valid} onClick={() => onCreate({ prospect, services, paymentTerms, notes, docs, assignedTo, clientId: mode === "client" ? clientId : null })} className="px-5 py-2.5 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
           Create request & assign
         </button>
       </div>
@@ -1303,7 +1377,8 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
   const iAmDrafter = me.id === p.assignedTo;
   const iAmRequester = me.id === p.requestedBy;
   const iHoldBaton = p.holder === me.id;
-  const client = clients.find((c) => c.pid === p.id);
+  const client = clients.find((c) => c.pid === p.id) || (p.clientId ? clients.find((c) => c.id === p.clientId) : null) || null;
+  const isAdditional = !!client && client.pid !== p.id;
   const showEngTab = ["signed", "proposal_sent", "el_staffing", "el_senior_review", "el_approved", "el_sent", "lost"].includes(p.status);
 
   const attribution = useMemo(() => {
@@ -1323,6 +1398,11 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
           </h1>
           <div className="text-sm mt-1 flex items-center gap-2 flex-wrap" style={{ color: "var(--mut)" }}>
             <StatusChip s={p.status} />
+            {isAdditional && (
+              <span className="text-[11px] px-2 py-0.5 rounded-full font-bold" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                Additional engagement for {client.code}
+              </span>
+            )}
             <span>Requested by <b style={{ color: "var(--ink)" }}>{byId(p.requestedBy).name}</b></span>·
             <span>Drafter <b style={{ color: "var(--ink)" }}>{byId(p.assignedTo).name}</b></span>·
             {p.holder ? <span>baton with <b style={{ color: "var(--ink)" }}>{byId(p.holder).name}</b></span> : <span>{p.status === "proposal_sent" ? "awaiting client confirmation" : p.status === "el_sent" ? "Proposal & Engagement complete" : "closed"}</span>}
@@ -1383,7 +1463,7 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
         ))}
       </div>
 
-      {tab === "work" && <Workspace p={p} me={me} byId={byId} actions={actions} iAmDrafter={iAmDrafter} iAmRequester={iAmRequester} iHoldBaton={iHoldBaton} gotoDoc={() => setTab("doc")} draft={wsDraft} setDraft={setWsDraft} dirty={formDirty} />}
+      {tab === "work" && <Workspace p={p} me={me} byId={byId} actions={actions} iAmDrafter={iAmDrafter} iAmRequester={iAmRequester} iHoldBaton={iHoldBaton} gotoDoc={() => setTab("doc")} draft={wsDraft} setDraft={setWsDraft} dirty={formDirty} existingClient={isAdditional ? client : null} />}
       {tab === "doc" && <DocTab p={p} byId={byId} firm={firm} me={me} users={users} actions={actions} iAmRequester={iAmRequester} formDirty={formDirty} />}
       {tab === "eng" && showEngTab && <EngTab p={p} byId={byId} firm={firm} me={me} users={users} client={client} workloadOf={workloadOf} actions={actions} iAmRequester={iAmRequester} now={now} />}
       {tab === "report" && ["el_sent", "onboarding_complete"].includes(p.status) && (me.role === "Manager" || me.role === "Admin") && <PerfReportHost p={p} byId={byId} />}
@@ -1395,7 +1475,7 @@ function Detail({ p, me, byId, now, firm, users, clients, workloadOf, actions, b
 
 /* ---------- workspace (unchanged mechanics from v1) ---------- */
 
-function Workspace({ p, me, byId, actions, iAmDrafter, iAmRequester, iHoldBaton, gotoDoc, draft, setDraft, dirty }) {
+function Workspace({ p, me, byId, actions, iAmDrafter, iAmRequester, iHoldBaton, gotoDoc, draft, setDraft, dirty, existingClient = null }) {
   const [slots, setSlots] = useState([]);
   const [label, setLabel] = useState("");
   const [kind, setKind] = useState("document");
@@ -1420,6 +1500,13 @@ function Workspace({ p, me, byId, actions, iAmDrafter, iAmRequester, iHoldBaton,
             {p.docs.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>Nothing attached yet.</div>}
           </div>
         </section>
+        {existingClient && (
+          <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
+            <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Already on file — {existingClient.code}</h3>
+            <p className="text-xs mt-0.5 mb-2" style={{ color: "var(--mut)" }}>The client's document registry, read-only — check here before requesting anything the firm already holds.</p>
+            <ClientDocuments clientId={existingClient.id} />
+          </section>
+        )}
         <section className="bg-white border rounded-xl p-4" style={{ borderColor: "var(--line)" }}>
           <h3 className="font-disp font-bold text-sm" style={{ color: "var(--ink)" }}>Request brief</h3>
           <div className="mt-2 text-sm space-y-1.5">
@@ -2880,19 +2967,19 @@ function ClientPerformance({ clientId }) {
   const t = (x) => new Date(x).getTime();
   return (
     <div className="rounded-lg border p-3 space-y-3" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
-      {r.proposal_cycle && (
-        <div className="bg-white rounded-md border p-3" style={{ borderColor: "var(--line)" }}>
+      {(r.proposal_cycles || (r.proposal_cycle ? [r.proposal_cycle] : [])).map((cycle) => (
+        <div key={cycle.ref} className="bg-white rounded-md border p-3" style={{ borderColor: "var(--line)" }}>
           <div className="flex items-center justify-between flex-wrap gap-2 text-xs">
-            <b>Onboarding cycle — {r.proposal_cycle.ref}</b>
-            <span className="font-mono2 font-bold" style={{ color: "var(--accent)" }}>{fmtDur(r.proposal_cycle.total_ms)} request → EL sent</span>
+            <b>Onboarding cycle — {cycle.ref}{cycle.services?.length ? <span className="font-normal" style={{ color: "var(--mut)" }}> · {cycle.services.join(", ")}</span> : null}</b>
+            <span className="font-mono2 font-bold" style={{ color: "var(--accent)" }}>{fmtDur(cycle.total_ms)} request → EL sent</span>
           </div>
           <div className="mt-1.5 flex gap-4 flex-wrap text-xs">
-            {r.proposal_cycle.per_employee.map((e) => (
+            {cycle.per_employee.map((e) => (
               <span key={e.user_id} className="flex items-center gap-1.5">{e.name} <Stars n={e.stars} /></span>
             ))}
           </div>
         </div>
-      )}
+      ))}
       <div>
         <div className="text-[10px] uppercase tracking-wider font-bold mb-1.5" style={{ color: "var(--mut)" }}>Task record — newest first ({r.tasks.length})</div>
         {r.tasks.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No completed duties on record for this client yet.</div>}
