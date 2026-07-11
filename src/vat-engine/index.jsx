@@ -124,7 +124,10 @@ function RequestLog({ f, kind, onResend }) {
 
 export function VatEngineScreen() {
   const en = useVatEnabled();
-  const { me, duties, byId, pushToast, refetchAll } = useData();
+  // NB: byId is NOT in the DataProvider context (it's local to the App component) —
+  // derive it here from `users`, which the context does provide.
+  const { me, users, duties, pushToast, refetchAll } = useData();
+  const byId = (id) => users.find((u) => u.id === id) || { id, name: "—", role: "" };
   const [filing, setFiling] = useState(null);
   const [busy, setBusy] = useState(false);
   if (!en) return null;
