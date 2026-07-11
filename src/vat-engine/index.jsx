@@ -13,6 +13,27 @@ const fmtD = (x) => new Date(x).toLocaleDateString("en-GB", { day: "2-digit", mo
 const fmtDT = (x) => new Date(x).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 const money = (n) => `AED ${Number(n).toLocaleString("en-AE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
+const BUSINESS_CATEGORIES = ["Trading", "Services", "Real estate", "Used goods & vehicles", "Manufacturing",
+  "Logistics & transport", "Education", "Healthcare", "Financial services", "Other"];
+
+const FLAG_QUESTIONS = [
+  { key: "has_zero_rated", short: "Zero-rated", q: "Does the client make zero-rated sales?",
+    what: "Sales charged at 0% — typically exports outside the GCC, international transport. The sale appears on the return but adds no output VAT.",
+    example: "e.g. An Ajman trader shipping goods to a buyer in India charges 0% VAT — the sale still goes on the VAT return." },
+  { key: "has_exempt", short: "Exempt", q: "Does the client make exempt supplies?",
+    what: "Supplies with no VAT and no input-VAT credit — residential rent, bare land, local passenger transport, certain financial services.",
+    example: "e.g. A landlord letting residential flats charges no VAT on that rent — and can't recover the related input VAT." },
+  { key: "margin_scheme", short: "Margin scheme", q: "Does the client trade second-hand goods or used vehicles?",
+    what: "Used-car and second-hand dealers may pay VAT only on their profit margin (sale price minus purchase price), not the full sale value — FTA margin scheme.",
+    example: "e.g. A used car bought for AED 40,000, sold for AED 45,000 → VAT is computed on the AED 5,000 margin." },
+  { key: "rcm_imports", short: "RCM imports", q: "Does the client import goods or services from abroad?",
+    what: "On imports the buyer self-accounts the VAT (reverse charge) — it appears as output VAT and, where recoverable, as input VAT on the same return.",
+    example: "e.g. Software licences bought from a US vendor: the client reports the 5% itself instead of the supplier." },
+  { key: "designated_zone", short: "Designated zone", q: "Does the client operate from a designated zone?",
+    what: "FTA-designated free zones (e.g. JAFZA, KIZAD) have special rules — some goods movements are outside the scope of VAT.",
+    example: "e.g. Goods sold between two designated-zone companies may fall outside the scope of UAE VAT entirely." },
+];
+
 const STAGES = [
   ["ledgers_pending", "1 · Ledger"],
   ["invoices_pending", "2 · Invoices"],
@@ -178,10 +199,124 @@ export function VatEngineScreen() {
   );
 }
 
+/* First-time recognition wizard / profile editor — one question per card, plain language,
+   each with a "What this means" explainer and a concrete UAE example. */
+function ProfileWizard({ clientId, clientName, existing, run, onDone, onCancel }) {
+  const [step, setStep] = useState(0); // 0 = nature; 1..N = flags; N+1 = review
+  const [nature, setNature] = useState(existing?.nature_of_business || "");
+  const [category, setCategory] = useState(existing?.business_category || "");
+  const [fl, setFl] = useState(() => Object.fromEntries(FLAG_QUESTIONS.map((q) => {
+    const e = existing?.flags?.[q.key];
+    return [q.key, { value: e?.value || null, note: e?.note || "" }];
+  })));
+  const [otherNotes, setOtherNotes] = useState(existing?.other_notes || "");
+  const last = FLAG_QUESTIONS.length + 1;
+  const flag = step >= 1 && step <= FLAG_QUESTIONS.length ? FLAG_QUESTIONS[step - 1] : null;
+  const canNext = step === 0 ? !!category : step === last ? true : !!fl[flag.key].value;
+
+  const save = () => run(() => api[existing ? "patch" : "post"](`/vat-engine/clients/${clientId}/profile`, {
+    nature_of_business: nature.trim(),
+    business_category: category,
+    flags: Object.fromEntries(Object.entries(fl).map(([k, v]) => [k, { value: v.value || "no", note: v.note.trim() || null }])),
+    other_notes: otherNotes.trim() || null,
+  })).then(onDone).catch(() => {});
+
+  return (
+    <div className="max-w-2xl mx-auto">
+      <button onClick={onCancel} className="text-xs font-medium mb-3" style={mut}>← Back</button>
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>
+        {existing ? "Edit VAT profile" : "Getting to know"} {clientName}
+      </h1>
+      <p className="text-sm mt-1" style={mut}>
+        {existing ? "Every change is logged on the filing trail." :
+          "First VAT filing for this client — a few quick questions build the VAT profile. It's remembered for every future period and drives the compliance checks. \"Not sure\" is fine; it just gets flagged to confirm with the client."}
+      </p>
+      <div className="mt-3 flex gap-1">
+        {Array.from({ length: last + 1 }, (_, i) => (
+          <div key={i} className="h-1 flex-1 rounded-full" style={{ background: i <= step ? "var(--accent)" : "var(--line)" }} />
+        ))}
+      </div>
+
+      <div className="mt-4 bg-white border rounded-xl p-5" style={line}>
+        {step === 0 && (
+          <>
+            <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>What does the business do?</h3>
+            <label className="block text-xs font-semibold mt-3" style={mut}>Nature of business (free text)</label>
+            <input value={nature} onChange={(e) => setNature(e.target.value)} placeholder='e.g. "Wholesale of electronics; occasional exports to Africa"' className="mt-1 w-full border rounded-md px-3 py-2 text-sm" style={line} />
+            <label className="block text-xs font-semibold mt-3" style={mut}>Category *</label>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {BUSINESS_CATEGORIES.map((c) => (
+                <button key={c} onClick={() => setCategory(c)} className="px-2.5 py-1.5 rounded-full text-xs font-medium border"
+                  style={category === c ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { ...line, ...mut }}>{c}</button>
+              ))}
+            </div>
+          </>
+        )}
+        {flag && (
+          <>
+            <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>{flag.q}</h3>
+            <div className="mt-2 text-xs rounded-lg border p-2.5" style={{ ...line, background: "var(--paper)" }}>
+              <b>What this means:</b> {flag.what}
+              <div className="mt-1" style={mut}>{flag.example}</div>
+            </div>
+            <div className="mt-3 flex gap-2">
+              {[["yes", "Yes"], ["no", "No"], ["not_sure", "Not sure"]].map(([v, l]) => (
+                <button key={v} onClick={() => setFl({ ...fl, [flag.key]: { ...fl[flag.key], value: v } })}
+                  className="px-4 py-2 rounded-lg text-sm font-semibold border"
+                  style={fl[flag.key].value === v
+                    ? { background: v === "not_sure" ? "var(--amber)" : "var(--accent)", color: "#fff", borderColor: "transparent" }
+                    : { ...line, ...mut }}>{l}</button>
+              ))}
+            </div>
+            {fl[flag.key].value === "not_sure" && (
+              <div className="mt-2 text-[11px]" style={{ color: "var(--amber)" }}>Flagged amber on the profile — confirm with the client. Treated as Yes for the compliance warnings.</div>
+            )}
+            <input value={fl[flag.key].note} onChange={(e) => setFl({ ...fl, [flag.key]: { ...fl[flag.key], note: e.target.value } })}
+              placeholder="Optional note — e.g. which products / counterparties" className="mt-2.5 w-full border rounded-md px-2.5 py-1.5 text-xs" style={line} />
+          </>
+        )}
+        {step === last && (
+          <>
+            <h3 className="font-disp font-bold" style={{ color: "var(--ink)" }}>Anything else worth remembering?</h3>
+            <textarea value={otherNotes} onChange={(e) => setOtherNotes(e.target.value)} rows={3} placeholder="Other notes (optional)" className="mt-2 w-full border rounded-md px-2.5 py-1.5 text-xs" style={line} />
+            <div className="mt-3 text-xs font-semibold" style={mut}>Profile summary</div>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              <span className="px-2 py-1 rounded-full text-[11px] font-medium border" style={line}>{category}{nature.trim() ? ` — ${nature.trim()}` : ""}</span>
+              {FLAG_QUESTIONS.map((q) => fl[q.key].value && fl[q.key].value !== "no" && (
+                <span key={q.key} className="px-2 py-1 rounded-full text-[11px] font-bold"
+                  style={fl[q.key].value === "yes" ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
+                  {q.short}{fl[q.key].value === "not_sure" ? " — confirm with client" : ""}
+                </span>
+              ))}
+            </div>
+          </>
+        )}
+        <div className="mt-4 flex justify-between">
+          <button onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0} className="text-xs underline disabled:opacity-30" style={mut}>← previous</button>
+          {step < last
+            ? <Btn disabled={!canNext} onClick={() => setStep(step + 1)}>Next →</Btn>
+            : <Btn onClick={save}>{existing ? "Save changes" : "Save profile & open the period"}</Btn>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function FilingView({ f, me, byId, run, busy, pushToast, back }) {
   const [modal, setModal] = useState(null); // {type, item?}
   const [trailOpen, setTrailOpen] = useState(false);
+  const [editProfile, setEditProfile] = useState(false);
   const iAmStaff = me.id === f.staff_id;
+
+  // first-time recognition: no VAT profile yet → the questionnaire replaces the period view
+  if (f.client_id && (!f.profile || editProfile)) {
+    return (
+      <ProfileWizard clientId={f.client_id} clientName={f.client_name}
+        existing={editProfile ? f.profile : null} run={run}
+        onCancel={editProfile ? () => setEditProfile(false) : back}
+        onDone={() => { setEditProfile(false); run(() => api.get(`/vat-engine/filings/${f.id}`)); }} />
+    );
+  }
   const stageIdx = STAGES.findIndex(([s]) => s === f.status);
   const contactEmail = f.client_contact?.email || "";
   const contactName = f.client_contact?.contactPerson || f.client_contact?.name || "Sir/Madam";
@@ -225,6 +360,27 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
         <span>· staff <b style={{ color: "var(--ink)" }}>{f.staff_name}</b> (holder)</span>
         <span>· duty due <span className="font-mono2">{fmtD(f.duty_next_due)}</span></span>
       </div>
+
+      {/* profile summary bar — the engine's memory, applied to every period */}
+      {f.profile && (
+        <div className="mt-3 flex items-center gap-1.5 flex-wrap text-[11px]">
+          <span className="px-2 py-1 rounded-full border font-medium" style={{ ...line, ...mut }}>
+            🧾 {f.profile.business_category}{f.profile.nature_of_business ? ` — ${f.profile.nature_of_business}` : ""} · profile v{f.profile.version}
+          </span>
+          {FLAG_QUESTIONS.map((q) => {
+            const v = f.profile.flags?.[q.key]?.value;
+            if (!v || v === "no") return null;
+            return (
+              <span key={q.key} className="px-2 py-1 rounded-full font-bold"
+                title={f.profile.flags[q.key]?.note || ""}
+                style={v === "yes" ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
+                {q.short}{v === "not_sure" ? " — confirm with client" : ""}
+              </span>
+            );
+          })}
+          <button onClick={() => setEditProfile(true)} className="underline" style={mut}>Edit profile</button>
+        </div>
+      )}
 
       {/* stage tracker */}
       <div className="mt-4 flex gap-1 flex-wrap">
@@ -341,11 +497,9 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
       {/* stage 4 — computation */}
       {["computation_draft", "awaiting_client_approval", "ready_to_file", "complete"].includes(f.status) && f.computation && (
         <Section title={`Stage 4 · Computation — ${f.computation.period}`}
-                 sub="Auto-drafted from the included ledger rows.">
-          <ComputationTable c={f.computation} />
-          {f.status === "computation_draft" && iAmStaff && (
-            <div className="mt-3"><Btn disabled={busy} onClick={() => run(() => api.post(`/vat-engine/filings/${f.id}/confirm-computation`))}>Confirm computation → send for client approval</Btn></div>
-          )}
+                 sub={`Auto-drafted from the included ledger rows${f.computation.profile_version ? `, profile v${f.computation.profile_version} pre-applied` : ""}.`}>
+          <Vat201 c={f.computation} />
+          <ChecksPanel f={f} run={run} busy={busy} editable={f.status === "computation_draft" && iAmStaff} />
         </Section>
       )}
 
@@ -428,28 +582,100 @@ function InvoiceUpload({ onUpload }) {
   );
 }
 
-function ComputationTable({ c }) {
+function Vat201({ c }) {
+  const zr = c.zero_rated || { sales: 0, rows: 0 };
+  const ex = c.exempt || { sales: 0, rows: 0 };
+  const mg = c.margin || { sales: 0, output_vat: 0, rows: 0 };
+  const rcm = c.rcm || { output_vat: 0, input_vat: 0, rows: 0 };
+  const Row = ({ label, sub, value, extra, strong }) => (
+    <div className="flex gap-4 items-baseline py-1 border-b last:border-0" style={line}>
+      <span className={`flex-1 ${strong ? "font-bold" : ""}`} style={strong ? { color: "var(--ink)" } : undefined}>
+        {label}{sub && <span className="text-[10px] ml-1.5" style={mut}>{sub}</span>}
+      </span>
+      {extra && <span className="font-mono2 text-[11px]" style={mut}>{extra}</span>}
+      <b className={`font-mono2 ${strong ? "text-sm" : ""}`}>{value}</b>
+    </div>
+  );
   return (
-    <div className="text-xs">
-      <div className="grid grid-cols-2 gap-x-6 gap-y-1 max-w-md">
-        <span style={{ color: "var(--mut)" }}>Taxable sales (net)</span><b className="font-mono2 text-right">{money(c.taxable_sales)}</b>
-        <span style={{ color: "var(--mut)" }}>Output VAT</span><b className="font-mono2 text-right">{money(c.output_vat)}</b>
-        <span style={{ color: "var(--mut)" }}>Input VAT (recoverable)</span><b className="font-mono2 text-right">{money(c.input_vat)}</b>
-        <span className="font-bold" style={{ color: "var(--ink)" }}>NET {c.position?.toUpperCase()}</span>
-        <b className="font-mono2 text-right text-sm" style={{ color: c.position === "payable" ? "var(--red)" : "var(--accent)" }}>{money(c.net)}</b>
-      </div>
-      <div className="mt-3 text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Taxable sales per emirate</div>
+    <div className="text-xs max-w-xl">
+      <Row label="Standard-rated sales (5%)" sub={`${Object.values(c.per_emirate || {}).reduce((a, v) => a + v.rows, 0)} inv`} extra={`output VAT ${money(c.output_vat - mg.output_vat - rcm.output_vat)}`} value={money(c.taxable_sales)} />
       {Object.entries(c.per_emirate || {}).map(([em, v]) => (
-        <div key={em} className="flex gap-4 py-0.5 border-b last:border-0 max-w-md" style={{ borderColor: "var(--line)" }}>
-          <span className="flex-1">{em}</span>
+        <div key={em} className="flex gap-4 py-0.5 pl-4 text-[11px]" style={mut}>
+          <span className="flex-1">{em} · {v.rows} inv</span>
+          <span className="font-mono2">VAT {money(v.output_vat)}</span>
           <span className="font-mono2">{money(v.taxable_sales)}</span>
-          <span className="font-mono2" style={{ color: "var(--mut)" }}>VAT {money(v.output_vat)} · {v.rows} inv</span>
         </div>
       ))}
-      <div className="mt-2" style={{ color: "var(--mut)" }}>
+      <Row label="Zero-rated sales (0%)" sub={`${zr.rows} inv — on the return, no output VAT`} value={money(zr.sales)} />
+      <Row label="Exempt supplies" sub={`${ex.rows} inv — outside output VAT, input apportionment applies`} value={money(ex.sales)} />
+      {mg.rows > 0 && <Row label="Margin-scheme sales" sub={`${mg.rows} inv — VAT on margin, not sale price`} extra={`margin VAT ${money(mg.output_vat)}`} value={money(mg.sales)} />}
+      {rcm.rows > 0 && <Row label="RCM imports (self-assessed)" sub={`${rcm.rows} row(s)`} extra={`+${money(rcm.output_vat)} output / +${money(rcm.input_vat)} input`} value="—" />}
+      <div className="mt-2" />
+      <Row label="Output VAT (total)" value={money(c.output_vat)} />
+      <Row label="Input VAT (recoverable)" value={money(c.input_vat)} />
+      <div className="flex gap-4 items-baseline py-1.5">
+        <span className="flex-1 font-bold" style={{ color: "var(--ink)" }}>NET VAT {c.position?.toUpperCase()}</span>
+        <b className="font-mono2 text-base" style={{ color: c.position === "payable" ? "var(--red)" : "var(--accent)" }}>{money(c.net)}</b>
+      </div>
+      <div className="mt-1" style={mut}>
         Basis: {c.counts?.included} ledger rows included ({c.counts?.output_rows} output / {c.counts?.input_rows} input) ·
         {" "}{c.counts?.matched} matches · {c.counts?.excluded} excluded · {c.counts?.out_of_window} out of window.
       </div>
+    </div>
+  );
+}
+
+/* Compliance checks — profile × data. Warnings need an explicit proceed-despite-warning
+   reason; confirmations are mandatory ticks. All logged with name + time server-side. */
+function ChecksPanel({ f, run, busy, editable }) {
+  const checks = f.computation?.checks || [];
+  const warnings = checks.filter((c) => c.kind === "warning");
+  const confs = checks.filter((c) => c.kind === "confirmation");
+  const [ticks, setTicks] = useState({});
+  const [note, setNote] = useState("");
+  const ready = confs.every((c) => ticks[c.id]) && (warnings.length === 0 || note.trim());
+  const confirm = () => run(() => api.post(`/vat-engine/filings/${f.id}/confirm-computation`, {
+    confirmations: confs.filter((c) => ticks[c.id]).map((c) => c.id),
+    warning_note: note.trim(),
+  }));
+
+  return (
+    <div className="mt-4 border-t pt-3" style={line}>
+      {checks.length > 0 && (
+        <>
+          <div className="text-[10px] uppercase tracking-wider font-bold mb-2" style={mut}>Compliance checks — from the client's VAT profile × this period's data</div>
+          <div className="space-y-1.5">
+            {warnings.map((c) => (
+              <div key={c.id} className="rounded-lg border px-3 py-2 text-xs" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A", color: "#6B5A38" }}>
+                <b>⚠️ Warning:</b> {c.text}
+                {c.acknowledged_by_name && <div className="mt-1 text-[10px]">Acknowledged by {c.acknowledged_by_name} · {fmtDT(c.acknowledged_at)}{f.computation.warning_note ? ` — "${f.computation.warning_note}"` : ""}</div>}
+              </div>
+            ))}
+            {confs.map((c) => (
+              <div key={c.id} className="rounded-lg border px-3 py-2 text-xs flex items-start gap-2" style={line}>
+                {editable
+                  ? <input type="checkbox" checked={!!ticks[c.id]} onChange={(e) => setTicks({ ...ticks, [c.id]: e.target.checked })} className="mt-0.5" />
+                  : <span style={{ color: "var(--accent)" }}>✓</span>}
+                <span>
+                  <b>Confirm:</b> {c.text}
+                  {c.ticked_by_name && <span className="block mt-1 text-[10px]" style={mut}>Ticked by {c.ticked_by_name} · {fmtDT(c.ticked_at)}</span>}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      {editable && (
+        <div className="mt-3 flex gap-2 items-center flex-wrap">
+          {warnings.length > 0 && (
+            <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Proceed despite warning — mandatory reason" className="flex-1 min-w-[260px] border rounded-md px-2.5 py-1.5 text-xs" style={line} />
+          )}
+          <Btn disabled={busy || !ready} onClick={confirm}>Confirm computation → send for client approval</Btn>
+          {!ready && <span className="text-[11px]" style={{ color: "var(--amber)" }}>
+            {confs.some((c) => !ticks[c.id]) ? "Tick every mandatory confirmation." : "A proceed-despite-warning reason is required."}
+          </span>}
+        </div>
+      )}
     </div>
   );
 }

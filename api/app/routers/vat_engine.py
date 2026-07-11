@@ -16,9 +16,12 @@ import re
 import uuid
 from datetime import date, datetime, timedelta
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, File as FileParam, Form, HTTPException, UploadFile
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, ForeignKey, Index, Numeric, Text, select, text
+from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Date, ForeignKey, Index, Integer,
+                        Numeric, Text, UniqueConstraint, select, text)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, Session, mapped_column
 from sqlalchemy.types import TIMESTAMP
@@ -43,8 +46,17 @@ EMIRATES = ("Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al K
 VAT_TOLERANCE = 0.01
 
 LEDGER_COLUMNS = ["Invoice No", "Invoice Date", "Party Name", "TRN", "Emirate",
-                  "Net Amount", "VAT Amount", "Type (Output/Input)"]
-REGISTER_COLUMNS = ["Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT Amount", "Notes"]
+                  "Net Amount", "VAT Amount", "Type (Output/Input)", "Supply Category"]
+REGISTER_COLUMNS = ["Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT Amount", "Notes",
+                    "Supply Category"]
+
+SUPPLY_CATEGORIES = {"standard": "Standard (5%)", "zero_rated": "Zero-rated (0%)", "exempt": "Exempt",
+                     "margin": "Margin scheme", "rcm_import": "RCM-Import"}
+
+BUSINESS_CATEGORIES = ("Trading", "Services", "Real estate", "Used goods & vehicles", "Manufacturing",
+                       "Logistics & transport", "Education", "Healthcare", "Financial services", "Other")
+FLAG_KEYS = ("has_zero_rated", "has_exempt", "margin_scheme", "rcm_imports", "designated_zone")
+FLAG_VALUE_LABELS = {"yes": "Yes", "no": "No", "not_sure": "Not sure"}
 
 APPROVAL_BASES = {
     "evidence_upload": "written approval on file (upload)",
@@ -113,6 +125,7 @@ class VatFilingItem(Base):
     net: Mapped[float] = mapped_column(Numeric(14, 2))
     vat: Mapped[float] = mapped_column(Numeric(14, 2))
     type_: Mapped[str | None] = mapped_column("type", Text)  # Output | Input (ledger only)
+    category: Mapped[str] = mapped_column(Text, server_default="standard")  # supply category key
     notes: Mapped[str | None] = mapped_column(Text)
     bucket: Mapped[str | None] = mapped_column(Text)  # matched | ledger_only | invoice_only | out_of_window
     resolution: Mapped[dict | None] = mapped_column(JSONB)  # {action, reason, by, at}
@@ -128,6 +141,27 @@ class VatFilingEvent(Base):
     at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
     by_user: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     text_: Mapped[str] = mapped_column("text", Text)
+
+
+class VatClientProfile(Base):
+    """The engine's memory: one VAT profile per client — nature of business plus the
+    compliance-relevant flags, each with an optional note. Every edit appends to the
+    updated log and bumps the version; filings record which version applied."""
+
+    __tablename__ = "vat_client_profiles"
+    __table_args__ = (UniqueConstraint("tenant_id", "client_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clients.id"))
+    nature_of_business: Mapped[str | None] = mapped_column(Text)
+    business_category: Mapped[str] = mapped_column(Text)
+    flags: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'"))  # {key: {value: yes|no|not_sure, note}}
+    other_notes: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, server_default=text("1"))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    updated: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))  # [{at, by, by_name, changes}]
 
 
 class VatClientRequest(Base):
@@ -162,6 +196,23 @@ class RequestFromClientIn(MailIn):
 
 class ReasonIn(BaseModel):
     reason: str = Field(min_length=1)
+
+
+class FlagIn(BaseModel):
+    value: Literal["yes", "no", "not_sure"]
+    note: str | None = None
+
+
+class ProfileIn(BaseModel):
+    nature_of_business: str = ""
+    business_category: str
+    flags: dict[str, FlagIn] = {}
+    other_notes: str | None = None
+
+
+class ConfirmComputationIn(BaseModel):
+    confirmations: list[str] = []
+    warning_note: str = ""
 
 
 # ---------- helpers ----------
@@ -257,7 +308,8 @@ def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
         out["items"] = [{
             "id": i.id, "source": i.source, "row_no": i.row_no, "invoice_no": i.invoice_no,
             "invoice_date": i.invoice_date, "party": i.party, "trn": i.trn, "emirate": i.emirate,
-            "net": float(i.net), "vat": float(i.vat), "type": i.type_, "notes": i.notes,
+            "net": float(i.net), "vat": float(i.vat), "type": i.type_, "category": i.category,
+            "notes": i.notes,
             "bucket": i.bucket, "resolution": i.resolution, "included": i.included,
         } for i in items]
         events = db.scalars(select(VatFilingEvent).where(VatFilingEvent.filing_id == f.id)
@@ -268,6 +320,7 @@ def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
         out["client_requests"] = [{"id": r.id, "kind": r.kind, "item_id": r.item_id, "to": r.to_email,
                                    "subject": r.subject, "sent_at": r.sent_at, "by": r.by_user} for r in reqs]
         out["unresolved_differences"] = _unresolved_count(items)
+        out["profile"] = _serialize_profile(_get_profile(db, f.tenant_id, f.client_id))
     return out
 
 
@@ -275,6 +328,130 @@ def _unresolved_count(items) -> int:
     return sum(1 for i in items
                if i.bucket in ("ledger_only", "invoice_only")
                and (i.resolution or {}).get("action") not in ("excluded", "resolved"))
+
+
+# ---------- client VAT profile (the engine's memory) ----------
+
+def _get_profile(db: Session, tenant_id, client_id) -> VatClientProfile | None:
+    if client_id is None:
+        return None
+    return db.scalar(select(VatClientProfile).where(VatClientProfile.tenant_id == tenant_id,
+                                                    VatClientProfile.client_id == client_id))
+
+
+def _serialize_profile(p: VatClientProfile | None) -> dict | None:
+    if p is None:
+        return None
+    return {"id": p.id, "client_id": p.client_id, "nature_of_business": p.nature_of_business,
+            "business_category": p.business_category, "flags": p.flags, "other_notes": p.other_notes,
+            "version": p.version, "created_by": p.created_by, "created_at": p.created_at,
+            "updated": p.updated}
+
+
+def _require_profile_editor(db: Session, user: User, client_id):
+    """Admin / Manager / staff assigned a VAT duty for this client."""
+    if user.role in ("Admin", "Manager"):
+        return
+    has_duty = db.scalar(select(Duty.id).where(Duty.tenant_id == user.tenant_id,
+                                               Duty.client_id == client_id,
+                                               Duty.staff_id == user.id, Duty.kind == "vat"))
+    if has_duty is None:
+        raise conflict("Only Admin, Manager, or the assigned VAT staff can edit this client's VAT profile")
+
+
+def _normalize_flags(flags: dict[str, FlagIn]) -> dict:
+    out = {}
+    for k in FLAG_KEYS:
+        f = flags.get(k)
+        out[k] = {"value": f.value, "note": (f.note or "").strip() or None} if f else {"value": "no", "note": None}
+    unknown = set(flags) - set(FLAG_KEYS)
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown profile flag(s): {sorted(unknown)}")
+    return out
+
+
+def _log_to_open_filings(db: Session, user: User, client_id, txt: str):
+    for f in db.scalars(select(VatFiling).where(VatFiling.tenant_id == user.tenant_id,
+                                                VatFiling.client_id == client_id,
+                                                VatFiling.status != "complete")).all():
+        _log(db, f, user.id, txt)
+
+
+@router.get("/clients/{client_id}/profile")
+def get_profile(client_id: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    get_scoped_or_404(db, Client, client_id, user)
+    p = _get_profile(db, user.tenant_id, client_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="No VAT profile recorded for this client yet")
+    return _serialize_profile(p)
+
+
+@router.post("/clients/{client_id}/profile", status_code=201)
+def create_profile(client_id: uuid.UUID, body: ProfileIn, user: User = Depends(current_user),
+                   db: Session = Depends(get_db)):
+    client = get_scoped_or_404(db, Client, client_id, user)
+    _require_profile_editor(db, user, client_id)
+    if _get_profile(db, user.tenant_id, client_id):
+        raise conflict("A VAT profile already exists for this client — edit it instead")
+    if body.business_category not in BUSINESS_CATEGORIES:
+        raise HTTPException(status_code=422, detail=f"business_category must be one of {BUSINESS_CATEGORIES}")
+    p = VatClientProfile(tenant_id=user.tenant_id, client_id=client_id,
+                         nature_of_business=body.nature_of_business.strip() or None,
+                         business_category=body.business_category,
+                         flags=_normalize_flags(body.flags),
+                         other_notes=(body.other_notes or "").strip() or None,
+                         created_by=user.id)
+    db.add(p)
+    db.flush()
+    active = [k for k in FLAG_KEYS if p.flags[k]["value"] in ("yes", "not_sure")]
+    unsure = [k for k in FLAG_KEYS if p.flags[k]["value"] == "not_sure"]
+    _log_to_open_filings(db, user, client_id,
+                         f"VAT client profile v1 recorded by {user.name} for {client.name} "
+                         f"({body.business_category}) — flags: {', '.join(active) or 'none'}"
+                         + (f"; NOT SURE (confirm with client): {', '.join(unsure)}" if unsure else "")
+                         + ". Applied to this filing.")
+    db.commit()
+    return _serialize_profile(p)
+
+
+@router.patch("/clients/{client_id}/profile")
+def update_profile(client_id: uuid.UUID, body: ProfileIn, user: User = Depends(current_user),
+                   db: Session = Depends(get_db)):
+    get_scoped_or_404(db, Client, client_id, user)
+    _require_profile_editor(db, user, client_id)
+    p = _get_profile(db, user.tenant_id, client_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="No VAT profile recorded for this client yet")
+    if body.business_category not in BUSINESS_CATEGORIES:
+        raise HTTPException(status_code=422, detail=f"business_category must be one of {BUSINESS_CATEGORIES}")
+    new_flags = _normalize_flags(body.flags)
+    changes = []
+    if (p.nature_of_business or "") != (body.nature_of_business.strip() or ""):
+        changes.append(f'nature of business "{p.nature_of_business or "—"}" → "{body.nature_of_business.strip() or "—"}"')
+    if p.business_category != body.business_category:
+        changes.append(f"category {p.business_category} → {body.business_category}")
+    for k in FLAG_KEYS:
+        old, new = p.flags.get(k) or {"value": "no", "note": None}, new_flags[k]
+        if old.get("value") != new["value"]:
+            note_txt = f' — note: "{new["note"]}"' if new["note"] else ""
+            changes.append(f"{k} {FLAG_VALUE_LABELS[old.get('value', 'no')]} → {FLAG_VALUE_LABELS[new['value']]}{note_txt}")
+        elif (old.get("note") or None) != new["note"]:
+            changes.append(f'{k} note → "{new["note"] or "—"}"')
+    if (p.other_notes or None) != ((body.other_notes or "").strip() or None):
+        changes.append("other notes updated")
+    if not changes:
+        return _serialize_profile(p)
+    p.nature_of_business = body.nature_of_business.strip() or None
+    p.business_category = body.business_category
+    p.flags = new_flags
+    p.other_notes = (body.other_notes or "").strip() or None
+    p.version = p.version + 1
+    p.updated = [*p.updated, {"at": iso(now()), "by": str(user.id), "by_name": user.name,
+                              "version": p.version, "changes": changes}]
+    _log_to_open_filings(db, user, client_id,
+                         f"Profile updated to v{p.version} by {user.name}: {'; '.join(changes)}")
+    db.commit()
+    return _serialize_profile(p)
 
 
 # ---------- status probe (frontend hides all UI on 404) ----------
@@ -319,18 +496,23 @@ def _template_workbook(columns: list[str], instruction: str, validations: dict[s
 LEDGER_INSTRUCTION = ("VAT Ledger — one row per invoice line. Keep the columns exactly as given "
                       "(the upload is validated against them). Dates as dd/mm/yyyy or Excel dates. "
                       "Type: Output = sales, Input = purchases. One file covers both two-ledger and "
-                      "single-ledger bookkeeping — mark each row's Type.")
+                      "single-ledger bookkeeping — mark each row's Type. "
+                      "Supply Category defaults to Standard (5%) when left blank.")
 REGISTER_INSTRUCTION = ("Invoice Register — one row per issued invoice. Keep the columns exactly as "
-                        "given (the upload is validated against them). Dates as dd/mm/yyyy or Excel dates.")
+                        "given (the upload is validated against them). Dates as dd/mm/yyyy or Excel dates. "
+                        "Supply Category defaults to Standard (5%) when left blank.")
 
 
 def _ledger_template_bytes() -> bytes:
     return _template_workbook(LEDGER_COLUMNS, LEDGER_INSTRUCTION,
-                              {"Type (Output/Input)": ["Output", "Input"], "Emirate": list(EMIRATES)})
+                              {"Type (Output/Input)": ["Output", "Input"], "Emirate": list(EMIRATES),
+                               "Supply Category": list(SUPPLY_CATEGORIES.values())})
 
 
 def _register_template_bytes() -> bytes:
-    return _template_workbook(REGISTER_COLUMNS, REGISTER_INSTRUCTION, {"Emirate": list(EMIRATES)})
+    return _template_workbook(REGISTER_COLUMNS, REGISTER_INSTRUCTION,
+                              {"Emirate": list(EMIRATES),
+                               "Supply Category": list(SUPPLY_CATEGORIES.values())})
 
 
 def _xlsx_response(data: bytes, name: str):
@@ -351,6 +533,21 @@ def register_template(user: User = Depends(current_user)):
 
 
 # ---------- upload parsing (pandas; hard-fail with row-level errors) ----------
+
+def _parse_category(v) -> str | None:
+    """Supply Category cell → category key; blank defaults to standard; unknown → None (row error)."""
+    if v is None or not str(v).strip():
+        return "standard"
+    s = str(v).strip().lower()
+    for key, label in SUPPLY_CATEGORIES.items():
+        if s in (label.lower(), key, key.replace("_", "-"), key.replace("_", " ")):
+            return key
+    for prefix, key in (("standard", "standard"), ("zero", "zero_rated"), ("exempt", "exempt"),
+                        ("margin", "margin"), ("rcm", "rcm_import")):
+        if s.startswith(prefix):
+            return key
+    return None
+
 
 def _norm_invoice_no(v) -> str:
     s = str(v).strip()
@@ -419,11 +616,16 @@ def _parse_upload(data: bytes, columns: list[str], is_ledger: bool) -> list[dict
             if row_type not in ("Output", "Input"):
                 errors.append(f"Row {excel_row}: Type must be Output or Input, got {val('Type (Output/Input)')!r}")
                 continue
+        category = _parse_category(val("Supply Category"))
+        if category is None:
+            errors.append(f"Row {excel_row}: Supply Category {val('Supply Category')!r} must be one of "
+                          f"{', '.join(SUPPLY_CATEGORIES.values())} (blank = Standard)")
+            continue
         rows.append({
             "row_no": excel_row, "invoice_no": str(inv_no).strip(),
             "invoice_no_norm": _norm_invoice_no(inv_no), "invoice_date": inv_date,
             "party": party, "trn": str(val("TRN")).strip() if is_ledger and val("TRN") is not None else None,
-            "emirate": matched_emirate, "net": net, "vat": vat, "type": row_type,
+            "emirate": matched_emirate, "net": net, "vat": vat, "type": row_type, "category": category,
             "notes": str(val("Notes")).strip() if not is_ledger and val("Notes") is not None else None,
         })
     if errors:
@@ -470,6 +672,12 @@ def open_filing(body: OpenIn, user: User = Depends(current_user), db: Session = 
     _log(db, f, user.id, f"VAT filing period opened: {_period_label(f)} (derived from the duty schedule, "
                          f"due {fmt_d(duty.next_due)}). Stage 1 — collect the VAT ledger. "
                          f"Invoices dated before {pps:%d %b %Y} fall out of the filing window (VAT rule).")
+    prof = _get_profile(db, f.tenant_id, f.client_id)
+    if prof:
+        active = [k for k in FLAG_KEYS if prof.flags.get(k, {}).get("value") in ("yes", "not_sure")]
+        _log(db, f, None, f"VAT client profile v{prof.version} auto-applied "
+                          f"({prof.business_category}; flags: {', '.join(active) or 'none'}) — "
+                          f"compliance checks will be pre-applied at the computation.")
     db.commit()
     return serialize(db, f, detail=True)
 
@@ -489,7 +697,8 @@ def _replace_items(db: Session, f: VatFiling, source: str, rows: list[dict]):
                              row_no=r["row_no"], invoice_no=r["invoice_no"],
                              invoice_no_norm=r["invoice_no_norm"], invoice_date=r["invoice_date"],
                              party=r["party"], trn=r["trn"], emirate=r["emirate"],
-                             net=r["net"], vat=r["vat"], type_=r["type"], notes=r["notes"]))
+                             net=r["net"], vat=r["vat"], type_=r["type"], category=r["category"],
+                             notes=r["notes"]))
     db.flush()  # the session doesn't autoflush — reconciliation must see these rows
 
 
@@ -735,6 +944,48 @@ def _included_ledger_rows(db: Session, f: VatFiling) -> list[VatFilingItem]:
     return out
 
 
+def _flag_value(profile: VatClientProfile | None, key: str) -> str | None:
+    if profile is None:
+        return None
+    return (profile.flags.get(key) or {}).get("value", "no")
+
+
+def _compliance_checks(profile: VatClientProfile | None, present: dict) -> list[dict]:
+    """Profile × data rules. 'not_sure' is treated as Yes for warning purposes.
+    kind=warning → needs an explicit proceed-despite-warning note;
+    kind=confirmation → mandatory tick before the computation can be confirmed."""
+    checks = []
+    yes = lambda k: _flag_value(profile, k) in ("yes", "not_sure")  # noqa: E731
+    labels = {"zero_rated": "zero-rated", "exempt": "exempt", "margin": "margin-scheme",
+              "rcm_import": "RCM-import"}
+    if profile is not None:
+        if yes("has_zero_rated") and present["zero_rated"] == 0:
+            checks.append({"id": "zero_rated_expected_missing", "kind": "warning",
+                           "text": "The client profile expects zero-rated sales (exports, international "
+                                   "services…) but this period's ledger has none — confirm with the client "
+                                   "that nothing was missed before filing."})
+        for cat, flag in (("zero_rated", "has_zero_rated"), ("exempt", "has_exempt"),
+                          ("margin", "margin_scheme"), ("rcm_import", "rcm_imports")):
+            if present[cat] > 0 and _flag_value(profile, flag) == "no":
+                checks.append({"id": f"{cat}_unexpected", "kind": "warning",
+                               "text": f"The ledger contains {present[cat]} {labels[cat]} row(s) but the "
+                                       f"client profile says No — update the profile or correct the ledger."})
+        if yes("margin_scheme") and present["margin"] > 0:
+            checks.append({"id": "margin_confirmation", "kind": "confirmation",
+                           "text": f"VAT on the {present['margin']} margin-scheme row(s) is computed on the "
+                                   f"profit margin (sale − purchase), not the full sale value, per FTA "
+                                   f"margin scheme rules."})
+        if yes("rcm_imports"):
+            checks.append({"id": "rcm_confirmation", "kind": "confirmation",
+                           "text": "Reverse-charge on imports is self-assessed and included in both output "
+                                   "VAT and recoverable input VAT as applicable."})
+    if present["exempt"] > 0:
+        checks.append({"id": "exempt_apportionment", "kind": "confirmation",
+                       "text": "Input VAT apportionment has been considered for the exempt supplies in "
+                               "this period."})
+    return checks
+
+
 @router.post("/filings/{fid}/draft-computation")
 def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
     f = _get(db, fid, user)
@@ -748,24 +999,47 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
     rows = _included_ledger_rows(db, f)
     if not rows:
         raise conflict("No includable ledger rows — nothing to compute")
-    output = [r for r in rows if r.type_ == "Output"]
-    input_ = [r for r in rows if r.type_ == "Input"]
-    output_vat = round(sum(float(r.vat) for r in output), 2)
-    input_vat = round(sum(float(r.vat) for r in input_), 2)
+
+    # VAT201-shaped split: RCM rows self-assess both sides; zero-rated/exempt add no output VAT
+    rcm_rows = [r for r in rows if r.category == "rcm_import"]
+    non_rcm = [r for r in rows if r.category != "rcm_import"]
+    output = [r for r in non_rcm if r.type_ == "Output"]
+    input_ = [r for r in non_rcm if r.type_ == "Input"]
+    std = [r for r in output if r.category == "standard"]
+    zero = [r for r in output if r.category == "zero_rated"]
+    exempt = [r for r in output if r.category == "exempt"]
+    margin = [r for r in output if r.category == "margin"]
+
+    ssum = lambda rs, attr: round(sum(float(getattr(r, attr)) for r in rs), 2)  # noqa: E731
+    std_vat, margin_vat = ssum(std, "vat"), ssum(margin, "vat")
+    rcm_vat = ssum(rcm_rows, "vat")
+    output_vat = round(std_vat + margin_vat + rcm_vat, 2)
+    input_vat = round(ssum(input_, "vat") + rcm_vat, 2)
     net = round(output_vat - input_vat, 2)
     per_emirate = {}
-    for r in output:
+    for r in std:
         pe = per_emirate.setdefault(r.emirate, {"taxable_sales": 0.0, "output_vat": 0.0, "rows": 0})
         pe["taxable_sales"] = round(pe["taxable_sales"] + float(r.net), 2)
         pe["output_vat"] = round(pe["output_vat"] + float(r.vat), 2)
         pe["rows"] += 1
+
+    present = {"zero_rated": len(zero), "exempt": len(exempt), "margin": len(margin),
+               "rcm_import": len(rcm_rows)}
+    profile = _get_profile(db, f.tenant_id, f.client_id)
+    checks = _compliance_checks(profile, present)
     excluded = sum(1 for i in items if (i.resolution or {}).get("action") == "excluded")
     f.computation = {
         "period": _period_label(f), "at": iso(now()), "by": str(user.id),
+        "profile_version": profile.version if profile else None,
         "output_vat": output_vat, "input_vat": input_vat, "net": abs(net),
         "position": "payable" if net >= 0 else "refundable",
-        "taxable_sales": round(sum(float(r.net) for r in output), 2),
+        "taxable_sales": ssum(std, "net"),  # standard-rated sales
         "per_emirate": per_emirate,
+        "zero_rated": {"sales": ssum(zero, "net"), "rows": len(zero)},
+        "exempt": {"sales": ssum(exempt, "net"), "rows": len(exempt)},
+        "margin": {"sales": ssum(margin, "net"), "output_vat": margin_vat, "rows": len(margin)},
+        "rcm": {"output_vat": rcm_vat, "input_vat": rcm_vat, "rows": len(rcm_rows)},
+        "checks": checks,
         "counts": {"included": len(rows), "output_rows": len(output), "input_rows": len(input_),
                    "matched": sum(1 for i in items if i.bucket == "matched") // 2,
                    "excluded": excluded,
@@ -773,9 +1047,15 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
         "confirmed": False,
     }
     f.status = "computation_draft"
-    _log(db, f, user.id, f"Computation auto-drafted from {len(rows)} included ledger row(s): "
-                         f"output VAT {output_vat:,.2f} · input VAT {input_vat:,.2f} · "
-                         f"net {abs(net):,.2f} {f.computation['position'].upper()}. Review and confirm.")
+    n_warn = sum(1 for c in checks if c["kind"] == "warning")
+    n_conf = sum(1 for c in checks if c["kind"] == "confirmation")
+    _log(db, f, user.id, f"Computation auto-drafted from {len(rows)} included ledger row(s) "
+                         f"(profile v{profile.version if profile else '—'} applied): "
+                         f"standard {ssum(std, 'net'):,.2f} / zero-rated {ssum(zero, 'net'):,.2f} / "
+                         f"exempt {ssum(exempt, 'net'):,.2f} · output VAT {output_vat:,.2f} · "
+                         f"input VAT {input_vat:,.2f} · net {abs(net):,.2f} "
+                         f"{f.computation['position'].upper()}. Compliance checks: {n_warn} warning(s), "
+                         f"{n_conf} mandatory confirmation(s). Review and confirm.")
     db.commit()
     return serialize(db, f, detail=True)
 
@@ -783,17 +1063,22 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
 def _computation_pdf(f: VatFiling, client_name: str) -> bytes:
     """Minimal clean single-page PDF (no external deps) with the computation."""
     c = f.computation
+    zr, ex, mg, rcm = (c.get("zero_rated") or {}), (c.get("exempt") or {}), (c.get("margin") or {}), (c.get("rcm") or {})
     lines = [
         "VAT Return Computation",
         f"Client: {client_name}",
         f"Period: {c['period']}",
         "",
-        f"Taxable sales (net):        AED {c['taxable_sales']:,.2f}",
-        f"Output VAT:                 AED {c['output_vat']:,.2f}",
+        f"Standard-rated sales (net): AED {c['taxable_sales']:,.2f}",
+        f"Zero-rated sales:           AED {zr.get('sales', 0):,.2f}",
+        f"Exempt supplies:            AED {ex.get('sales', 0):,.2f}",
+        f"Margin-scheme sales:        AED {mg.get('sales', 0):,.2f}  (VAT on margin: {mg.get('output_vat', 0):,.2f})",
+        f"RCM self-assessed:          output {rcm.get('output_vat', 0):,.2f} / input {rcm.get('input_vat', 0):,.2f}",
+        f"Output VAT (total):         AED {c['output_vat']:,.2f}",
         f"Input VAT (recoverable):    AED {c['input_vat']:,.2f}",
         f"NET VAT {c['position'].upper():<12}        AED {c['net']:,.2f}",
         "",
-        "Taxable sales per emirate:",
+        "Standard-rated sales per emirate:",
     ]
     for em, v in c["per_emirate"].items():
         lines.append(f"  {em:<18} AED {v['taxable_sales']:,.2f}  (output VAT {v['output_vat']:,.2f}, "
@@ -834,18 +1119,48 @@ def _computation_pdf(f: VatFiling, client_name: str) -> bytes:
 
 
 @router.post("/filings/{fid}/confirm-computation")
-def confirm_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def confirm_computation(fid: uuid.UUID, body: ConfirmComputationIn | None = None,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
     f = _get(db, fid, user)
     _require_staff_open(f, user)
     _require_status(f, "computation_draft")
+    body = body or ConfirmComputationIn()
+
+    checks = f.computation.get("checks") or []
+    required = [c for c in checks if c["kind"] == "confirmation"]
+    missing = [c for c in required if c["id"] not in body.confirmations]
+    if missing:
+        raise conflict(f"{len(missing)} mandatory confirmation(s) unticked: "
+                       + " · ".join(c["id"] for c in missing))
+    warnings = [c for c in checks if c["kind"] == "warning"]
+    if warnings and not body.warning_note.strip():
+        raise conflict("Compliance warning(s) present — an explicit 'proceed despite warning' reason "
+                       "note is mandatory")
+    stamped = []
+    for c in checks:
+        if c["kind"] == "confirmation":
+            stamped.append({**c, "ticked_by": str(user.id), "ticked_by_name": user.name,
+                            "ticked_at": iso(now())})
+        else:
+            stamped.append({**c, "acknowledged_by": str(user.id), "acknowledged_by_name": user.name,
+                            "acknowledged_at": iso(now())})
+
     client = db.get(Client, f.client_id) if f.client_id else None
     client_name = client.name if client else "Client"
+    f.computation = {**f.computation, "checks": stamped,
+                     "warning_note": body.warning_note.strip() or None}
     pdf = _computation_pdf(f, client_name)
     pname = f"VAT Computation {f.period_start:%b} - {f.period_end:%b %Y}.pdf"
     stored = _store_bytes(db, user, "client", f.client_id or f.id, pname, pdf)
     f.computation = {**f.computation, "confirmed": True, "confirmed_at": iso(now()),
                      "pdf_file_id": str(stored.id), "pdf_name": pname}
     f.status = "awaiting_client_approval"
+    if required:
+        _log(db, f, user.id, f"Compliance confirmations ticked by {user.name}: "
+                             + "; ".join(c["id"] for c in required) + ".")
+    if warnings:
+        _log(db, f, user.id, f'{len(warnings)} compliance warning(s) acknowledged by {user.name} — '
+                             f'proceed-despite-warning reason: "{body.warning_note.strip()}"')
     _log(db, f, user.id, f"Computation reviewed and CONFIRMED by staff. Rendered as {pname} "
                          f"(stored on the client registry). Stage 5 — send to the client for approval.")
     db.commit()
@@ -932,6 +1247,8 @@ def file_at_fta(
         "net VAT (AED)": f"{c['net']:,.2f}",
         "output VAT (AED)": f"{c['output_vat']:,.2f}",
         "input VAT (AED)": f"{c['input_vat']:,.2f}",
+        "zero-rated sales (AED)": f"{(c.get('zero_rated') or {}).get('sales', 0):,.2f}",
+        "exempt sales (AED)": f"{(c.get('exempt') or {}).get('sales', 0):,.2f}",
         "taxable sales per emirate": "; ".join(
             f"{em} {v['taxable_sales']:,.2f}" for em, v in c["per_emirate"].items()),
     }

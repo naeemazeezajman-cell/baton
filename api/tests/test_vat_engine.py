@@ -3,8 +3,12 @@ buckets (tolerance + window rule), the computation gate, computation math, duty
 completion pre-fill, the env flag, and tenancy."""
 
 import io
+import json
 from datetime import date
 
+from sqlalchemy import text as sql
+
+from app.db import engine
 from .conftest import bootstrap_tenant, login_after_reset
 from .test_onboarding import setup_firm
 
@@ -29,14 +33,31 @@ REGISTER_ROWS = [
 ]
 
 
-def make_vat_duty(client, ctx, next_due="2026-08-28T00:00:00Z", cadence="quarterly"):
+def make_vat_duty(client, ctx, next_due="2026-08-28T00:00:00Z", cadence="quarterly", client_id=None):
     r = client.post("/duties", json={
         "staff_id": ctx["staff"]["id"], "client_name": "Gulf Horizon Trading LLC",
+        "client_id": client_id,
         "service": "VAT Filing", "cadence": cadence, "next_due": next_due,
         "contact": {"name": "Mariam", "email": "accounts@gulfhorizon.ae"},
     }, headers=H(ctx, "manager"))
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def make_client(name="Gulf Horizon Trading LLC"):
+    """Direct client row (skips the proposal flow — tests only)."""
+    with engine.begin() as conn:
+        tid = conn.execute(sql("SELECT tenant_id FROM users LIMIT 1")).scalar()
+        cid = conn.execute(sql(
+            "INSERT INTO clients (tenant_id, ref, name, contact) "
+            "VALUES (:t, 'CL-001', :n, cast(:c AS jsonb)) RETURNING id"
+        ), {"t": tid, "n": name,
+            "c": json.dumps({"email": "accounts@gulfhorizon.ae", "contactPerson": "Mariam"})}).scalar()
+    return str(cid)
+
+
+def flags(**kw):
+    return {k: {"value": v} for k, v in kw.items()}
 
 
 def open_filing(client, ctx, duty_id):
@@ -269,6 +290,7 @@ def test_completion_prefills_duty_record_and_rolls_schedule(client):
     assert rec["position"] == "payable"
     assert rec["net VAT (AED)"] == "260.00"
     assert rec["output VAT (AED)"] == "300.00" and rec["input VAT (AED)"] == "40.00"
+    assert rec["zero-rated sales (AED)"] == "0.00" and rec["exempt sales (AED)"] == "0.00"
     assert "Dubai 4,000.00" in rec["taxable sales per emirate"]
     assert "Sharjah 2,000.00" in rec["taxable sales per emirate"]
     assert comp["evidence"][0]["name"] == "FTA-ack.pdf"
@@ -303,6 +325,217 @@ def test_flag_off_404s_everything(client, monkeypatch):
     assert client.post("/vat-engine/filings/open", json={}).status_code == 404
     monkeypatch.delenv("VAT_ENGINE_ENABLED")
     assert client.get("/vat-engine/status").status_code == 401  # back on
+
+
+# ---------- client VAT profile, wizard gate, compliance checks ----------
+
+CAT_LEDGER = [
+    ["S-1", date(2026, 5, 5), "Std Co", "T1", "Dubai", 1000, 50, "Output", "Standard (5%)"],
+    ["S-2", date(2026, 5, 6), "Std Co", "T1", "Sharjah", 2000, 100, "Output", ""],  # blank → Standard
+    ["Z-1", date(2026, 5, 7), "Exporter", "T2", "Dubai", 5000, 0, "Output", "Zero-rated (0%)"],
+    ["E-1", date(2026, 5, 8), "Landlord", "T3", "Dubai", 3000, 0, "Output", "Exempt"],
+    ["M-1", date(2026, 5, 9), "Car Dealer", "T4", "Dubai", 45000, 250, "Output", "Margin scheme"],
+    ["R-1", date(2026, 5, 10), "US Vendor", "T5", "Dubai", 2000, 100, "Input", "RCM-Import"],
+    ["P-1", date(2026, 5, 11), "Supplier", "T6", "Dubai", 800, 40, "Input", "Standard (5%)"],
+]
+CAT_REGISTER = [
+    ["S-1", date(2026, 5, 5), "Std Co", "Dubai", 1000, 50, "", ""],
+    ["S-2", date(2026, 5, 6), "Std Co", "Sharjah", 2000, 100, "", ""],
+    ["Z-1", date(2026, 5, 7), "Exporter", "Dubai", 5000, 0, "", "Zero-rated (0%)"],
+    ["E-1", date(2026, 5, 8), "Landlord", "Dubai", 3000, 0, "", "Exempt"],
+    ["M-1", date(2026, 5, 9), "Car Dealer", "Dubai", 45000, 250, "", "Margin scheme"],
+]
+
+ALL_YES = flags(has_zero_rated="yes", has_exempt="yes", margin_scheme="yes", rcm_imports="yes")
+
+
+def setup_client_filing(client, ctx, ledger=None, register=None, profile_flags=None):
+    """Client row + linked VAT duty + open filing; optional profile + uploads through recon."""
+    cid = make_client()
+    duty = make_vat_duty(client, ctx, client_id=cid)
+    if profile_flags is not None:
+        r = client.post(f"/vat-engine/clients/{cid}/profile",
+                        json={"nature_of_business": "General trading and used vehicles",
+                              "business_category": "Trading", "flags": profile_flags},
+                        headers=H(ctx, "staff"))
+        assert r.status_code == 201, r.text
+    f = open_filing(client, ctx, duty["id"])
+    if ledger is not None:
+        upload_ledger(client, ctx, f["id"], fill_template(get_template(client, ctx, "ledger"), ledger))
+    if register is not None:
+        f = upload_register(client, ctx, f["id"],
+                            fill_template(get_template(client, ctx, "invoice-register"), register))
+    return cid, duty, client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+
+
+def test_wizard_gate_and_profile_change_events(client):
+    ctx = setup_firm(client)
+    cid = make_client()
+    duty = make_vat_duty(client, ctx, client_id=cid)
+    # no profile yet: 404 on GET, filing detail carries profile: null → frontend shows the wizard
+    assert client.get(f"/vat-engine/clients/{cid}/profile", headers=H(ctx, "staff")).status_code == 404
+    f = open_filing(client, ctx, duty["id"])
+    assert f["profile"] is None
+
+    # staff (assigned VAT duty) creates the profile; the open filing logs it as applied
+    r = client.post(f"/vat-engine/clients/{cid}/profile",
+                    json={"nature_of_business": "Trading in electronics",
+                          "business_category": "Trading",
+                          "flags": flags(has_zero_rated="not_sure")},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 201, r.text
+    assert r.json()["version"] == 1
+    assert r.json()["flags"]["has_zero_rated"]["value"] == "not_sure"
+    f = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+    assert f["profile"]["version"] == 1  # returning visits skip straight to periods
+    assert any("VAT client profile v1 recorded" in e["text"] and "Applied to this filing" in e["text"]
+               for e in f["events"])
+    # accountant may not edit; duplicate create refused
+    assert client.post(f"/vat-engine/clients/{cid}/profile",
+                       json={"business_category": "Trading", "flags": {}},
+                       headers=H(ctx, "accountant")).status_code == 409
+    assert client.post(f"/vat-engine/clients/{cid}/profile",
+                       json={"business_category": "Trading", "flags": {}},
+                       headers=H(ctx, "staff")).status_code == 409
+
+    # edit: has_exempt No → Yes with a note → version bump, updated log, vat event
+    r = client.patch(f"/vat-engine/clients/{cid}/profile",
+                     json={"nature_of_business": "Trading in electronics",
+                           "business_category": "Trading",
+                           "flags": flags(has_zero_rated="not_sure",
+                                          has_exempt="yes") | {"has_exempt": {"value": "yes", "note": "Now leasing residential units"}}},
+                     headers=H(ctx, "manager"))
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["version"] == 2
+    assert any('has_exempt No → Yes — note: "Now leasing residential units"' in c
+               for c in p["updated"][-1]["changes"])
+    f = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+    assert any('Profile updated to v2' in e["text"] and 'has_exempt No → Yes' in e["text"]
+               for e in f["events"])
+
+
+def test_supply_category_parsing(client):
+    ctx = setup_firm(client)
+    _, _, f = setup_client_filing(client, ctx, ledger=CAT_LEDGER)
+    cats = {i["invoice_no"]: i["category"] for i in f["items"] if i["source"] == "ledger"}
+    assert cats == {"S-1": "standard", "S-2": "standard", "Z-1": "zero_rated", "E-1": "exempt",
+                    "M-1": "margin", "R-1": "rcm_import", "P-1": "standard"}
+    # invalid category value → row-level hard fail
+    bad = fill_template(get_template(client, ctx, "ledger"),
+                        [["X-1", date(2026, 5, 5), "P", "T", "Dubai", 100, 5, "Output", "Luxury rate"]])
+    r = client.post(f"/vat-engine/filings/{f['id']}/ledger",
+                    files={"file": ("bad.xlsx", bad, "application/octet-stream")}, headers=H(ctx, "staff"))
+    assert r.status_code == 422
+    assert any("Supply Category 'Luxury rate'" in e for e in r.json()["detail"]["errors"])
+
+
+def test_compliance_rules_fire_both_directions(client):
+    ctx = setup_firm(client)
+    # direction 1: profile expects zero-rated, ledger has none → warning; note required to proceed
+    _, _, f = setup_client_filing(client, ctx, ledger=LEDGER_ROWS[:2] + [LEDGER_ROWS[4]],
+                                  register=REGISTER_ROWS[:2],
+                                  profile_flags=flags(has_zero_rated="yes"))
+    r = client.post(f"/vat-engine/filings/{f['id']}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    checks = r.json()["computation"]["checks"]
+    assert [c["id"] for c in checks] == ["zero_rated_expected_missing"]
+    assert checks[0]["kind"] == "warning"
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation", json={}, headers=H(ctx, "staff"))
+    assert r.status_code == 409 and "warning" in r.json()["detail"]["reason"].lower()
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
+                    json={"warning_note": "Client confirmed no exports this quarter"}, headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    f2 = r.json()
+    assert any('warning(s) acknowledged by Priya Nair' in e["text"]
+               and "no exports this quarter" in e["text"] for e in f2["events"])
+    assert f2["computation"]["checks"][0]["acknowledged_by_name"] == "Priya Nair"
+
+
+def test_compliance_rules_unexpected_rows_and_mandatory_ticks(client):
+    ctx = setup_firm(client)
+    # direction 2: ledger contains exempt + margin rows but the profile says No to both
+    _, _, f = setup_client_filing(client, ctx, ledger=CAT_LEDGER, register=CAT_REGISTER,
+                                  profile_flags=flags(has_zero_rated="yes"))  # exempt/margin/rcm = No
+    r = client.post(f"/vat-engine/filings/{f['id']}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    checks = {c["id"]: c for c in r.json()["computation"]["checks"]}
+    assert checks["exempt_unexpected"]["kind"] == "warning"
+    assert checks["margin_unexpected"]["kind"] == "warning"
+    assert checks["rcm_import_unexpected"]["kind"] == "warning"
+    assert checks["exempt_apportionment"]["kind"] == "confirmation"
+    assert "zero_rated_expected_missing" not in checks  # zero-rated rows ARE present
+
+    # mandatory-tick gate: untucked confirmation blocks even with a warning note
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
+                    json={"warning_note": "Ledger verified with client"}, headers=H(ctx, "staff"))
+    assert r.status_code == 409 and "exempt_apportionment" in r.json()["detail"]["reason"]
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
+                    json={"confirmations": ["exempt_apportionment"],
+                          "warning_note": "Ledger verified with client — profile to be updated"},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    tick = next(c for c in r.json()["computation"]["checks"] if c["id"] == "exempt_apportionment")
+    assert tick["ticked_by_name"] == "Priya Nair" and tick["ticked_at"]
+    assert any("Compliance confirmations ticked by Priya Nair: exempt_apportionment" in e["text"]
+               for e in r.json()["events"])
+
+
+def test_vat201_splits_completion_record_and_stars(client):
+    ctx = setup_firm(client)
+    cid, duty, f = setup_client_filing(client, ctx, ledger=CAT_LEDGER, register=CAT_REGISTER,
+                                       profile_flags=ALL_YES)
+    r = client.post(f"/vat-engine/filings/{f['id']}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    c = r.json()["computation"]
+    # profile-aware computation, VAT201-shaped
+    assert c["profile_version"] == 1
+    assert c["taxable_sales"] == 3000.0  # standard only
+    assert c["per_emirate"] == {"Dubai": {"taxable_sales": 1000.0, "output_vat": 50.0, "rows": 1},
+                                "Sharjah": {"taxable_sales": 2000.0, "output_vat": 100.0, "rows": 1}}
+    assert c["zero_rated"] == {"sales": 5000.0, "rows": 1}
+    assert c["exempt"] == {"sales": 3000.0, "rows": 1}
+    assert c["margin"] == {"sales": 45000.0, "output_vat": 250.0, "rows": 1}
+    assert c["rcm"] == {"output_vat": 100.0, "input_vat": 100.0, "rows": 1}
+    assert c["output_vat"] == 500.0 and c["input_vat"] == 140.0
+    assert c["net"] == 360.0 and c["position"] == "payable"
+    # profile matches the data → confirmations only, no warnings
+    kinds = {x["id"]: x["kind"] for x in c["checks"]}
+    assert kinds == {"margin_confirmation": "confirmation", "rcm_confirmation": "confirmation",
+                     "exempt_apportionment": "confirmation"}
+
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation", json={}, headers=H(ctx, "staff"))
+    assert r.status_code == 409  # mandatory ticks missing
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
+                    json={"confirmations": ["margin_confirmation", "rcm_confirmation",
+                                            "exempt_apportionment"]},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+
+    # unchanged final flow: approval → FTA ack → duty completes → seal → stars
+    r = client.post(f"/vat-engine/filings/{f['id']}/client-approval",
+                    data={"basis": "email_approval", "note": "Approved by Mariam"}, headers=H(ctx, "staff"))
+    assert r.status_code == 200
+    r = client.post(f"/vat-engine/filings/{f['id']}/file-at-fta", data={"note": ""},
+                    files=[("acknowledgement", ("ack.pdf", b"%PDF", "application/pdf"))],
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    duties = client.get("/duties", headers=H(ctx, "staff")).json()
+    d = next(x for x in duties if x["id"] == duty["id"])
+    rec = d["history"][-1]["record"]
+    assert rec["zero-rated sales (AED)"] == "5,000.00"
+    assert rec["exempt sales (AED)"] == "3,000.00"
+    assert rec["net VAT (AED)"] == "360.00"
+    assert d["history"][-1]["method"] == "proof"
+    assert d["next_due"].startswith("2026-11-28")
+    # sealed
+    assert client.post(f"/vat-engine/filings/{f['id']}/draft-computation",
+                       headers=H(ctx, "staff")).status_code == 409
+    # stars flow through the existing performance pipeline
+    emp = client.get("/performance/employees", headers=H(ctx, "admin")).json()["employees"]
+    staff_row = next(e for e in emp if e["user_id"] == ctx["staff"]["id"])
+    assert staff_row["duty_count"] >= 1
+    assert any(ev["source"] == "duty" for ev in staff_row["recent_events"])
 
 
 def test_tenancy_isolation(client):
