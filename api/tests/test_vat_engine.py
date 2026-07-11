@@ -732,6 +732,105 @@ def test_add_to_register_and_add_to_ledger_resolutions(client, monkeypatch):
     assert "INV-900" in sent["body"] and "to be booked in client's records" in sent["body"]
 
 
+def test_working_paper_sheets_and_adjustment_loop(client):
+    from openpyxl import load_workbook
+
+    ctx = setup_firm(client)
+    cid, duty, f = setup_client_filing(client, ctx, ledger=CAT_LEDGER, register=CAT_REGISTER,
+                                       profile_flags=ALL_YES)
+    fid = f["id"]
+    r = client.post(f"/vat-engine/filings/{fid}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+
+    def get_workbook():
+        resp = client.get(f"/vat-engine/filings/{fid}/recon-workbook", headers=H(ctx, "staff"))
+        assert resp.status_code == 200
+        return load_workbook(io.BytesIO(resp.content))
+
+    def rows_of(ws):
+        return [[c.value for c in row] for row in ws.iter_rows()]
+
+    # 1 — all sheets present, computation sheets after the recon sheets
+    wb = get_workbook()
+    assert wb.sheetnames == ["Summary", "Matched", "Differences", "Excluded", "Ledger corrections",
+                             "VAT Computation", "Computation Detail"]
+    comp = wb["VAT Computation"]
+    rows = rows_of(comp)
+    assert rows[1][0] == "This workbook is generated from Baton; corrections are made in Baton."
+    assert "Gulf Horizon Trading LLC" in rows[2][0] and "CL-001" in rows[2][0]
+    assert rows[4][0] == "Client VAT profile applied: v1"
+    labels = [r_[0] for r_ in rows]
+    dubai = rows[labels.index("Standard-rated — Dubai")]
+    assert dubai[1] == 1000.0 and dubai[2] == 50.0 and dubai[3] == 1
+    sub = rows[labels.index("Standard-rated subtotal")]
+    assert str(sub[1]).startswith("=SUM(") and str(sub[2]).startswith("=SUM(")
+    assert "Box 1" in sub[4]
+    zr = rows[labels.index("Zero-rated supplies")]
+    assert zr[1] == 5000.0 and "no output VAT (Art. 45)" in zr[4]
+    out_total = rows[labels.index("Output VAT (total)")]
+    assert str(out_total[2]).startswith("=C")
+    inp = rows[labels.index("Input VAT (recoverable)")]
+    assert inp[2] == 140.0 and "Art. 55" in inp[4]
+    net_row = rows[labels.index("NET VAT PAYABLE")]
+    assert str(net_row[2]).startswith("=C")
+    assert comp.freeze_panes == "A8"
+    # unticked footer — the confirmations are pending
+    assert any(r_[4] and "NOT YET TICKED" in str(r_[4]) for r_ in rows)
+
+    detail = wb["Computation Detail"]
+    drows = rows_of(detail)
+    assert drows[1][:6] == ["Invoice No", "Date", "Party", "Emirate", "Category", "Type"]
+    data = [r_ for r_ in drows[2:] if r_[0] and r_[0] != "TOTAL"]
+    assert len(data) == 7 and all(r_[8] == "Ledger" for r_ in data)
+    total = next(r_ for r_ in drows if r_[0] == "TOTAL")
+    assert str(total[6]).startswith("=SUM(") and str(total[7]).startswith("=SUM(")
+    assert detail.freeze_panes == "A3"
+
+    # 2 — adjustment: edit re-drafts live, resets ticks, logs
+    items = {i["invoice_no"]: i for i in r.json()["items"] if i["source"] == "ledger"}
+    r = client.post(f"/vat-engine/filings/{fid}/items/{items['S-1']['id']}/adjust",
+                    json={"action": "edit", "emirate": "Sharjah",
+                          "reason": "invoice shows place of supply Sharjah"},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    f2 = r.json()
+    c2 = f2["computation"]
+    assert c2["per_emirate"] == {"Sharjah": {"taxable_sales": 3000.0, "output_vat": 150.0, "rows": 2}}
+    assert all(not x.get("ticked_by") for x in c2["checks"])  # confirmations RESET
+    assert any('Computation adjustment by Priya Nair: S-1 emirate Dubai→Sharjah — reason: '
+               '"invoice shows place of supply Sharjah"' in e["text"] for e in f2["events"])
+    # confirm without re-ticking → blocked (numbers changed)
+    r = client.post(f"/vat-engine/filings/{fid}/confirm-computation", json={}, headers=H(ctx, "staff"))
+    assert r.status_code == 409
+
+    # exclude an input row → input VAT drops to the RCM-only 100
+    r = client.post(f"/vat-engine/filings/{fid}/items/{items['P-1']['id']}/adjust",
+                    json={"action": "exclude", "reason": "duplicate of a Q1 booking"},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    assert r.json()["computation"]["input_vat"] == 100.0
+    assert r.json()["computation"]["counts"]["included"] == 6
+
+    # jump back to Stage 3 and re-draft — the exclusion persists
+    r = client.post(f"/vat-engine/filings/{fid}/reopen-reconciliation",
+                    json={"reason": "double-check a difference"}, headers=H(ctx, "staff"))
+    assert r.status_code == 200 and r.json()["status"] == "reconciled" and r.json()["computation"] is None
+    r = client.post(f"/vat-engine/filings/{fid}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200 and r.json()["computation"]["input_vat"] == 100.0
+
+    # 3 — confirm with ticks → the footer names the confirmer; Detail notes the adjustment
+    ticks = [x["id"] for x in r.json()["computation"]["checks"] if x["kind"] == "confirmation"]
+    r = client.post(f"/vat-engine/filings/{fid}/confirm-computation",
+                    json={"confirmations": ticks}, headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    wb = get_workbook()
+    rows = rows_of(wb["VAT Computation"])
+    assert any(r_[4] and "ticked by Priya Nair" in str(r_[4]) for r_ in rows)
+    drows = rows_of(wb["Computation Detail"])
+    s1 = next(r_ for r_ in drows if r_[0] == "S-1")
+    assert "adjusted by Priya Nair: emirate Dubai→Sharjah — invoice shows place of supply Sharjah" in s1[9]
+
+
 # ---------- AI invoice extraction (mandatory human review) ----------
 
 from app.routers import vat_engine  # noqa: E402

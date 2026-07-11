@@ -609,9 +609,23 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
       {/* stage 4 — computation */}
       {["computation_draft", "awaiting_client_approval", "ready_to_file", "complete"].includes(f.status) && f.computation && (
         <Section title={`Stage 4 · Computation — ${f.computation.period}`}
-                 sub={`Auto-drafted from the included ledger rows${f.computation.profile_version ? `, profile v${f.computation.profile_version} pre-applied` : ""}.`}>
+                 sub={`Auto-drafted from the included ledger rows${f.computation.profile_version ? `, profile v${f.computation.profile_version} pre-applied` : ""}. Corrections are made in Baton — edited Excel files are never accepted as input.`}>
+          <div className="mb-3 flex gap-2 items-center flex-wrap">
+            <GhostBtn onClick={() => downloadTemplate(`/vat-engine/filings/${f.id}/recon-workbook`, f.recon?.excel_name || "VAT Working Paper.xlsx")}>
+              ⬇ Download working paper (Excel)
+            </GhostBtn>
+            {f.status === "computation_draft" && iAmStaff && (
+              <button onClick={() => {
+                const reason = window.prompt("Back to Stage 3 — why is the reconciliation being reopened?");
+                if (reason?.trim()) run(() => api.post(`/vat-engine/filings/${f.id}/reopen-reconciliation`, { reason: reason.trim() }));
+              }} className="text-xs underline" style={mut}>← back to reconciliation (Stage 3)</button>
+            )}
+          </div>
           <Vat201 c={f.computation} />
-          <ChecksPanel f={f} run={run} busy={busy} editable={f.status === "computation_draft" && iAmStaff} />
+          {f.status === "computation_draft" && iAmStaff && (
+            <ComputationDetail f={f} run={run} busy={busy} />
+          )}
+          <ChecksPanel key={f.computation.at} f={f} run={run} busy={busy} editable={f.status === "computation_draft" && iAmStaff} />
         </Section>
       )}
 
@@ -929,6 +943,77 @@ function Vat201({ c }) {
         Basis: {c.counts?.included} ledger rows included ({c.counts?.output_rows} output / {c.counts?.input_rows} input) ·
         {" "}{c.counts?.matched} matches · {c.counts?.excluded} excluded · {c.counts?.out_of_window} out of window.
       </div>
+    </div>
+  );
+}
+
+/* The check-and-correct loop: every included ledger row with a per-row Adjust… action.
+   Adjustments re-draft the computation live and RESET the confirmations. */
+function ComputationDetail({ f, run, busy }) {
+  const [open, setOpen] = useState(false);
+  const [adjusting, setAdjusting] = useState(null); // item id
+  const [v, setV] = useState({});
+  const included = (f.items || []).filter((i) =>
+    i.source === "ledger" && i.included && i.bucket !== "out_of_window"
+    && !(i.bucket === "ledger_only" && i.resolution?.action !== "resolved"));
+  const startAdjust = (i) => {
+    setAdjusting(i.id);
+    setV({ category: i.category, emirate: i.emirate, net: i.net, vat: i.vat, type: i.type || "Output", reason: "" });
+  };
+  const submit = (i, action) => run(() => api.post(`/vat-engine/filings/${f.id}/items/${i.id}/adjust`,
+    action === "exclude"
+      ? { action: "exclude", reason: v.reason.trim() }
+      : { action: "edit", category: v.category, emirate: v.emirate, net: Number(v.net),
+          vat: Number(v.vat), type: v.type, reason: v.reason.trim() },
+  )).then(() => setAdjusting(null)).catch(() => {});
+
+  return (
+    <div className="mt-3 border-t pt-2" style={line}>
+      <button onClick={() => setOpen(!open)} className="text-xs underline" style={mut}>
+        Included rows — check & correct ({included.length}) {open ? "▾" : "▸"}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-1">
+          {included.map((i) => (
+            <div key={i.id} className="border rounded-md px-2.5 py-1.5 text-[11px]" style={line}>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-mono2 font-semibold">{i.invoice_no}</span>
+                <span className="flex-1">{i.party} · {i.emirate} · {i.type} · {i.category} · net {money(i.net)} · VAT {money(i.vat)}</span>
+                {(i.resolution?.adjustments || []).length > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}
+                    title={i.resolution.adjustments.map((a) => `${a.changes} — ${a.reason}`).join(" · ")}>
+                    adjusted ×{i.resolution.adjustments.length}
+                  </span>
+                )}
+                <button onClick={() => (adjusting === i.id ? setAdjusting(null) : startAdjust(i))}
+                  className="underline" style={{ color: "var(--accent)" }}>{adjusting === i.id ? "cancel" : "Adjust…"}</button>
+              </div>
+              {adjusting === i.id && (
+                <div className="mt-1.5 flex gap-1.5 flex-wrap items-center">
+                  <select value={v.type} onChange={(e) => setV({ ...v, type: e.target.value })} className="border rounded px-1 py-1" style={line}>
+                    <option>Output</option><option>Input</option>
+                  </select>
+                  <select value={v.category} onChange={(e) => setV({ ...v, category: e.target.value })} className="border rounded px-1 py-1" style={line}>
+                    {SUPPLY_CATEGORY_OPTIONS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                  </select>
+                  <select value={v.emirate} onChange={(e) => setV({ ...v, emirate: e.target.value })} className="border rounded px-1 py-1" style={line}>
+                    {EMIRATES.map((e) => <option key={e}>{e}</option>)}
+                  </select>
+                  <input value={v.net} onChange={(e) => setV({ ...v, net: e.target.value })} placeholder="Net" className="border rounded px-1.5 py-1 w-20" style={line} />
+                  <input value={v.vat} onChange={(e) => setV({ ...v, vat: e.target.value })} placeholder="VAT" className="border rounded px-1.5 py-1 w-20" style={line} />
+                  <input value={v.reason} onChange={(e) => setV({ ...v, reason: e.target.value })}
+                    placeholder="Mandatory reason — why is this row being adjusted?"
+                    className="flex-1 min-w-[220px] border rounded px-2 py-1" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A" }} />
+                  <Btn disabled={busy || !v.reason?.trim()} onClick={() => submit(i, "edit")}>Apply → re-draft</Btn>
+                  <button disabled={busy || !v.reason?.trim()} onClick={() => submit(i, "exclude")}
+                    className="text-[11px] underline disabled:opacity-40" style={mut}>exclude from computation</button>
+                </div>
+              )}
+            </div>
+          ))}
+          <div className="text-[10px]" style={mut}>Any adjustment re-drafts the computation and clears the compliance ticks — re-confirm below.</div>
+        </div>
+      )}
     </div>
   );
 }

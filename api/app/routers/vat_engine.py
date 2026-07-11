@@ -1080,7 +1080,7 @@ def _reconcile(db: Session, f: VatFiling, user: User):
 
     ledger_only = [i for i in ledger if i.bucket == "ledger_only"]
     invoice_only = unused
-    excel = _recon_workbook(f, items)
+    excel = _recon_workbook(f, items, db.get(Client, f.client_id) if f.client_id else None)
     fname = f"VAT Reconciliation {f.period_start:%b} - {f.period_end:%b %Y}.xlsx"
     stored = _store_bytes(db, user, "client", f.client_id or f.id, fname, excel)
     f.recon = {
@@ -1104,9 +1104,13 @@ ORIGIN_LABELS = {"register": "Register", "ai_extracted": "AI-extracted",
                  "added_at_recon": "Added at recon", "ledger_correction": "Ledger correction"}
 
 
-def _recon_workbook(f: VatFiling, items) -> bytes:
-    """Built from the CURRENT items — regenerates on download, reflecting every resolution
-    (excluded / resolved / added rows) with its origin, plus the Ledger corrections sheet."""
+BATON_WORKBOOK_DISCLAIMER = "This workbook is generated from Baton; corrections are made in Baton."
+
+
+def _recon_workbook(f: VatFiling, items, client: Client | None = None) -> bytes:
+    """The full working-paper file, built from the CURRENT items — regenerates on every
+    download. Recon sheets reflect every resolution with its origin; once a computation
+    exists, the VAT Computation + Computation Detail sheets follow the recon sheets."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
 
@@ -1151,6 +1155,8 @@ def _recon_workbook(f: VatFiling, items) -> bytes:
     ws.title = "Summary"
     ws.append(["VAT Reconciliation"])
     ws["A1"].font = Font(bold=True, size=13)
+    ws.append([BATON_WORKBOOK_DISCLAIMER])
+    ws["A2"].font = Font(italic=True, size=9, color="666666")
     ws.append([f"Period: {_period_label(f)}"])
     ws.append([f"Window rule: invoices dated before {f.prev_period_start:%d %b %Y} are excluded (VAT rule)"])
     ws.append([])
@@ -1174,9 +1180,146 @@ def _recon_workbook(f: VatFiling, items) -> bytes:
                    i.invoice_date.strftime("%d/%m/%Y"), i.party, i.emirate, float(i.net),
                    float(i.vat), i.type_ or "", i.bucket or "", res_label(i),
                    (i.resolution or {}).get("correction_note") or i.notes or ""])
+    if f.computation:
+        _computation_sheets(wb, f, items, client)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _adjustment_notes(i: VatFilingItem) -> str:
+    adjs = (i.resolution or {}).get("adjustments") or []
+    parts = [f"adjusted by {a['by_name']}: {a['changes']} — {a['reason']}" for a in adjs]
+    if i.notes:
+        parts.insert(0, i.notes)
+    return " · ".join(parts)
+
+
+def _computation_sheets(wb, f: VatFiling, items, client: Client | None):
+    """'VAT Computation' (VAT201-shaped, plain-language notes, SUM formulas, confirmations
+    footer) + 'Computation Detail' (every included row — the auditor's drill-down)."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    c = f.computation
+    NUM = "#,##0.00"
+    BOLD = Font(bold=True)
+    NOTE_FONT = Font(size=9, color="666666")
+
+    ws = wb.create_sheet("VAT Computation")
+    ws.append(["VAT Return Computation — working paper"])
+    ws["A1"].font = Font(bold=True, size=13)
+    ws.append([BATON_WORKBOOK_DISCLAIMER])
+    ws["A2"].font = Font(italic=True, size=9, color="666666")
+    trn = (client.contact or {}).get("trn") if client and client.contact else None
+    ws.append([f"Client: {client.name if client else '—'}"
+               f"{' (' + client.ref + ')' if client else ''} · TRN: {trn or '—'}"])
+    ws.append([f"Period: {c['period']}"])
+    ws.append([f"Client VAT profile applied: v{c['profile_version']}" if c.get("profile_version")
+               else "Client VAT profile applied: —"])
+    ws.append([])
+    ws.append(["Line", "Net (AED)", "VAT (AED)", "Invoices", "Note"])
+    hdr = ws.max_row
+    for cell in ws[hdr]:
+        cell.font = BOLD
+    ws.freeze_panes = f"A{hdr + 1}"
+
+    first_em = hdr + 1
+    for em, v in (c.get("per_emirate") or {}).items():
+        ws.append([f"Standard-rated — {em}", v["taxable_sales"], v["output_vat"], v["rows"], ""])
+    last_em = ws.max_row
+    if last_em >= first_em:
+        ws.append(["Standard-rated subtotal", f"=SUM(B{first_em}:B{last_em})",
+                   f"=SUM(C{first_em}:C{last_em})", f"=SUM(D{first_em}:D{last_em})",
+                   "Box 1 — standard-rated supplies by emirate"])
+    else:
+        ws.append(["Standard-rated subtotal", 0, 0, 0, "Box 1 — standard-rated supplies by emirate"])
+    std_row = ws.max_row
+    ws.append(["Zero-rated supplies", (c.get("zero_rated") or {}).get("sales", 0), 0,
+               (c.get("zero_rated") or {}).get("rows", 0),
+               "Zero-rated: on the return, no output VAT (Art. 45)"])
+    ws.append(["Exempt supplies", (c.get("exempt") or {}).get("sales", 0), 0,
+               (c.get("exempt") or {}).get("rows", 0),
+               "Exempt: no output VAT, related input not recoverable — apportionment applies (Art. 46)"])
+    oos = c.get("out_of_scope") or {}
+    if oos.get("rows"):
+        ws.append(["Out of scope (designated zone)", oos.get("sales", 0), 0, oos.get("rows", 0),
+                   "Outside the return boxes — listed for completeness"])
+    mg = c.get("margin") or {}
+    margin_row = None
+    if mg.get("rows"):
+        ws.append(["Margin-scheme sales", mg.get("sales", 0), mg.get("output_vat", 0), mg.get("rows", 0),
+                   "VAT computed on the profit margin, not the full sale value (Art. 29 ER)"])
+        margin_row = ws.max_row
+    rcm = c.get("rcm") or {}
+    rcm_row = None
+    if rcm.get("rows"):
+        ws.append(["RCM imports — self-assessed", "", rcm.get("output_vat", 0), rcm.get("rows", 0),
+                   "Reverse charge (Art. 48): output VAT and recoverable input on the same return"])
+        rcm_row = ws.max_row
+    ws.append([])
+    out_formula = f"=C{std_row}" + (f"+C{margin_row}" if margin_row else "") + (f"+C{rcm_row}" if rcm_row else "")
+    ws.append(["Output VAT (total)", "", out_formula, "", "Total VAT charged on supplies"])
+    out_row = ws.max_row
+    ws.append(["Input VAT (recoverable)", "", c["input_vat"], "",
+               "Input recovery per Art. 55 — blocked categories excluded"])
+    in_row = ws.max_row
+    ws.append([f"NET VAT {c['position'].upper()}", "", f"=C{out_row}-C{in_row}", "",
+               "Positive = payable to the FTA; negative = refundable"])
+    for r_ in (std_row, out_row, in_row, ws.max_row):
+        for cell in ws[r_]:
+            cell.font = BOLD
+    for row in ws.iter_rows(min_row=first_em, max_row=ws.max_row, min_col=2, max_col=3):
+        for cell in row:
+            cell.number_format = NUM
+    for row in ws.iter_rows(min_row=first_em, max_row=ws.max_row, min_col=5, max_col=5):
+        row[0].font = NOTE_FONT
+
+    ws.append([])
+    ws.append(["Compliance confirmations & warnings"])
+    ws[f"A{ws.max_row}"].font = BOLD
+    for chk in c.get("checks") or []:
+        if chk["kind"] == "confirmation":
+            who = chk.get("ticked_by_name") or "— NOT YET TICKED —"
+            ws.append([chk["text"], "", "", "", f"ticked by {who} · {chk.get('ticked_at') or '—'}"])
+        else:
+            who = chk.get("acknowledged_by_name") or "— NOT YET ACKNOWLEDGED —"
+            ws.append([chk["text"], "", "", "",
+                       f"WARNING — acknowledged by {who}; reason: {c.get('warning_note') or '—'}"])
+        ws[f"E{ws.max_row}"].font = NOTE_FONT
+    widths = {"A": 46, "B": 14, "C": 14, "D": 10, "E": 64}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    ws.page_setup.fitToWidth = 1
+
+    ws2 = wb.create_sheet("Computation Detail")
+    ws2.append(["Every ledger row included in the computation — " + BATON_WORKBOOK_DISCLAIMER])
+    ws2["A1"].font = Font(italic=True, size=9, color="666666")
+    cols = ["Invoice No", "Date", "Party", "Emirate", "Category", "Type", "Net (AED)", "VAT (AED)",
+            "Origin", "Notes / adjustments"]
+    ws2.append(cols)
+    for cell in ws2[2]:
+        cell.font = BOLD
+    ws2.freeze_panes = "A3"
+    included = _included_from(items)
+    first = ws2.max_row + 1
+    for i in included:
+        origin = "Ledger" if i.origin == "register" else ORIGIN_LABELS.get(i.origin, i.origin)
+        ws2.append([i.invoice_no, i.invoice_date.strftime("%d/%m/%Y"), i.party, i.emirate,
+                    SUPPLY_CATEGORIES.get(i.category, i.category), i.type_ or "", float(i.net),
+                    float(i.vat), origin, _adjustment_notes(i)])
+    last = ws2.max_row
+    if last >= first:
+        ws2.append(["TOTAL", "", "", "", "", "", f"=SUM(G{first}:G{last})", f"=SUM(H{first}:H{last})", "", ""])
+        for cell in ws2[ws2.max_row]:
+            cell.font = BOLD
+    for row in ws2.iter_rows(min_row=first, max_row=ws2.max_row, min_col=7, max_col=8):
+        for cell in row:
+            cell.number_format = NUM
+    for idx, w in enumerate([16, 12, 24, 16, 22, 8, 13, 13, 16, 50], start=1):
+        ws2.column_dimensions[get_column_letter(idx)].width = w
+    ws2.page_setup.orientation = "landscape"
+    ws2.page_setup.fitToWidth = 1
 
 
 def _refresh_recon_counts(db: Session, f: VatFiling):
@@ -1360,7 +1503,8 @@ def recon_workbook(fid: uuid.UUID, user: User = Depends(current_user), db: Sessi
         raise conflict("No reconciliation has run yet")
     items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)
                        .order_by(VatFilingItem.source, VatFilingItem.row_no)).all()
-    return _xlsx_response(_recon_workbook(f, items),
+    client = db.get(Client, f.client_id) if f.client_id else None
+    return _xlsx_response(_recon_workbook(f, items, client),
                           f.recon.get("excel_name") or "VAT Reconciliation.xlsx")
 
 
@@ -1390,19 +1534,24 @@ def request_from_client(fid: uuid.UUID, body: RequestFromClientIn,
 
 # ---------- stage 4: computation ----------
 
-def _included_ledger_rows(db: Session, f: VatFiling) -> list[VatFilingItem]:
+def _included_from(items) -> list[VatFilingItem]:
     """Ledger rows entering the computation: matched Output rows, resolved differences,
-    and Input rows (never register-matched) — excluded and out-of-window rows never."""
-    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id,
-                                                   VatFilingItem.source == "ledger")).all()
+    and Input rows (never register-matched) — excluded and out-of-window rows never.
+    Pure (no db) so the working-paper Detail sheet derives the same set."""
     out = []
     for i in items:
-        if not i.included or i.bucket == "out_of_window":
+        if i.source != "ledger" or not i.included or i.bucket == "out_of_window":
             continue
         if i.bucket == "ledger_only" and (i.resolution or {}).get("action") != "resolved":
             continue
         out.append(i)
     return out
+
+
+def _included_ledger_rows(db: Session, f: VatFiling) -> list[VatFilingItem]:
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id,
+                                                   VatFilingItem.source == "ledger")).all()
+    return _included_from(items)
 
 
 def _flag_value(profile: VatClientProfile | None, key: str) -> str | None:
@@ -1460,17 +1609,12 @@ def _compliance_checks(profile: VatClientProfile | None, present: dict) -> list[
     return checks
 
 
-@router.post("/filings/{fid}/draft-computation")
-def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    f = _get(db, fid, user)
-    _require_staff_open(f, user)
-    _require_status(f, "reconciled")
+def _build_computation(db: Session, f: VatFiling, user: User) -> dict:
+    """(Re)compute the VAT201 splits and compliance checks from the CURRENT items, refresh
+    the registry workbook copy, and store on the filing. Checks come back UNTICKED — any
+    rebuild (draft or adjustment) resets the confirmations because the numbers changed."""
     items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)).all()
-    unresolved = _unresolved_count(items)
-    if unresolved:
-        raise conflict(f"{unresolved} reconciliation difference(s) unresolved — every difference must be "
-                       f"matched, requested→resolved, or excluded with a reason before the computation")
-    rows = _included_ledger_rows(db, f)
+    rows = _included_from(items)
     if not rows:
         raise conflict("No includable ledger rows — nothing to compute")
 
@@ -1503,12 +1647,6 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
                "rcm_import": len(rcm_rows), "out_of_scope": len(oos)}
     profile = _get_profile(db, f.tenant_id, f.client_id)
     checks = _compliance_checks(profile, present)
-    # refresh the registry copy of the workbook — the stored version reflects final resolutions
-    if f.recon:
-        stored_x = _store_bytes(db, user, "client", f.client_id or f.id,
-                                f.recon.get("excel_name") or "VAT Reconciliation.xlsx",
-                                _recon_workbook(f, items))
-        f.recon = {**f.recon, "excel_file_id": str(stored_x.id)}
     excluded = sum(1 for i in items if (i.resolution or {}).get("action") == "excluded")
     f.computation = {
         "period": _period_label(f), "at": iso(now()), "by": str(user.id),
@@ -1529,16 +1667,120 @@ def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Se
                    "out_of_window": sum(1 for i in items if i.bucket == "out_of_window")},
         "confirmed": False,
     }
+    # refresh the registry copy of the working paper — reflects resolutions AND the computation
+    if f.recon:
+        client = db.get(Client, f.client_id) if f.client_id else None
+        stored_x = _store_bytes(db, user, "client", f.client_id or f.id,
+                                f.recon.get("excel_name") or "VAT Reconciliation.xlsx",
+                                _recon_workbook(f, items, client))
+        f.recon = {**f.recon, "excel_file_id": str(stored_x.id)}
+    return f.computation
+
+
+@router.post("/filings/{fid}/draft-computation")
+def draft_computation(fid: uuid.UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "reconciled")
+    items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)).all()
+    unresolved = _unresolved_count(items)
+    if unresolved:
+        raise conflict(f"{unresolved} reconciliation difference(s) unresolved — every difference must be "
+                       f"matched, requested→resolved, or excluded with a reason before the computation")
+    c = _build_computation(db, f, user)
     f.status = "computation_draft"
-    n_warn = sum(1 for c in checks if c["kind"] == "warning")
-    n_conf = sum(1 for c in checks if c["kind"] == "confirmation")
-    _log(db, f, user.id, f"Computation auto-drafted from {len(rows)} included ledger row(s) "
-                         f"(profile v{profile.version if profile else '—'} applied): "
-                         f"standard {ssum(std, 'net'):,.2f} / zero-rated {ssum(zero, 'net'):,.2f} / "
-                         f"exempt {ssum(exempt, 'net'):,.2f} · output VAT {output_vat:,.2f} · "
-                         f"input VAT {input_vat:,.2f} · net {abs(net):,.2f} "
-                         f"{f.computation['position'].upper()}. Compliance checks: {n_warn} warning(s), "
+    checks = c["checks"]
+    n_warn = sum(1 for x in checks if x["kind"] == "warning")
+    n_conf = sum(1 for x in checks if x["kind"] == "confirmation")
+    _log(db, f, user.id, f"Computation auto-drafted from {c['counts']['included']} included ledger row(s) "
+                         f"(profile v{c['profile_version'] or '—'} applied): "
+                         f"standard {c['taxable_sales']:,.2f} / zero-rated {c['zero_rated']['sales']:,.2f} / "
+                         f"exempt {c['exempt']['sales']:,.2f} · output VAT {c['output_vat']:,.2f} · "
+                         f"input VAT {c['input_vat']:,.2f} · net {c['net']:,.2f} "
+                         f"{c['position'].upper()}. Compliance checks: {n_warn} warning(s), "
                          f"{n_conf} mandatory confirmation(s). Review and confirm.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+class AdjustItemIn(BaseModel):
+    action: Literal["edit", "exclude"] = "edit"
+    category: str | None = None
+    emirate: str | None = None
+    net: float | None = None
+    vat: float | None = None
+    type: Literal["Output", "Input"] | None = None
+    reason: str = Field(min_length=1)  # mandatory — every adjustment is on the record
+
+
+@router.post("/filings/{fid}/items/{item_id}/adjust")
+def adjust_item(fid: uuid.UUID, item_id: uuid.UUID, body: AdjustItemIn,
+                user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """The check-and-correct loop at Stage 4: edit an included row's facts (or exclude it)
+    with a mandatory reason. The computation re-drafts live and the confirmations RESET —
+    the numbers changed, so the staff must re-confirm. Excel edits are never accepted as
+    input; corrections happen here."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "computation_draft")
+    it = _item(db, f, item_id)
+    if it.source != "ledger" or not _included_from([it]):
+        raise conflict("Only ledger rows currently included in the computation can be adjusted")
+
+    changes = []
+    if body.action == "exclude":
+        it.included = False
+        changes.append("excluded from the computation")
+    else:
+        if body.category is not None and body.category != it.category:
+            if body.category not in SUPPLY_CATEGORIES:
+                raise HTTPException(status_code=422, detail=f"category must be one of {sorted(SUPPLY_CATEGORIES)}")
+            changes.append(f"category {SUPPLY_CATEGORIES[it.category]}→{SUPPLY_CATEGORIES[body.category]}")
+            it.category = body.category
+        if body.emirate is not None and body.emirate != it.emirate:
+            matched_emirate = next((e for e in EMIRATES if e.lower() == body.emirate.strip().lower()), None)
+            if matched_emirate is None:
+                raise HTTPException(status_code=422, detail=f"emirate must be one of {', '.join(EMIRATES)}")
+            changes.append(f"emirate {it.emirate}→{matched_emirate}")
+            it.emirate = matched_emirate
+        if body.net is not None and round(body.net, 2) != float(it.net):
+            changes.append(f"net {float(it.net):,.2f}→{body.net:,.2f}")
+            it.net = round(body.net, 2)
+        if body.vat is not None and round(body.vat, 2) != float(it.vat):
+            changes.append(f"VAT {float(it.vat):,.2f}→{body.vat:,.2f}")
+            it.vat = round(body.vat, 2)
+        if body.type is not None and body.type != it.type_:
+            changes.append(f"type {it.type_}→{body.type}")
+            it.type_ = body.type
+        if not changes:
+            raise conflict("No change submitted — edit at least one field, or use exclude")
+
+    res = dict(it.resolution or {})
+    res["adjustments"] = [*(res.get("adjustments") or []),
+                          {"by": str(user.id), "by_name": user.name, "at": iso(now()),
+                           "action": body.action, "changes": "; ".join(changes),
+                           "reason": body.reason.strip()}]
+    it.resolution = res
+    db.flush()
+    _build_computation(db, f, user)  # re-drafts live; checks come back unticked
+    _log(db, f, user.id, f"Computation adjustment by {user.name}: {it.invoice_no} "
+                         f"{'; '.join(changes)} — reason: \"{body.reason.strip()}\". "
+                         f"Computation re-drafted; compliance confirmations reset — re-confirm.")
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+@router.post("/filings/{fid}/reopen-reconciliation")
+def reopen_reconciliation(fid: uuid.UUID, body: ReasonIn, user: User = Depends(current_user),
+                          db: Session = Depends(get_db)):
+    """Back to Stage 3 to resolve a difference differently — the draft computation is discarded."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "computation_draft")
+    f.computation = None
+    f.status = "reconciled"
+    _log(db, f, user.id, f'Computation discarded — returned to reconciliation by {user.name}: '
+                         f'"{body.reason.strip()}"')
     db.commit()
     return serialize(db, f, detail=True)
 
