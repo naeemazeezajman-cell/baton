@@ -135,6 +135,7 @@ class VatFilingItem(Base):
     vat: Mapped[float] = mapped_column(Numeric(14, 2))
     type_: Mapped[str | None] = mapped_column("type", Text)  # Output | Input (ledger only)
     category: Mapped[str] = mapped_column(Text, server_default="standard")  # supply category key
+    origin: Mapped[str] = mapped_column(Text, server_default="register")  # register | ai_extracted
     notes: Mapped[str | None] = mapped_column(Text)
     bucket: Mapped[str | None] = mapped_column(Text)  # matched | ledger_only | invoice_only | out_of_window
     resolution: Mapped[dict | None] = mapped_column(JSONB)  # {action, reason, by, at}
@@ -172,6 +173,26 @@ class VatClientProfile(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
     updated: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))  # [{at, by, by_name, changes}]
+
+
+class VatExtractionDraft(Base):
+    """AI-extracted invoice fields awaiting the MANDATORY human review. Only confirmed
+    drafts become register items (origin=ai_extracted); unconfirmed drafts never reconcile."""
+
+    __tablename__ = "vat_extraction_drafts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    filing_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("vat_filings.id"))
+    file_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))  # source document (kept as evidence)
+    file_name: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default="extracted")  # extracted | failed | confirmed
+    fields: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'"))  # {name: {value, confidence}}
+    error: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(TS)
 
 
 class VatClientRequest(Base):
@@ -224,6 +245,22 @@ class ProfileIn(BaseModel):
 class ConfirmComputationIn(BaseModel):
     confirmations: list[str] = []
     warning_note: str = ""
+
+
+class ExtractionRowIn(BaseModel):
+    draft_id: uuid.UUID
+    invoice_no: str = Field(min_length=1)
+    invoice_date: str  # ISO date
+    party: str = Field(min_length=1)
+    emirate: str
+    net: float
+    vat: float
+    currency: str = "AED"
+    conversion_note: str = ""  # mandatory when currency != AED (manual conversion)
+
+
+class ConfirmExtractionsIn(BaseModel):
+    rows: list[ExtractionRowIn] = Field(min_length=1)
 
 
 # ---------- helpers ----------
@@ -328,7 +365,7 @@ def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
             "id": i.id, "source": i.source, "row_no": i.row_no, "invoice_no": i.invoice_no,
             "invoice_date": i.invoice_date, "party": i.party, "trn": i.trn, "emirate": i.emirate,
             "net": float(i.net), "vat": float(i.vat), "type": i.type_, "category": i.category,
-            "notes": i.notes,
+            "origin": i.origin, "notes": i.notes,
             "bucket": i.bucket, "resolution": i.resolution, "included": i.included,
         } for i in items]
         events = db.scalars(select(VatFilingEvent).where(VatFilingEvent.filing_id == f.id)
@@ -340,6 +377,9 @@ def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
                                    "subject": r.subject, "sent_at": r.sent_at, "by": r.by_user} for r in reqs]
         out["unresolved_differences"] = _unresolved_count(items)
         out["profile"] = _serialize_profile(_get_profile(db, f.tenant_id, f.client_id))
+        drafts = db.scalars(select(VatExtractionDraft).where(VatExtractionDraft.filing_id == f.id)
+                            .order_by(VatExtractionDraft.created_at, VatExtractionDraft.id)).all()
+        out["extraction_drafts"] = [_serialize_draft(d) for d in drafts]
     return out
 
 
@@ -765,7 +805,10 @@ def get_filing(fid: uuid.UUID, user: User = Depends(current_user), db: Session =
 
 def _replace_items(db: Session, f: VatFiling, source: str, rows: list[dict]):
     from sqlalchemy import delete
-    db.execute(delete(VatFilingItem).where(VatFilingItem.filing_id == f.id, VatFilingItem.source == source))
+    q = delete(VatFilingItem).where(VatFilingItem.filing_id == f.id, VatFilingItem.source == source)
+    if source == "invoice":  # a register re-upload never wipes confirmed AI-extracted rows
+        q = q.where(VatFilingItem.origin == "register")
+    db.execute(q)
     for r in rows:
         db.add(VatFilingItem(tenant_id=f.tenant_id, filing_id=f.id, source=source,
                              row_no=r["row_no"], invoice_no=r["invoice_no"],
@@ -813,6 +856,172 @@ def upload_invoices(fid: uuid.UUID, file: UploadFile,
                               *[{"file_id": str(p.id), "name": p.name, "size": p.size} for p in pdfs]]
     pdf_txt = f" · {len(pdfs)} invoice PDF(s) stored as evidence" if pdfs else ""
     _log(db, f, user.id, f"Invoice register uploaded: {stored.name} — {len(rows)} row(s) parsed{pdf_txt}.")
+    _reconcile(db, f, user)
+    db.commit()
+    return serialize(db, f, detail=True)
+
+
+# ---------- stage 2 alternative: AI invoice extraction (mandatory human review) ----------
+
+VAT_EXTRACT_MODEL = "claude-sonnet-4-6"
+EXTRACT_MEDIA_TYPES = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+                       ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+EXTRACT_FIELDS = ("invoice_no", "invoice_date", "party", "emirate", "net_amount", "vat_amount", "currency")
+EXTRACT_PROMPT = (
+    "You are extracting fields from a SINGLE UAE tax invoice (the attached document). "
+    "Return ONLY a JSON object — no prose, no markdown fences — with exactly these keys:\n"
+    '{"invoice_no": {"value": string|null, "confidence": "low"|"high"},\n'
+    ' "invoice_date": {"value": "YYYY-MM-DD"|null, "confidence": "low"|"high"},\n'
+    ' "party": {"value": string|null, "confidence": "low"|"high"},\n'
+    ' "emirate": {"value": string|null, "confidence": "low"|"high"},\n'
+    ' "net_amount": {"value": number|null, "confidence": "low"|"high"},\n'
+    ' "vat_amount": {"value": number|null, "confidence": "low"|"high"},\n'
+    ' "currency": {"value": string|null, "confidence": "low"|"high"}}\n'
+    "Rules: if a field is unreadable or absent, return null — NEVER guess. "
+    "party = the counterparty the invoice is issued to (or by, if this is a purchase invoice). "
+    f"emirate only if visible on the document, one of: {', '.join(EMIRATES)} — else null. "
+    "net_amount = amount before VAT; vat_amount = the VAT charged. "
+    "currency = the ISO code shown (AED, USD, …). Mark confidence low when the print is unclear, "
+    "the value is inferred from layout, or multiple candidates exist."
+)
+
+
+def _extract_invoice(data: bytes, media_type: str) -> dict:
+    """One document → extracted field dict. Raises on any failure (caller isolates per file)."""
+    import base64
+    import json as _json
+
+    import anthropic
+
+    key = get_settings().ANTHROPIC_API_KEY
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not configured")
+    block_type = "document" if media_type == "application/pdf" else "image"
+    client = anthropic.Anthropic(api_key=key)
+    msg = client.messages.create(
+        model=VAT_EXTRACT_MODEL, max_tokens=1024, temperature=0,
+        messages=[{"role": "user", "content": [
+            {"type": block_type, "source": {"type": "base64", "media_type": media_type,
+                                            "data": base64.b64encode(data).decode()}},
+            {"type": "text", "text": EXTRACT_PROMPT},
+        ]}],
+    )
+    out = "".join(b.text for b in msg.content if b.type == "text").strip()
+    if out.startswith("```"):
+        out = out.strip("`")
+        out = out[out.find("{"):out.rfind("}") + 1]
+    parsed = _json.loads(out)
+    return {k: (parsed.get(k) if isinstance(parsed.get(k), dict) else {"value": parsed.get(k), "confidence": "low"})
+            for k in EXTRACT_FIELDS}
+
+
+def _serialize_draft(d: VatExtractionDraft) -> dict:
+    return {"id": d.id, "file_id": d.file_id, "file_name": d.file_name, "status": d.status,
+            "fields": d.fields, "error": d.error, "created_at": d.created_at,
+            "reviewed_by": d.reviewed_by, "reviewed_at": d.reviewed_at}
+
+
+@router.post("/filings/{fid}/invoices/extract")
+def extract_invoices(fid: uuid.UUID, files: list[UploadFile] = FileParam(...),
+                     user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """AI extraction — an ALTERNATIVE input path at the invoice stage; mixes freely with
+    the register upload. Multi-page PDFs are assumed to be ONE invoice per file. Every
+    result is a DRAFT until a human reviews and confirms it."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "invoices_pending", "reconciled")
+    max_files = int(os.getenv("VAT_EXTRACT_MAX_FILES", "25"))
+    if len(files) > max_files:
+        raise HTTPException(status_code=422, detail=f"{len(files)} files exceeds the per-batch extraction "
+                            f"limit of {max_files} (VAT_EXTRACT_MAX_FILES) — split the batch to keep API "
+                            f"costs predictable")
+    results = []
+    n_ok = 0
+    for up in files:
+        ext = "." + (up.filename or "").rsplit(".", 1)[-1].lower()
+        data = up.file.read()
+        up.file.seek(0)
+        stored = _store_upload(db, user, "vat_filing", f.id, up)  # source kept as evidence
+        draft = VatExtractionDraft(tenant_id=f.tenant_id, filing_id=f.id, file_id=stored.id,
+                                   file_name=stored.name, created_by=user.id)
+        media_type = EXTRACT_MEDIA_TYPES.get(ext)
+        try:
+            if media_type is None:
+                raise RuntimeError(f"unsupported file type {ext!r} — PDF or image required")
+            draft.fields = _extract_invoice(data, media_type)
+            draft.status = "extracted"
+            n_ok += 1
+        except Exception as exc:
+            draft.status = "failed"
+            draft.error = f"extraction failed — enter manually ({type(exc).__name__})"
+        db.add(draft)
+        db.flush()
+        results.append({"file_name": draft.file_name, "status": draft.status,
+                        "draft_id": str(draft.id), "error": draft.error})
+    _log(db, f, user.id, f"AI invoice extraction batch: {len(files)} file(s) → {n_ok} extracted, "
+                         f"{len(files) - n_ok} failed. Drafts await human review — nothing enters the "
+                         f"reconciliation until reviewed and confirmed.")
+    db.commit()
+    return {"results": results, "filing": serialize(db, f, detail=True)}
+
+
+@router.post("/filings/{fid}/invoices/confirm-extracted")
+def confirm_extractions(fid: uuid.UUID, body: ConfirmExtractionsIn,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """The mandatory review gate: staff-corrected rows become register items with
+    origin=ai_extracted; reconciliation re-runs. Unconfirmed drafts never reconcile."""
+    f = _get(db, fid, user)
+    _require_staff_open(f, user)
+    _require_status(f, "invoices_pending", "reconciled")
+    corrected = 0
+    for row in body.rows:
+        draft = db.scalar(select(VatExtractionDraft).where(VatExtractionDraft.filing_id == f.id,
+                                                           VatExtractionDraft.id == row.draft_id))
+        if draft is None:
+            raise HTTPException(status_code=404, detail=f"extraction draft {row.draft_id} not found")
+        if draft.status == "confirmed":
+            raise conflict(f'"{draft.file_name}" is already confirmed')
+        emirate = next((e for e in EMIRATES if e.lower() == row.emirate.strip().lower()), None)
+        if emirate is None:
+            raise HTTPException(status_code=422, detail=f"{draft.file_name}: emirate must be one of {', '.join(EMIRATES)}")
+        try:
+            inv_date = date.fromisoformat(row.invoice_date)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"{draft.file_name}: invoice_date must be YYYY-MM-DD")
+        currency = row.currency.strip().upper() or "AED"
+        if currency != "AED" and not row.conversion_note.strip():
+            raise conflict(f'"{draft.file_name}" is in {currency} — a manual-conversion note is mandatory '
+                           f"(state the rate/source used to reach the AED amounts)")
+        # count reviewer corrections vs the raw extraction
+        raw = {k: (draft.fields.get(k) or {}).get("value") for k in EXTRACT_FIELDS}
+        submitted = {"invoice_no": row.invoice_no.strip(), "invoice_date": row.invoice_date,
+                     "party": row.party.strip(), "emirate": emirate,
+                     "net_amount": row.net, "vat_amount": row.vat, "currency": currency}
+        for k, v in submitted.items():
+            old = raw.get(k)
+            if k in ("net_amount", "vat_amount"):
+                same = old is not None and abs(float(old) - float(v)) < 0.005
+            else:
+                same = old is not None and str(old).strip().lower() == str(v).strip().lower()
+            if not same:
+                corrected += 1
+        note = f"AI-extracted from {draft.file_name}"
+        if currency != "AED":
+            note += f" · {currency} converted manually — {row.conversion_note.strip()}"
+        db.add(VatFilingItem(tenant_id=f.tenant_id, filing_id=f.id, source="invoice",
+                             origin="ai_extracted", row_no=0,
+                             invoice_no=row.invoice_no.strip(),
+                             invoice_no_norm=_norm_invoice_no(row.invoice_no),
+                             invoice_date=inv_date, party=row.party.strip(), trn=None,
+                             emirate=emirate, net=round(row.net, 2), vat=round(row.vat, 2),
+                             type_=None, category="standard", notes=note))
+        draft.status = "confirmed"
+        draft.reviewed_by = user.id
+        draft.reviewed_at = now()
+    db.flush()
+    _log(db, f, user.id, f"{len(body.rows)} invoice(s) extracted by AI, reviewed and confirmed by "
+                         f"{user.name} — {corrected} field(s) corrected. Confirmed rows join the "
+                         f"reconciliation as register items (origin: AI-extracted).")
     _reconcile(db, f, user)
     db.commit()
     return serialize(db, f, detail=True)
@@ -885,14 +1094,21 @@ def _recon_workbook(f: VatFiling, matched, ledger_only, invoice_only, out_of_win
 
     AMBER = PatternFill("solid", fgColor="FDE9C8")
     HEAD = Font(bold=True)
-    COLS = ["Source", "Row", "Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT", "Type", "Bucket"]
+    COLS = ["Source", "Origin", "Row", "Invoice No", "Invoice Date", "Party", "Emirate", "Net", "VAT",
+            "Type", "Bucket"]
+
+    def origin_label(i):
+        if i.source == "ledger":
+            return "Ledger"
+        return "AI-extracted" if i.origin == "ai_extracted" else "Register"
 
     def put_rows(ws, items, fill=None):
         ws.append(COLS)
         for c in ws[1]:
             c.font = HEAD
         for i in items:
-            ws.append([i.source, i.row_no, i.invoice_no, i.invoice_date.strftime("%d/%m/%Y"), i.party,
+            ws.append([i.source, origin_label(i), i.row_no, i.invoice_no,
+                       i.invoice_date.strftime("%d/%m/%Y"), i.party,
                        i.emirate, float(i.net), float(i.vat), i.type_ or "", i.bucket])
             if fill:
                 for c in ws[ws.max_row]:

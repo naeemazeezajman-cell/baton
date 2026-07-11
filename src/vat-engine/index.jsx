@@ -534,6 +534,14 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
         </Section>
       )}
 
+      {/* stage 2 alternative — AI extraction with mandatory review */}
+      {["invoices_pending", "reconciled"].includes(f.status) && iAmStaff && (
+        <Section title="Upload invoice PDFs/images — Baton reads them (AI)"
+                 sub="An alternative to the register upload — the two can mix. Multi-page PDFs are treated as ONE invoice per file. AI extraction uses the firm's Claude API and is reviewed by you before anything enters the reconciliation.">
+          <AiExtraction f={f} run={run} busy={busy} />
+        </Section>
+      )}
+
       {/* stage 3 — reconciliation */}
       {f.status === "reconciled" && (
         <Section title="Stage 3 · Reconciliation"
@@ -653,6 +661,128 @@ function FilingView({ f, me, byId, run, busy, pushToast, back }) {
             body: `Dear ${contactName},\n\nPlease find attached the VAT return computation for ${f.period_label}: net ${money(f.computation?.net)} ${f.computation?.position}. Kindly review and reply with your approval so we can file at the FTA before the deadline.\n\nBest regards,\n${byId(f.staff_id).name}`,
           }}
           onSend={(mail) => { run(() => api.post(`/vat-engine/filings/${f.id}/send-computation`, mail)).then(() => setModal(null)).catch(() => {}); }} />
+      )}
+    </div>
+  );
+}
+
+const EMIRATES = ["Abu Dhabi", "Dubai", "Sharjah", "Ajman", "Umm Al Quwain", "Ras Al Khaimah", "Fujairah"];
+
+/* AI invoice extraction — upload, per-file status chips, and the MANDATORY review table.
+   Low-confidence / unreadable cells render amber; only reviewed+confirmed rows reconcile. */
+function AiExtraction({ f, run, busy }) {
+  const [files, setFiles] = useState([]);
+  const [rows, setRows] = useState({});
+  const drafts = f.extraction_drafts || [];
+  const pending = drafts.filter((d) => d.status === "extracted");
+  const failed = drafts.filter((d) => d.status === "failed");
+  const confirmedN = drafts.filter((d) => d.status === "confirmed").length;
+
+  useEffect(() => {
+    setRows((prev) => {
+      const next = { ...prev };
+      for (const d of pending) {
+        if (!next[d.id]) {
+          const v = (k) => d.fields?.[k]?.value;
+          next[d.id] = {
+            invoice_no: v("invoice_no") || "", invoice_date: v("invoice_date") || "",
+            party: v("party") || "", emirate: v("emirate") || "",
+            net: v("net_amount") ?? "", vat: v("vat_amount") ?? "",
+            currency: (v("currency") || "AED").toUpperCase(), conversion_note: "", reviewed: false,
+          };
+        }
+      }
+      return next;
+    });
+  }, [f.extraction_drafts]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const amber = (d, k) => {
+    const fld = d.fields?.[k];
+    return !fld || fld.value === null || fld.value === undefined || fld.confidence === "low"
+      ? { background: "var(--amber-soft)", borderColor: "#E4C99A" } : line;
+  };
+  const setRow = (id, patch) => setRows((r) => ({ ...r, [id]: { ...r[id], ...patch } }));
+  const extract = () => {
+    const fd = new FormData();
+    for (const x of files) fd.append("files", x, x.name);
+    run(() => api.postForm(`/vat-engine/filings/${f.id}/invoices/extract`, fd)).then(() => setFiles([])).catch(() => {});
+  };
+  const toConfirm = pending.filter((d) => rows[d.id]?.reviewed);
+  const confirm = () => run(() => api.post(`/vat-engine/filings/${f.id}/invoices/confirm-extracted`, {
+    rows: toConfirm.map((d) => {
+      const r = rows[d.id];
+      return { draft_id: d.id, invoice_no: r.invoice_no, invoice_date: r.invoice_date, party: r.party,
+               emirate: r.emirate, net: Number(r.net), vat: Number(r.vat), currency: r.currency,
+               conversion_note: r.conversion_note };
+    }),
+  }));
+
+  const inp = (d, k, rk, extra = {}) => (
+    <input value={rows[d.id]?.[rk] ?? ""} onChange={(e) => setRow(d.id, { [rk]: e.target.value })}
+      className="border rounded px-1.5 py-1 text-[11px] w-full" style={amber(d, k)} {...extra} />
+  );
+
+  return (
+    <div>
+      <div className="flex gap-2 items-center flex-wrap">
+        <label className="px-2.5 py-1.5 rounded-md border text-xs cursor-pointer" style={line}>
+          {files.length ? `${files.length} file(s) picked` : "Pick invoice PDFs / images"}
+          <input type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple className="hidden"
+            onChange={(e) => setFiles([...files, ...e.target.files])} />
+        </label>
+        <Btn disabled={busy || files.length === 0} onClick={extract}>Extract with AI →</Btn>
+        {confirmedN > 0 && <span className="text-[11px]" style={{ color: "var(--accent)" }}>✓ {confirmedN} confirmed into the reconciliation</span>}
+      </div>
+      {failed.length > 0 && (
+        <div className="mt-2 flex gap-1.5 flex-wrap">
+          {failed.map((d) => (
+            <span key={d.id} className="text-[10px] px-2 py-1 rounded-full font-bold" title={d.error}
+              style={{ background: "var(--red-soft, #F7E4E2)", color: "var(--red)" }}>✗ {d.file_name} — {d.error}</span>
+          ))}
+        </div>
+      )}
+      {pending.length > 0 && (
+        <div className="mt-3 space-y-2">
+          <div className="text-[10px] uppercase tracking-wider font-bold" style={mut}>
+            Review before anything reconciles — amber cells were unreadable or low-confidence; open the source alongside
+          </div>
+          {pending.map((d) => {
+            const r = rows[d.id] || {};
+            return (
+              <div key={d.id} className="border rounded-lg p-2.5" style={line}>
+                <div className="flex items-center gap-2 text-[11px] mb-1.5">
+                  <button onClick={() => openFileLink(d.file_id)} className="underline font-mono2" style={{ color: "var(--accent)" }}>📄 {d.file_name}</button>
+                  <span className="flex-1" />
+                  <label className="flex items-center gap-1.5 font-semibold cursor-pointer" style={{ color: r.reviewed ? "var(--accent)" : "var(--mut)" }}>
+                    <input type="checkbox" checked={!!r.reviewed} onChange={(e) => setRow(d.id, { reviewed: e.target.checked })} /> reviewed
+                  </label>
+                </div>
+                <div className="grid grid-cols-[110px_115px_1fr_130px_80px_80px_60px] gap-1.5 text-[10px]" style={mut}>
+                  <span>Invoice No</span><span>Date</span><span>Party</span><span>Emirate</span><span>Net</span><span>VAT</span><span>Curr.</span>
+                  {inp(d, "invoice_no", "invoice_no")}
+                  {inp(d, "invoice_date", "invoice_date", { type: "date" })}
+                  {inp(d, "party", "party")}
+                  <select value={r.emirate || ""} onChange={(e) => setRow(d.id, { emirate: e.target.value })}
+                    className="border rounded px-1 py-1 text-[11px]" style={amber(d, "emirate")}>
+                    <option value="">—</option>
+                    {EMIRATES.map((e) => <option key={e}>{e}</option>)}
+                  </select>
+                  {inp(d, "net_amount", "net")}
+                  {inp(d, "vat_amount", "vat")}
+                  {inp(d, "currency", "currency")}
+                </div>
+                {(r.currency || "AED") !== "AED" && (
+                  <input value={r.conversion_note || ""} onChange={(e) => setRow(d.id, { conversion_note: e.target.value })}
+                    placeholder={`${r.currency} invoice — mandatory note: rate/source used for the AED amounts above`}
+                    className="mt-1.5 w-full border rounded px-2 py-1 text-[11px]" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A" }} />
+                )}
+              </div>
+            );
+          })}
+          <Btn disabled={busy || toConfirm.length === 0} onClick={confirm}>
+            Confirm {toConfirm.length || ""} reviewed invoice{toConfirm.length !== 1 ? "s" : ""} → reconcile
+          </Btn>
+        </div>
       )}
     </div>
   );

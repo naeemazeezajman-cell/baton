@@ -323,6 +323,8 @@ def test_flag_off_404s_everything(client, monkeypatch):
     assert client.get("/vat-engine/templates/ledger").status_code == 404
     assert client.get("/vat-engine/filings").status_code == 404
     assert client.post("/vat-engine/filings/open", json={}).status_code == 404
+    assert client.post("/vat-engine/filings/00000000-0000-0000-0000-000000000000/invoices/extract",
+                       files=[("files", ("x.pdf", b"%PDF", "application/pdf"))]).status_code == 404
     monkeypatch.delenv("VAT_ENGINE_ENABLED")
     assert client.get("/vat-engine/status").status_code == 401  # back on
 
@@ -629,6 +631,153 @@ def test_out_of_scope_category_flow(client):
     assert r.status_code == 200, r.text
     ids = [x["id"] for x in r.json()["computation"]["checks"]]
     assert "out_of_scope_unexpected" not in ids  # not_sure treated as Yes
+
+
+# ---------- AI invoice extraction (mandatory human review) ----------
+
+from app.routers import vat_engine  # noqa: E402
+
+
+def fake_fields(no="AI-100", date_="2026-05-12", party="Acme LLC", emirate="Dubai",
+                net=1000, vat=50, curr="AED", conf="high"):
+    mk = lambda v: {"value": v, "confidence": conf}  # noqa: E731
+    return {"invoice_no": mk(no), "invoice_date": mk(date_), "party": mk(party),
+            "emirate": mk(emirate), "net_amount": mk(net), "vat_amount": mk(vat),
+            "currency": mk(curr)}
+
+
+def post_extract(client, ctx, fid, files, expect=200):
+    r = client.post(f"/vat-engine/filings/{fid}/invoices/extract",
+                    files=[("files", (n, data, "application/pdf")) for n, data in files],
+                    headers=H(ctx, "staff"))
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def extraction_filing(client, ctx, ledger_rows):
+    cid = make_client()
+    duty = make_vat_duty(client, ctx, client_id=cid)
+    client.post(f"/vat-engine/clients/{cid}/profile",
+                json={"business_category": "Trading", "flags": {}}, headers=H(ctx, "staff"))
+    f = open_filing(client, ctx, duty["id"])
+    upload_ledger(client, ctx, f["id"], fill_template(get_template(client, ctx, "ledger"), ledger_rows))
+    return client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+
+
+def test_ai_extraction_review_gate_and_mixed_recon(client, monkeypatch):
+    ctx = setup_firm(client)
+    ledger = [
+        ["AI-100", date(2026, 5, 12), "Acme LLC", "T1", "Dubai", 1000, 50, "Output", ""],
+        ["REG-1", date(2026, 5, 15), "Reg Co", "T2", "Dubai", 500, 25, "Output", ""],
+    ]
+    f = extraction_filing(client, ctx, ledger)
+
+    def fake(data, media_type):
+        if b"nullish" in data:
+            out = fake_fields(no=None, net=None, conf="low")
+            return out
+        return fake_fields()
+    monkeypatch.setattr(vat_engine, "_extract_invoice", fake)
+
+    out = post_extract(client, ctx, f["id"], [("inv-ai-100.pdf", b"%PDF good"),
+                                              ("blurry.pdf", b"%PDF nullish")])
+    assert [x["status"] for x in out["results"]] == ["extracted", "extracted"]
+    drafts = out["filing"]["extraction_drafts"]
+    assert len(drafts) == 2
+    nullish = next(d for d in drafts if d["file_name"] == "blurry.pdf")
+    assert nullish["fields"]["invoice_no"]["value"] is None
+    assert nullish["fields"]["net_amount"]["confidence"] == "low"
+    # the source documents are kept as evidence files
+    assert all(d["file_id"] for d in drafts)
+
+    # REVIEW GATE: drafts are not items — the register upload reconciles without them
+    register = [["REG-1", date(2026, 5, 15), "Reg Co", "Dubai", 500, 25, "", ""]]
+    f2 = upload_register(client, ctx, f["id"],
+                         fill_template(get_template(client, ctx, "invoice-register"), register))
+    assert {i["invoice_no"] for i in f2["items"] if i["source"] == "invoice"} == {"REG-1"}
+    by = {(i["source"], i["invoice_no"]): i for i in f2["items"]}
+    assert by[("ledger", "AI-100")]["bucket"] == "ledger_only"  # AI draft not reconciled yet
+
+    # confirm the good draft with one correction (party) → joins recon as origin=ai_extracted
+    good = next(d for d in drafts if d["file_name"] == "inv-ai-100.pdf")
+    r = client.post(f"/vat-engine/filings/{f['id']}/invoices/confirm-extracted",
+                    json={"rows": [{"draft_id": good["id"], "invoice_no": "AI-100",
+                                    "invoice_date": "2026-05-12", "party": "Acme LLC (Dubai branch)",
+                                    "emirate": "Dubai", "net": 1000, "vat": 50, "currency": "AED"}]},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    f3 = r.json()
+    item = next(i for i in f3["items"] if i["invoice_no"] == "AI-100" and i["source"] == "invoice")
+    assert item["origin"] == "ai_extracted" and item["bucket"] == "matched"
+    assert "AI-extracted from inv-ai-100.pdf" in item["notes"]
+    # mixed recon: register + AI-extracted both matched
+    by2 = {(i["source"], i["invoice_no"]): i["bucket"] for i in f3["items"]}
+    assert by2[("invoice", "REG-1")] == "matched" and by2[("ledger", "AI-100")] == "matched"
+    assert any("1 invoice(s) extracted by AI, reviewed and confirmed by Priya Nair — 1 field(s) corrected"
+               in e["text"] for e in f3["events"])
+    # the unconfirmed draft stays a draft — never reconciles
+    assert next(d for d in f3["extraction_drafts"] if d["file_name"] == "blurry.pdf")["status"] == "extracted"
+    # the recon workbook rows carry the origin
+    from openpyxl import load_workbook
+    from app import blobs
+    with engine.begin() as conn:
+        blob_path = conn.execute(sql("SELECT blob_path FROM files WHERE id = :i"),
+                                 {"i": f3["recon"]["excel_file_id"]}).scalar()
+    wb = load_workbook(io.BytesIO(blobs.read_blob(blob_path)))
+    ws = wb["Matched"]
+    assert ws.cell(row=1, column=2).value == "Origin"
+    origins = {ws.cell(row=r_, column=2).value for r_ in range(2, ws.max_row + 1)}
+    assert {"Ledger", "AI-extracted", "Register"} <= origins
+
+
+def test_ai_extraction_batch_failure_isolation(client, monkeypatch):
+    ctx = setup_firm(client)
+    f = extraction_filing(client, ctx, [["X-1", date(2026, 5, 5), "P", "T", "Dubai", 100, 5, "Output", ""]])
+
+    def fake(data, media_type):
+        if b"corrupt" in data:
+            raise RuntimeError("model choked")
+        return fake_fields()
+    monkeypatch.setattr(vat_engine, "_extract_invoice", fake)
+    out = post_extract(client, ctx, f["id"], [("ok.pdf", b"%PDF fine"), ("bad.pdf", b"%PDF corrupt")])
+    statuses = {x["file_name"]: x for x in out["results"]}
+    assert statuses["ok.pdf"]["status"] == "extracted"
+    assert statuses["bad.pdf"]["status"] == "failed"
+    assert "extraction failed — enter manually" in statuses["bad.pdf"]["error"]
+    # unsupported type fails without touching the API
+    out = post_extract(client, ctx, f["id"], [("notes.txt", b"hello")])
+    assert out["results"][0]["status"] == "failed"
+
+
+def test_ai_extraction_max_files_guard(client, monkeypatch):
+    ctx = setup_firm(client)
+    f = extraction_filing(client, ctx, [["X-1", date(2026, 5, 5), "P", "T", "Dubai", 100, 5, "Output", ""]])
+    monkeypatch.setenv("VAT_EXTRACT_MAX_FILES", "2")
+    r = client.post(f"/vat-engine/filings/{f['id']}/invoices/extract",
+                    files=[("files", (f"i{i}.pdf", b"%PDF", "application/pdf")) for i in range(3)],
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 422
+    assert "limit of 2" in r.json()["detail"]
+
+
+def test_ai_extraction_non_aed_requires_conversion_note(client, monkeypatch):
+    ctx = setup_firm(client)
+    f = extraction_filing(client, ctx, [["USD-1", date(2026, 5, 5), "P", "T", "Dubai", 3673, 183.65, "Output", ""]])
+    monkeypatch.setattr(vat_engine, "_extract_invoice",
+                        lambda data, mt: fake_fields(no="USD-1", net=1000, vat=50, curr="USD"))
+    out = post_extract(client, ctx, f["id"], [("usd.pdf", b"%PDF")])
+    draft_id = out["results"][0]["draft_id"]
+    row = {"draft_id": draft_id, "invoice_no": "USD-1", "invoice_date": "2026-05-05",
+           "party": "P", "emirate": "Dubai", "net": 3673.0, "vat": 183.65, "currency": "USD"}
+    r = client.post(f"/vat-engine/filings/{f['id']}/invoices/confirm-extracted",
+                    json={"rows": [row]}, headers=H(ctx, "staff"))
+    assert r.status_code == 409 and "manual-conversion note is mandatory" in r.json()["detail"]["reason"]
+    r = client.post(f"/vat-engine/filings/{f['id']}/invoices/confirm-extracted",
+                    json={"rows": [{**row, "conversion_note": "CB rate 3.6730 on invoice date"}]},
+                    headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    item = next(i for i in r.json()["items"] if i["invoice_no"] == "USD-1" and i["source"] == "invoice")
+    assert "USD converted manually — CB rate 3.6730" in item["notes"]
 
 
 def test_tenancy_isolation(client):
