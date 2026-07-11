@@ -89,15 +89,27 @@ def _pass_baton(db: Session, ob: Onboarding, to_user_id, by: User, note_user_id=
 
 
 def serialize_item(i: OnboardingItem, reveal: bool = False) -> dict:
-    masked = i.kind == "credential" and i.answer_text and not reveal
-    return {
+    legacy = i.kind == "credential" and i.answer_text and not i.credential
+    masked = bool(legacy and not reveal)
+    out = {
         "id": i.id, "label": i.label, "kind": i.kind, "status": i.status,
         "requested_by": i.requested_by, "note": i.note,
         "answer_text": MASK if masked else i.answer_text,
         "credential_masked": bool(masked),
+        "credential_legacy": bool(legacy),
         "qualifier": i.qualifier, "files": i.files, "reason": i.reason,
         "requested_at": i.requested_at, "resolved_at": i.resolved_at, "accepted_at": i.accepted_at,
     }
+    if i.credential:
+        c = i.credential
+        out["credential"] = {
+            "portal_label": c.get("portal_label"),
+            "username": c.get("username"),
+            "password": c.get("password") if reveal else MASK,
+            "extra_note": c.get("extra_note"),
+        }
+        out["credential_masked"] = not reveal
+    return out
 
 
 def serialize(db: Session, ob: Onboarding, detail: bool = False) -> dict:
@@ -230,6 +242,10 @@ def provide_item(
     oid: uuid.UUID, item_id: uuid.UUID,
     answer_text: str = Form(""),
     qualifier: str = Form(""),
+    portal_label: str = Form(""),
+    username: str = Form(""),
+    password: str = Form(""),
+    extra_note: str = Form(""),
     evidence: list[UploadFile] = FileParam(default=[]),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
@@ -252,16 +268,26 @@ def provide_item(
         q_txt = f" (qualifier: {qualifier})" if qualifier else ""
         _log(db, ob, user.id, f'Document provided for "{it.label}": '
                               f"{', '.join(f.name for f in stored)}{q_txt}")
+    elif it.kind == "credential":
+        if not username.strip() or not password.strip():
+            raise HTTPException(status_code=422,
+                                detail="Username and password are both required for a credential item")
+        it.credential = {
+            "portal_label": portal_label.strip() or None,
+            "username": username.strip(),
+            "password": password,
+            "extra_note": extra_note.strip() or None,
+        }
+        it.status = "answered"
+        portal_txt = f" ({portal_label.strip()})" if portal_label.strip() else ""
+        _log(db, ob, user.id, f'Credential provided for "{it.label}"{portal_txt} — stored server-side, '
+                              f"password returned masked; every reveal is logged")
     else:
         if not answer_text.strip():
             raise HTTPException(status_code=422, detail="An answer is required for this item")
         it.answer_text = answer_text.strip()
         it.status = "answered"
-        if it.kind == "credential":
-            _log(db, ob, user.id, f'Credential provided for "{it.label}" — stored server-side, '
-                                  f"returned masked; every reveal is logged")
-        else:
-            _log(db, ob, user.id, f'Information provided for "{it.label}"')
+        _log(db, ob, user.id, f'Information provided for "{it.label}"')
     it.reason = None
     it.resolved_at = now()
     _maybe_autoreturn(db, ob, user)
@@ -356,13 +382,14 @@ def reveal_credential(oid: uuid.UUID, item_id: uuid.UUID, user: User = Depends(c
     if user.id not in (ob.staff_id, manager_id) and user.role != "Admin":
         raise conflict("Only the assigned staff, the engagement manager, or an Admin can reveal credentials")
     it = _item(db, ob, item_id)
-    if it.kind != "credential" or not it.answer_text:
+    if it.kind != "credential" or not (it.credential or it.answer_text):
         raise conflict("This item is not a stored credential")
     _log(db, ob, user.id, f'Credential "{it.label}" viewed by {user.name}')
     if manager_id and manager_id != user.id:
         _notify(db, ob, manager_id, f'Onboarding · {ob.service}: credential "{it.label}" was viewed by {user.name}')
     db.commit()
-    return {"id": it.id, "label": it.label, "value": it.answer_text}
+    # value carries the legacy single-blob form; credential the structured payload
+    return {"id": it.id, "label": it.label, "value": it.answer_text, "credential": it.credential}
 
 
 # ---------- completion → duty creation (the bridge) ----------

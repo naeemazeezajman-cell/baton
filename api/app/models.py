@@ -181,7 +181,8 @@ class OnboardingItem(Base):
     status: Mapped[str] = mapped_column(Text, server_default="requested")
     requested_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     note: Mapped[str | None] = mapped_column(Text)
-    answer_text: Mapped[str | None] = mapped_column(Text)  # credentials returned masked by default
+    answer_text: Mapped[str | None] = mapped_column(Text)  # information answers; legacy single-blob credentials
+    credential: Mapped[dict | None] = mapped_column(JSONB)  # {portal_label, username, password, extra_note} — password masked by default
     qualifier: Mapped[str | None] = mapped_column(Text)  # null | audited | unaudited | draft | copy
     files: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
     reason: Mapped[str | None] = mapped_column(Text)

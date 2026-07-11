@@ -80,7 +80,8 @@ def test_full_relay_round_trip(client):
     assert r.status_code == 200
     # answer the credential — resolves the last open item → baton auto-returns
     r = client.post(f"/onboardings/{oid}/items/{items['FTA portal login']['id']}/provide",
-                    data={"answer_text": "user: gulfhorizon / pass: Fta!2026"}, headers=ctx["manager"]["headers"])
+                    data={"portal_label": "EmaraTax — FTA portal", "username": "gulfhorizon",
+                          "password": "Fta!2026"}, headers=ctx["manager"]["headers"])
     o = r.json()
     assert o["open_items"] == 0
     assert o["holder"] == ctx["staff"]["id"]  # auto-returned
@@ -133,17 +134,34 @@ def test_credential_masked_and_reveal_logged(client):
                {"items": [{"label": "FTA login", "kind": "credential"}]})
     item_id = o["items"][0]["id"]
     ob_act(client, ctx, "staff", oid, "send-requests")
-    client.post(f"/onboardings/{oid}/items/{item_id}/provide",
-                data={"answer_text": "user: gh / pass: Secret!9"}, headers=ctx["manager"]["headers"])
 
-    # masked by default for everyone
+    # username and password are both mandatory
+    for partial in ({"username": "gh"}, {"password": "Secret!9"}, {"portal_label": "EmaraTax"}):
+        r = client.post(f"/onboardings/{oid}/items/{item_id}/provide",
+                        data=partial, headers=ctx["manager"]["headers"])
+        assert r.status_code == 422, r.text
+
+    r = client.post(f"/onboardings/{oid}/items/{item_id}/provide",
+                    data={"portal_label": "EmaraTax — FTA portal", "username": "gh",
+                          "password": "Secret!9", "extra_note": "TRN 100-1111-2222-333"},
+                    headers=ctx["manager"]["headers"])
+    assert r.status_code == 200, r.text
+
+    # masked by default for everyone: portal + username in clear, password fully masked
     detail = client.get(f"/onboardings/{oid}", headers=ctx["staff"]["headers"]).json()
     it = detail["items"][0]
-    assert it["credential_masked"] is True and "Secret" not in it["answer_text"]
+    assert it["credential_masked"] is True and it["credential_legacy"] is False
+    assert it["credential"]["portal_label"] == "EmaraTax — FTA portal"
+    assert it["credential"]["username"] == "gh"
+    assert "Secret" not in it["credential"]["password"] and "•" in it["credential"]["password"]
+    assert it["credential"]["extra_note"] == "TRN 100-1111-2222-333"
+    assert it["answer_text"] is None
 
-    # reveal returns the value, writes the event, notifies the manager
+    # reveal returns the full payload, writes the event, notifies the manager
     r = client.get(f"/onboardings/{oid}/items/{item_id}/reveal", headers=ctx["staff"]["headers"])
-    assert r.status_code == 200 and r.json()["value"] == "user: gh / pass: Secret!9"
+    assert r.status_code == 200
+    assert r.json()["credential"] == {"portal_label": "EmaraTax — FTA portal", "username": "gh",
+                                      "password": "Secret!9", "extra_note": "TRN 100-1111-2222-333"}
     detail = client.get(f"/onboardings/{oid}", headers=ctx["staff"]["headers"]).json()
     assert any('Credential "FTA login" viewed by Priya Nair' in e["text"] for e in detail["events"])
     mgr_notices = client.get("/notices", headers=ctx["manager"]["headers"]).json()
@@ -151,6 +169,32 @@ def test_credential_masked_and_reveal_logged(client):
     # accountant may not reveal
     assert client.get(f"/onboardings/{oid}/items/{item_id}/reveal",
                       headers=ctx["accountant"]["headers"]).status_code == 409
+
+
+def test_legacy_blob_credential_still_readable(client):
+    ctx = setup_firm(client)
+    _, obs = start_onboardings(client, ctx)
+    oid = obs[0]["id"]
+    o = ob_act(client, ctx, "staff", oid, "items",
+               {"items": [{"label": "Old portal login", "kind": "credential"}]})
+    item_id = o["items"][0]["id"]
+    ob_act(client, ctx, "staff", oid, "send-requests")
+
+    # simulate a pre-migration single-blob credential written before the structured shape existed
+    from sqlalchemy import text as sql
+    from app.db import engine
+    with engine.begin() as conn:
+        conn.execute(sql("UPDATE onboarding_items SET answer_text = 'user: gh / pass: OldSecret!1', "
+                         "status = 'answered', resolved_at = now() WHERE id = :id"), {"id": item_id})
+
+    detail = client.get(f"/onboardings/{oid}", headers=ctx["staff"]["headers"]).json()
+    it = detail["items"][0]
+    assert it["credential_legacy"] is True and it["credential_masked"] is True
+    assert "OldSecret" not in it["answer_text"] and it.get("credential") is None
+
+    r = client.get(f"/onboardings/{oid}/items/{item_id}/reveal", headers=ctx["staff"]["headers"])
+    assert r.status_code == 200
+    assert r.json()["value"] == "user: gh / pass: OldSecret!1" and r.json()["credential"] is None
 
 
 def test_qualifier_registry_and_unaudited_chip(client):

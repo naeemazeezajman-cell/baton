@@ -2438,12 +2438,82 @@ function ClientDocuments({ clientId }) {
   );
 }
 
+function CopyBtn({ text, label }) {
+  const [ok, setOk] = useState(false);
+  return (
+    <button
+      onClick={async () => { try { await navigator.clipboard.writeText(text); setOk(true); setTimeout(() => setOk(false), 1200); } catch { /* clipboard unavailable */ } }}
+      className="text-[10px] px-1.5 py-0.5 rounded border font-sans"
+      style={{ borderColor: "var(--line)", color: ok ? "var(--accent)" : "var(--mut)" }}
+    >
+      {ok ? "✓ copied" : `copy ${label}`}
+    </button>
+  );
+}
+
+function CredentialCard({ it, ob, byId, run, oid, revealed, setRevealed }) {
+  const rev = revealed[it.id]; // structured: full credential payload; legacy: { value }
+  const providerName = byId(ob.manager_id).name;
+  const doReveal = () => {
+    if (!window.confirm(`Reveal this credential?\n\nViewing is logged on the trail and ${providerName} (who provided it) is notified.`)) return;
+    run(async () => {
+      const r = await api.get(`/onboardings/${oid}/items/${it.id}/reveal`);
+      setRevealed((m) => ({ ...m, [it.id]: r.credential || { value: r.value } }));
+    });
+  };
+  const hide = () => setRevealed((m) => { const n = { ...m }; delete n[it.id]; return n; });
+
+  if (it.credential_legacy) {
+    return (
+      <div className="text-xs mt-1.5 font-mono2 flex items-center gap-2 flex-wrap">
+        <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded font-sans" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>legacy note</span>
+        ↳ {rev ? rev.value : it.answer_text}
+        {!rev
+          ? <button onClick={doReveal} className="underline font-sans" style={{ color: "var(--amber)" }}>Reveal (logged)</button>
+          : <button onClick={hide} className="underline font-sans" style={{ color: "var(--mut)" }}>hide again</button>}
+      </div>
+    );
+  }
+  const c = it.credential;
+  if (!c) return null;
+  return (
+    <div className="mt-2 rounded-lg border p-2.5 text-xs" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>🔐 portal</span>
+        <span className="font-medium">{c.portal_label || it.label}</span>
+      </div>
+      <div className="mt-1.5 space-y-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="w-8" style={{ color: "var(--mut)" }}>user</span>
+          <span className="font-mono2">{c.username}</span>
+          {rev && <CopyBtn text={rev.username} label="username" />}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="w-8" style={{ color: "var(--mut)" }}>pass</span>
+          <span className="font-mono2">{rev ? rev.password : "••••••"}</span>
+          {!rev ? (
+            <button onClick={doReveal} className="underline" style={{ color: "var(--amber)" }}>Reveal (logged)</button>
+          ) : (
+            <>
+              <CopyBtn text={rev.password} label="password" />
+              <button onClick={hide} className="underline" style={{ color: "var(--mut)" }}>hide again</button>
+            </>
+          )}
+        </div>
+        {c.extra_note && <div style={{ color: "var(--mut)" }}>note: {c.extra_note}</div>}
+      </div>
+    </div>
+  );
+}
+
 function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
   const iAmStaff = me.id === ob.staff_id;
   const iAmManager = me.id === ob.manager_id;
   const managerTurn = iAmManager && ob.holder === me.id && it.status === "requested" && ob.status === "in_progress";
   const [val, setVal] = useState("");
   const [qual, setQual] = useState("");
+  const [cred, setCred] = useState({ portal: "", user: "", pass: "", note: "" });
+  const [showPw, setShowPw] = useState(false);
   const [files, setFiles] = useState([]);
   const [naMode, setNaMode] = useState(false);
   const [naReason, setNaReason] = useState("");
@@ -2455,7 +2525,12 @@ function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
 
   const provide = () => run(async () => {
     const fd = new FormData();
-    if (val.trim()) fd.append("answer_text", val.trim());
+    if (it.kind === "credential") {
+      fd.append("portal_label", cred.portal.trim());
+      fd.append("username", cred.user.trim());
+      fd.append("password", cred.pass);
+      fd.append("extra_note", cred.note.trim());
+    } else if (val.trim()) fd.append("answer_text", val.trim());
     if (qual) fd.append("qualifier", qual);
     for (const f of files) {
       const raw = rawFromUrl(f.url);
@@ -2481,16 +2556,8 @@ function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
         </div>
       )}
       {it.kind !== "credential" && it.answer_text && <div className="text-xs mt-1.5 font-mono2">↳ {it.answer_text}</div>}
-      {it.kind === "credential" && it.answer_text && (
-        <div className="text-xs mt-1.5 font-mono2 flex items-center gap-2">
-          ↳ {revealed[it.id] || it.answer_text}
-          {!revealed[it.id] && (
-            <button onClick={() => run(async () => {
-              const r = await api.get(`/onboardings/${oid}/items/${it.id}/reveal`);
-              setRevealed((m) => ({ ...m, [it.id]: r.value }));
-            })} className="underline font-sans" style={{ color: "var(--amber)" }}>Reveal — viewing is logged</button>
-          )}
-        </div>
+      {it.kind === "credential" && (it.credential || it.answer_text) && (
+        <CredentialCard it={it} ob={ob} byId={byId} run={run} oid={oid} revealed={revealed} setRevealed={setRevealed} />
       )}
 
       {managerTurn && (
@@ -2506,9 +2573,20 @@ function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
                   </select>
                   <button disabled={files.length === 0} onClick={provide} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Provide</button>
                 </>
+              ) : it.kind === "credential" ? (
+                <>
+                  <input value={cred.portal} onChange={(e) => setCred({ ...cred, portal: e.target.value })} placeholder={'Portal / label — e.g. "EmaraTax — FTA portal"'} className="flex-1 min-w-[200px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <input value={cred.user} onChange={(e) => setCred({ ...cred, user: e.target.value })} placeholder="User ID" autoComplete="off" className="min-w-[140px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <span className="relative inline-flex min-w-[150px]">
+                    <input value={cred.pass} onChange={(e) => setCred({ ...cred, pass: e.target.value })} type={showPw ? "text" : "password"} placeholder="Password" autoComplete="new-password" className="w-full border rounded-md px-2.5 py-1.5 pr-8 text-xs" style={{ borderColor: "var(--line)" }} />
+                    <button type="button" onClick={() => setShowPw((s) => !s)} title={showPw ? "Hide password" : "Show password"} className="absolute right-1.5 top-1/2 -translate-y-1/2 text-sm leading-none">{showPw ? "🙈" : "👁️"}</button>
+                  </span>
+                  <input value={cred.note} onChange={(e) => setCred({ ...cred, note: e.target.value })} placeholder="Optional note — TRN, security question…" className="flex-1 min-w-[200px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <button disabled={!cred.user.trim() || !cred.pass.trim()} onClick={provide} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Provide credential</button>
+                </>
               ) : (
                 <>
-                  <input value={val} onChange={(e) => setVal(e.target.value)} type={it.kind === "credential" ? "password" : "text"} placeholder={it.kind === "credential" ? "Credential — stored server-side, returned masked" : "Type the information"} className="flex-1 min-w-[220px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
+                  <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="Type the information" className="flex-1 min-w-[220px] border rounded-md px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--line)" }} />
                   <button disabled={!val.trim()} onClick={provide} className="px-3 py-1.5 rounded-md text-white text-xs font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>Answer</button>
                 </>
               )}
