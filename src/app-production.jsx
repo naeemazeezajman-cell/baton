@@ -2609,6 +2609,8 @@ function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
   const [wdMode, setWdMode] = useState(false);
   const [wdReason, setWdReason] = useState("");
   const chip = OB_CHIP[it.status] || [it.status, "var(--mut)"];
+  // requested but the baton hasn't passed — the manager can't see it and got no notice yet
+  const unsent = it.status === "requested" && ob.status === "in_progress" && ob.holder === ob.staff_id;
 
   const provide = () => run(async () => {
     const fd = new FormData();
@@ -2632,6 +2634,7 @@ function ObItem({ it, ob, me, byId, run, oid, revealed, setRevealed }) {
         <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{it.kind}</span>
         <span className="flex-1 font-medium">{it.label}</span>
         {it.accepted_at && <span className="text-[10px] font-bold" style={{ color: "var(--accent)" }}>✓ accepted</span>}
+        {unsent && <span className="text-[10px] px-1.5 py-0.5 rounded-full font-bold" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>not sent yet</span>}
         <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: chip[1] + "18", color: chip[1] }}>{chip[0]}</span>
       </div>
       {it.note && <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>Note: {it.note}</div>}
@@ -2821,9 +2824,14 @@ function OnboardingView({ oid, me, byId, back }) {
               <button disabled={!newLabel.trim()} onClick={() => { run(() => api.post(`/onboardings/${oid}/items`, { items: [{ label: newLabel.trim(), kind: newKind }] })); setNewLabel(""); }} className="px-3 py-2 rounded-md border text-sm font-medium disabled:opacity-40" style={{ borderColor: "var(--line)" }}>Add</button>
             </div>
             {openItems.length > 0 && (
-              <button onClick={() => run(() => api.post(`/onboardings/${oid}/send-requests`))} className="mt-3 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--amber)" }}>
-                Send {openItems.length} request{openItems.length !== 1 && "s"} to {byId(ob.manager_id).name} — baton passes to them
-              </button>
+              <>
+                <div className="mt-3 rounded-lg border px-3 py-2 text-xs font-medium" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A", color: "#6B5A38" }}>
+                  ⚠️ {openItems.length} request{openItems.length !== 1 && "s"} drafted but NOT sent — {byId(ob.manager_id).name} sees nothing and gets no notice until you press Send.
+                </div>
+                <button onClick={() => run(() => api.post(`/onboardings/${oid}/send-requests`))} className="mt-2 px-4 py-2 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--amber)" }}>
+                  Send {openItems.length} request{openItems.length !== 1 && "s"} to {byId(ob.manager_id).name} — baton passes to them
+                </button>
+              </>
             )}
           </div>
         )}

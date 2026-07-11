@@ -193,6 +193,14 @@ def test_baton_pass_notices_both_directions(client):
 
     # staff → manager: manager is notified with the count
     ob_act(client, ctx, "staff", oid, "send-requests")
+    # layer 1 — the notices row is physically in the DB, addressed to the manager
+    from sqlalchemy import text as sql
+    from app.db import engine
+    with engine.begin() as conn:
+        row = conn.execute(sql("SELECT text FROM notices WHERE user_id = :mid ORDER BY id DESC LIMIT 1"),
+                           {"mid": ctx["manager"]["id"]}).first()
+    assert row is not None and "2 item(s) requested by Priya Nair — baton with you" in row[0]
+    # layer 2 — GET /notices with the manager token returns it
     mgr_notices = client.get("/notices", headers=ctx["manager"]["headers"]).json()
     assert any("Onboarding Gulf Horizon Trading LLC — VAT Filing: 2 item(s) requested by Priya Nair "
                "— baton with you" in n["text"] for n in mgr_notices)
