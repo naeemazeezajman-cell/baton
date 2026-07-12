@@ -3,6 +3,7 @@ import { api, registerFile, rawFromUrl, openFileLink } from "./api.js";
 import { AuthProvider, useAuth, LoginScreen, ForcedResetScreen } from "./auth.jsx";
 import { DataProvider, useData } from "./state.jsx";
 import { VatEngineNav, VatEngineScreen } from "./vat-engine/index.jsx"; // VAT-ENGINE (removable module — see REMOVING-VAT-ENGINE.md)
+import { filterGroups, groupClientActivities, rowNeedsAttention, slimClientActivities } from "./selectors.js";
 
 /* ------------------------------------------------------------------ */
 /*  Baton — CRM & employee performance tracker for bookkeeping firms    */
@@ -352,7 +353,9 @@ function Shell() {
         ...proposals.flatMap((p) => Object.entries(p.el?.assignments || {}).filter(([, uId]) => uId === me.id).map(([svc]) => {
           const ob = onboardings.find((o) => o.proposalId === p.uuid && o.service === svc && o.staffId === me.id);
           return { pid: p.id, client: p.prospect.name, service: svc, live: p.status === "el_sent",
-                   onboardingId: ob?.id || null, onboardingComplete: ob?.status === "complete" };
+                   onboardingId: ob?.id || null, onboardingComplete: ob?.status === "complete",
+                   holder: ob?.holder || null, holderSince: ob?.holderSince || null,
+                   itemCount: ob?.itemCount ?? 0 };
         })),
       ]
     : [];
@@ -401,6 +404,7 @@ function Shell() {
           </div>
           <nav className="flex-1 px-3 space-y-1 text-sm">
             <NavBtn label="Dashboard" active={route.screen === "dashboard"} onClick={() => setRoute({ screen: "dashboard" })} />
+            {!isAcct && <NavBtn label={isMgr ? "Clients & staffing" : "My clients"} active={route.screen === "myclients"} onClick={() => setRoute({ screen: "myclients" })} />}
             {!isAcct && <NavBtn label="Proposals" active={["proposals", "detail"].includes(route.screen)} onClick={() => setRoute({ screen: "proposals" })} />}
             {isMgr && <NavBtn label="New proposal request" active={route.screen === "new"} onClick={() => setRoute({ screen: "new" })} />}
             {(isMgr || isAcct) && <NavBtn label="Clients" active={route.screen === "clients"} onClick={() => setRoute({ screen: "clients" })} />}
@@ -433,7 +437,13 @@ function Shell() {
 
           <main className="flex-1 overflow-y-auto p-6">
             {route.screen === "dashboard" && !isAcct && (
-              <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} onbQueue={onbQueue} openOnb={(id) => setRoute({ screen: "onboarding", id })} />
+              <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} onbQueue={onbQueue} openOnb={(id) => setRoute({ screen: "onboarding", id })} gotoMyClients={() => setRoute({ screen: "myclients" })} />
+            )}
+            {route.screen === "myclients" && !isAcct && (
+              <MyClients me={me} isMgr={isMgr} users={users} onboardings={onboardings} duties={duties} byId={byId} now={now}
+                openOnb={(id) => setRoute({ screen: "onboarding", id })}
+                openVat={(dutyId) => setRoute({ screen: "vat", dutyId })}
+                gotoDashboard={() => setRoute({ screen: "dashboard" })} />
             )}
             {(route.screen === "payments" || (route.screen === "dashboard" && isAcct)) && (
               <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} raiseInvoice={raiseInvoice} recordReceipt={recordReceipt} healthOf={healthOf} />
@@ -441,7 +451,7 @@ function Shell() {
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
             {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
             {route.screen === "performance" && isMgr && <PerformanceScreen />}
-            {route.screen === "vat" && <VatEngineScreen />} {/* VAT-ENGINE (removable) */}
+            {route.screen === "vat" && <VatEngineScreen initialDutyId={route.dutyId || null} />} {/* VAT-ENGINE (removable) */}
             {route.screen === "onboarding" && route.id && <OnboardingView oid={route.id} me={me} byId={byId} back={() => setRoute({ screen: "dashboard" })} />}
             {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} clients={clients} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
             {route.screen === "detail" && (
@@ -564,7 +574,7 @@ function StatusChip({ s }) {
 
 /* ================================================================== */
 
-function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals, duties, markDutyDone, byId, now, open, gotoNew, onbQueue = [], openOnb = () => {} }) {
+function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals, duties, markDutyDone, byId, now, open, gotoNew, onbQueue = [], openOnb = () => {}, gotoMyClients = () => {} }) {
   const myDuties = duties.filter((d) => d.staffId === me.id && !d.closed).sort((a, b) => a.nextDue - b.nextDue);
   const myOverdue = myDuties.filter((d) => d.nextDue < now());
   const allOpenDuties = duties.filter((d) => !d.closed).sort((a, b) => a.nextDue - b.nextDue);
@@ -604,21 +614,47 @@ function Dashboard({ me, isMgr, batonQueue, myOpenTasks, myActivities, proposals
         </div>
       )}
 
-      {myActivities.length > 0 && (
-        <div className="mb-5 rounded-xl border p-4" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}>
-          <div className="font-semibold text-sm" style={{ color: "var(--accent)" }}>🧾 Your client activities</div>
-          <div className="mt-2 space-y-1">
-            {myActivities.map((a, i) => (
-              <div key={i} className="bg-white rounded-lg px-3 py-2 text-sm flex items-center gap-3">
-                {a.pid ? <button className="font-medium underline decoration-dotted" onClick={() => (a.onboardingId ? openOnb(a.onboardingId) : open(a.pid))}>{a.client}</button> : <span className="font-medium">{a.client}</span>}
-                <span className="flex-1 text-xs" style={{ color: "var(--mut)" }}>{a.service}</span>
-                {a.onboardingId && <button onClick={() => openOnb(a.onboardingId)} className="text-[11px] font-semibold underline" style={{ color: "var(--accent)" }}>{a.onboardingComplete ? "Onboarding ✓" : "Open onboarding →"}</button>}
-                <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={a.legacy ? { background: "var(--paper)", color: "var(--mut)" } : a.live ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>{a.legacy ? "Ongoing — pre-Baton" : a.live ? "Live — EL sent" : "Pending EL"}</span>
+      {myActivities.length > 0 && (() => {
+        /* the dashboard is the TO-DO list: only what needs attention; the directory lives
+           in My clients. Completed onboardings never show here. */
+        const slim = slimClientActivities(myActivities, 8);
+        return (
+          <div className="mb-5 rounded-xl border p-4" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}>
+            <div className="font-semibold text-sm" style={{ color: "var(--accent)" }}>🧾 Your client activities — needing attention</div>
+            {slim.allComplete ? (
+              <div className="mt-1.5 text-xs" style={{ color: "var(--mut)" }}>
+                All onboardings complete — see <button onClick={gotoMyClients} className="underline font-semibold" style={{ color: "var(--accent)" }}>My clients</button>.
               </div>
-            ))}
+            ) : (
+              <div className="mt-2 space-y-1">
+                {slim.visible.map((a, i) => {
+                  const withMe = a.holder === me.id;
+                  const age = a.holderSince ? fmtDur(now() - a.holderSince) : null;
+                  return (
+                    <div key={i} className="bg-white rounded-lg px-3 py-2 text-sm flex items-center gap-3">
+                      {a.pid ? <button className="font-medium underline decoration-dotted" onClick={() => (a.onboardingId ? openOnb(a.onboardingId) : open(a.pid))}>{a.client}</button> : <span className="font-medium">{a.client}</span>}
+                      <span className="flex-1 text-xs" style={{ color: "var(--mut)" }}>{a.service}</span>
+                      {a.onboardingId ? (
+                        <>
+                          <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={withMe ? { background: "var(--accent-soft)", color: "var(--accent)" } : { background: "var(--amber-soft)", color: "var(--amber)" }}>
+                            {a.itemCount === 0 ? "not started" : withMe ? `baton with you · ${age}` : `awaiting ${byId(a.holder).name.split(" ")[0]} · ${age}`}
+                          </span>
+                          <button onClick={() => openOnb(a.onboardingId)} className="text-[11px] font-semibold underline" style={{ color: "var(--accent)" }}>Open onboarding →</button>
+                        </>
+                      ) : (
+                        <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>Pending EL — not started</span>
+                      )}
+                    </div>
+                  );
+                })}
+                {slim.more > 0 && (
+                  <button onClick={gotoMyClients} className="text-[11px] underline font-semibold" style={{ color: "var(--accent)" }}>+ {slim.more} more — see My clients</button>
+                )}
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {isMgr && onbQueue.length > 0 && (
         <div className="mb-5 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
@@ -1016,6 +1052,106 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
 }
 
 /* ================================================================== */
+
+/* "My clients" (staff) / "Clients & staffing" (managers): the DIRECTORY — one row per
+   client-activity, grouped by client. The dashboard stays the to-do list; the per-service
+   tabs (e.g. the VAT engine) stay the working ledgers — this tab links into them. */
+function MyClients({ me, isMgr, users, onboardings, duties, byId, now, openOnb, openVat, gotoDashboard }) {
+  const [query, setQuery] = useState("");
+  const [needsOnly, setNeedsOnly] = useState(false);
+  const [staffFilter, setStaffFilter] = useState("");
+  const [vatFilings, setVatFilings] = useState([]);
+  useEffect(() => {
+    api.get("/vat-engine/filings").then(setVatFilings).catch(() => setVatFilings([])); // 404 = engine off
+  }, []);
+  const liveVatByDuty = Object.fromEntries(vatFilings.filter((x) => x.status !== "complete").map((x) => [x.duty_id, x]));
+
+  const groups = filterGroups(
+    groupClientActivities({ onboardings, duties, meId: me.id, role: me.role, staffFilter: staffFilter || null }),
+    { query, needsOnly, nowMs: now() },
+  );
+  const staffIds = [...new Set([...onboardings.map((o) => o.staffId), ...duties.map((d) => d.staffId)])];
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>
+        {isMgr ? "Clients & staffing" : "My clients"}
+      </h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>
+        Every client-activity {isMgr ? "across the firm" : "you are staffed on"} — onboarding state, the recurring duty once born, and where to act. The dashboard shows only what needs attention; this is the full directory.
+      </p>
+
+      <div className="mt-3 flex gap-2 items-center flex-wrap">
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search client, code or activity…" className="border rounded-md px-3 py-2 text-sm w-72" style={{ borderColor: "var(--line)" }} />
+        {[["all", "All", false], ["needs", "Needs attention", true]].map(([k, l, v]) => (
+          <button key={k} onClick={() => setNeedsOnly(v)} className="px-3 py-1.5 rounded-full text-xs font-semibold border"
+            style={needsOnly === v ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { borderColor: "var(--line)", color: "var(--mut)" }}>{l}</button>
+        ))}
+        {isMgr && (
+          <select value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)} className="border rounded-md px-2 py-1.5 text-xs" style={{ borderColor: "var(--line)" }}>
+            <option value="">All staff</option>
+            {staffIds.map((sid) => <option key={sid} value={sid}>{byId(sid).name}</option>)}
+          </select>
+        )}
+      </div>
+
+      <div className="mt-4 space-y-3">
+        {groups.map((g) => (
+          <div key={g.clientKey} className="bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+            <div className="px-4 py-2.5 border-b flex items-center gap-2" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+              <span className="font-semibold text-sm">{g.clientName}</span>
+              {g.clientRef && <span className="font-mono2 text-xs" style={{ color: "var(--accent)" }}>{g.clientRef}</span>}
+            </div>
+            {g.rows.map((r) => {
+              const ob = r.onboarding;
+              const d = r.duty;
+              const vat = d && liveVatByDuty[d.id];
+              const overdue = d && d.nextDue < now();
+              return (
+                <div key={r.key} className="px-4 py-2.5 border-b last:border-0 flex items-center gap-3 text-sm flex-wrap" style={{ borderColor: "var(--line)" }}>
+                  <span className="w-52 shrink-0 font-medium truncate">{r.service}</span>
+                  {isMgr && <span className="text-[11px] w-24 shrink-0 truncate" style={{ color: "var(--mut)" }}>{byId(r.staffId).name.split(" ")[0]}</span>}
+                  {ob ? (
+                    ob.status === "complete"
+                      ? <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>✓ onboarded {ob.completedAt ? fmtD(ob.completedAt) : ""}</span>
+                      : <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>
+                          onboarding · {ob.itemCount === 0 ? "not started" : `with ${byId(ob.holder).name.split(" ")[0]} · ${fmtDur(now() - (ob.holderSince || now()))}`}
+                        </span>
+                  ) : (
+                    <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>pre-Baton</span>
+                  )}
+                  {d && (
+                    <span className="text-[11px] px-2 py-0.5 rounded-full font-mono2 font-medium" style={overdue ? { background: "var(--red-soft, #F7E4E2)", color: "var(--red)" } : { background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>
+                      due {fmtD(d.nextDue)} · {overdue ? `${fmtDur(now() - d.nextDue)} OVERDUE` : `in ${fmtDur(d.nextDue - now())}`}
+                    </span>
+                  )}
+                  <span className="flex-1" />
+                  <span className="flex gap-3 text-[11px] font-semibold">
+                    {ob && <button onClick={() => openOnb(ob.id)} className="underline" style={{ color: "var(--accent)" }}>onboarding →</button>}
+                    {d && d.kind === "vat" && !d.closed && (
+                      <button onClick={() => openVat(d.id)} className="underline" style={{ color: "var(--accent)" }}>
+                        {vat ? `VAT period (${STAGES_SHORT[vat.status] || vat.status}) →` : "VAT engine →"}
+                      </button>
+                    )}
+                    {d && d.kind !== "vat" && <button onClick={gotoDashboard} className="underline" style={{ color: "var(--mut)" }}>duty on dashboard →</button>}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+        {groups.length === 0 && (
+          <div className="bg-white rounded-xl border p-8 text-center text-sm" style={{ borderColor: "var(--line)", color: "var(--mut)" }}>
+            {needsOnly ? "Nothing needs attention — switch to All to see the full directory." : "No client activities yet."}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const STAGES_SHORT = { ledgers_pending: "ledger", invoices_pending: "invoices", reconciled: "recon",
+  computation_draft: "computation", awaiting_client_approval: "client approval", ready_to_file: "file at FTA" };
 
 function Payments({ payments, duePayments, clients, now, byId, raiseInvoice, recordReceipt, healthOf }) {
   const groups = (list) => {

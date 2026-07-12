@@ -3,7 +3,7 @@
    { VatEngineNav, VatEngineScreen } and renders them in the nav + screen switch — two
    marked lines. When env VAT_ENGINE_ENABLED=false the API 404s and both render null. */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, openFileLink } from "../api.js";
 import { useData } from "../state.jsx";
 
@@ -167,7 +167,7 @@ function RequestLog({ f, kind, onResend }) {
 
 /* ---------- the screen ---------- */
 
-export function VatEngineScreen() {
+export function VatEngineScreen({ initialDutyId = null }) {
   const en = useVatEnabled();
   // NB: byId is NOT in the DataProvider context (it's local to the App component) —
   // derive it here from `users`, which the context does provide.
@@ -175,6 +175,15 @@ export function VatEngineScreen() {
   const byId = (id) => users.find((u) => u.id === id) || { id, name: "—", role: "" };
   const [filing, setFiling] = useState(null);
   const [busy, setBusy] = useState(false);
+  const autoOpened = useRef(false);
+  // deep link from My clients: auto-open the duty's period once the duty list is in
+  useEffect(() => {
+    if (!en || !initialDutyId || autoOpened.current) return;
+    const d = duties.find((x) => x.id === initialDutyId && x.kind === "vat" && !x.closed);
+    if (!d) return;
+    autoOpened.current = true;
+    api.post("/vat-engine/filings/open", { duty_id: d.id }).then(setFiling).catch(() => {});
+  }, [en, initialDutyId, duties]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!en) return null;
 
   const vatDuties = duties.filter((d) => d.kind === "vat" && !d.closed);

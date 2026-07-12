@@ -93,7 +93,7 @@ const mapUser = (u) => ({
 });
 
 const mapDuty = (d) => ({
-  id: d.id, staffId: d.staff_id, client: d.client_name, service: d.service,
+  id: d.id, staffId: d.staff_id, client: d.client_name, clientId: d.client_id || null, service: d.service,
   kind: d.kind, contact: d.contact || { name: "", email: "" }, cadence: d.cadence,
   nextDue: ms(d.next_due), closed: d.closed,
   history: (d.history || []).map((h) => ({
@@ -122,7 +122,7 @@ const mapOnboarding = (o) => ({
   clientContact: o.client_contact, proposalId: o.proposal_id, service: o.service,
   staffId: o.staff_id, staffName: o.staff_name, managerId: o.manager_id,
   status: o.status, holder: o.holder, holderSince: ms(o.holder_since),
-  dutyId: o.duty_id, createdAt: ms(o.created_at),
+  dutyId: o.duty_id, createdAt: ms(o.created_at), completedAt: ms(o.completed_at),
   openItems: o.open_items, itemCount: o.item_count,
 });
 
