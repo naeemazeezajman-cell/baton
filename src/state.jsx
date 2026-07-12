@@ -154,6 +154,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
   const firm = mapFirm(firmRaw);
   const isAcct = me.role === "Accountant";
   const isAdmin = me.role === "Admin";
+  const isMgrRole = me.role === "Manager"; // GET /payments allows Admin, Accountant AND Manager
 
   const pushToast = (t) => { setToast(t); setTimeout(() => setToast(null), 3000); };
 
@@ -172,8 +173,8 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
     () => api.get("/notices").then((n) => setNotices(n.map((x) => ({ id: x.id, userId: me.id, at: ms(x.at), text: x.text, read: x.read })))).catch(() => false),
     [me.id]);
   const refetchPayments = useCallback(
-    () => (isAcct || isAdmin ? api.get("/payments").then(setPaymentsRaw).catch(() => false) : Promise.resolve()),
-    [isAcct, isAdmin]);
+    () => (isAcct || isAdmin || isMgrRole ? api.get("/payments").then(setPaymentsRaw).catch(() => false) : Promise.resolve()),
+    [isAcct, isAdmin, isMgrRole]);
   const refetchSigUses = useCallback(
     () => (isAdmin
       ? api.get("/signature-uses").then((r) => setSigUses(r.map((s) => ({ id: s.id, by: s.by, doc: s.document, pid: s.context, at: ms(s.at) })))).catch(() => false)

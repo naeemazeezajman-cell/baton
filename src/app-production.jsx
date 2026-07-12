@@ -57,19 +57,88 @@ const SEED_FIRM = {
   templates: { letterhead: null, proposal: null, el: null },
 };
 
+/* Verified against the ACTUAL endpoint guards (api/app/routers/*) — the matrix mirrors
+   the code. ✓* = scoped to the specific assignment (assigned drafter / assigned staff /
+   engagement manager on that matter), not the role at large. */
+const ROLE_COLS = ["Admin", "Manager", "Technical Staff", "In-house Accountant"];
 const ROLE_MATRIX = [
-  ["Create proposal requests", true, true, false, false],
-  ["Assign technical staff / offer duties", true, true, false, false],
-  ["Draft & generate proposals", true, true, true, false],
-  ["Edit commercial terms (proposal)", true, true, false, false],
-  ["Sign documents (own signature only)", true, true, false, false],
-  ["Approve / reject engagement letters", true, false, false, false],
-  ["Send client emails (edit · confirm · send)", true, true, false, false],
-  ["Upload signed engagement letters", true, true, false, false],
-  ["Mark invoices raised / record receipts", true, false, false, true],
-  ["Manage employees, firm & letterhead", true, false, false, false],
-  ["View audit trails", true, true, true, true],
+  ["Proposals & engagement", [
+    ["Create proposal requests", 1, 1, 0, 0],
+    ["Draft & edit commercial terms (assigned drafter; signatory at senior review)", 1, 1, "*", 0],
+    ["Sign — own signature only", 1, 1, 0, 0],
+    ["Counter-sign & approve/reject ELs (Admin signatories)", 1, 0, 0, 0],
+    ["Record client confirmation / conversion", 1, 1, 0, 0],
+    ["Staff activities with workload view", 1, 1, 0, 0],
+  ]],
+  ["Onboarding", [
+    ["Request client documents & credentials", 0, 0, "*", 0],
+    ["Provide documents / answer requests (the engagement manager)", "*", "*", 0, 0],
+    ["Reveal stored credentials — always logged", 1, "*", "*", 0],
+    ["Complete onboarding → create recurring duty (assigned staff only)", 0, 0, "*", 0],
+  ]],
+  ["Duties & deadlines", [
+    ["Complete duties with proof of work (whoever is assigned)", "*", "*", "*", "*"],
+    ["Create / assign duties", 1, 1, 0, 0],
+    ["Firm-wide compliance board", 1, 1, 0, 0],
+  ]],
+  ["VAT engine", [
+    ["Run filings — profile interview, uploads, reconciliation, computation", 0, 0, "*", 0],
+    ["Edit the client VAT profile", 1, 1, "*", 0],
+    ["Approve computation dispatch to client", 0, 0, "*", 0],
+    ["View all filings (and open a period read-only)", 1, 1, 0, 0],
+  ]],
+  ["Payments", [
+    ["Raise invoices (upload + auto-email) & record receipts with references", 1, 0, 0, 1],
+    ["Keep client contact details current", 1, 0, 0, 1],
+    ["View payment health", 1, 1, 0, 1],
+  ]],
+  ["Performance", [
+    ["★ Performance tab & per-client performance", 1, 1, 0, 0],
+  ]],
+  ["Administration", [
+    ["Firm settings, service catalog, templates", 1, 0, 0, 0],
+    ["Employees & roles", 1, 0, 0, 0],
+    ["Signature vault", 1, 0, 0, 0],
+    ["Data export", 1, 0, 0, 0],
+  ]],
 ];
+
+function PermMatrix({ compact = false }) {
+  return (
+    <>
+      <table className={`w-full ${compact ? "text-[11px]" : "text-xs"}`}>
+        <thead>
+          <tr className="text-left text-[10px] uppercase tracking-wider" style={{ color: "var(--mut)" }}>
+            <th className={compact ? "py-0.5" : "py-1"}>Permission</th>
+            {ROLE_COLS.map((r) => <th key={r} className="text-center px-1 whitespace-nowrap">{r}</th>)}
+          </tr>
+        </thead>
+        {ROLE_MATRIX.map(([header, rows]) => (
+          <tbody key={header}>
+            <tr>
+              <td colSpan={5} className={`${compact ? "pt-1.5" : "pt-2.5"} pb-0.5 text-[10px] uppercase tracking-wider font-bold`} style={{ color: "var(--accent)" }}>{header}</td>
+            </tr>
+            {rows.map(([perm, ...cells], i) => (
+              <tr key={i} className="border-t" style={{ borderColor: "var(--line)" }}>
+                <td className={`${compact ? "py-0.5" : "py-1"} pr-2`}>{perm}</td>
+                {cells.map((x, j) => (
+                  <td key={j} className="text-center">
+                    {x === "*"
+                      ? <span title="Scoped to the specific assignment, not the role at large" style={{ color: "var(--accent)" }}>✓*</span>
+                      : x ? <span style={{ color: "var(--accent)" }}>✓</span> : <span style={{ color: "var(--line)" }}>—</span>}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        ))}
+      </table>
+      <div className="mt-1.5 text-[10px]" style={{ color: "var(--mut)" }}>
+        ✓* = scoped to the specific assignment (assigned drafter / assigned staff / engagement manager on that matter) — not the role at large. Verified against the API endpoint guards.
+      </div>
+    </>
+  );
+}
 
 const BASIS = ["per month", "per quarter", "per annum", "one-time"];
 const CADENCES = ["monthly", "quarterly", "half-yearly", "annual", "one-time"];
@@ -3579,17 +3648,7 @@ function SetupWizard({ onCancel, onDone }) {
             {!emps.some((e) => e.role === "Admin") && <div className="mt-3 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>At least one Admin is required to proceed.</div>}
             <div className="mt-4 pt-4 border-t" style={{ borderColor: "var(--line)" }}>
               <div className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--mut)" }}>Permission matrix applied</div>
-              <table className="w-full text-xs">
-                <thead><tr className="text-left" style={{ color: "var(--mut)" }}><th className="py-1">Permission</th><th className="text-center">Admin</th><th className="text-center">Manager</th><th className="text-center">Staff</th><th className="text-center">Acct</th></tr></thead>
-                <tbody>
-                  {ROLE_MATRIX.slice(0, 6).map(([perm, a, m, s2, ac], i) => (
-                    <tr key={i} className="border-t" style={{ borderColor: "var(--line)" }}>
-                      <td className="py-1">{perm}</td>
-                      {[a, m, s2, ac].map((x, j) => <td key={j} className="text-center">{x ? <span style={{ color: "var(--accent)" }}>✓</span> : <span style={{ color: "var(--line)" }}>—</span>}</td>)}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <PermMatrix compact />
             </div>
           </Card>
         )}
@@ -3695,18 +3754,8 @@ function Employees({ users, setUsers }) {
         </button>
       </Card>
 
-      <Card title="Role permission matrix" sub="Fixed roles in v1; the data model is role → permissions so custom roles can be exposed later.">
-        <table className="w-full text-sm">
-          <thead><tr className="text-left text-[11px] uppercase tracking-wider" style={{ color: "var(--mut)" }}><th className="py-2">Permission</th><th className="text-center">Admin</th><th className="text-center">Manager</th><th className="text-center">Staff</th><th className="text-center">Accountant</th></tr></thead>
-          <tbody>
-            {ROLE_MATRIX.map(([perm, a, m, s, ac], i) => (
-              <tr key={i} className="border-t" style={{ borderColor: "var(--line)" }}>
-                <td className="py-2">{perm}</td>
-                {[a, m, s, ac].map((x, j) => <td key={j} className="text-center">{x ? <span style={{ color: "var(--accent)" }}>✓</span> : <span style={{ color: "var(--line)" }}>—</span>}</td>)}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <Card title="Role permission matrix" sub="Fixed roles in v1; the data model is role → permissions so custom roles can be exposed later. Every row mirrors the actual API endpoint guards.">
+        <PermMatrix />
       </Card>
     </div>
   );
