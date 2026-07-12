@@ -732,6 +732,57 @@ def test_add_to_register_and_add_to_ledger_resolutions(client, monkeypatch):
     assert "INV-900" in sent["body"] and "to be booked in client's records" in sent["body"]
 
 
+def test_checks_track_current_profile_until_confirm_then_pin(client):
+    ctx = setup_firm(client)
+    ledger = [
+        ["S-1", date(2026, 5, 5), "Std Co", "T1", "Dubai", 1000, 50, "Output", ""],
+        ["Z-1", date(2026, 5, 7), "Exporter", "T2", "Dubai", 5000, 0, "Output", "Zero-rated (0%)"],
+    ]
+    register = [
+        ["S-1", date(2026, 5, 5), "Std Co", "Dubai", 1000, 50, "", ""],
+        ["Z-1", date(2026, 5, 7), "Exporter", "Dubai", 5000, 0, "", "Zero-rated (0%)"],
+    ]
+    # profile v1 says zero-rated = No, but the ledger HAS zero-rated rows → mismatch warning
+    cid, _, f = setup_client_filing(client, ctx, ledger=ledger, register=register,
+                                    profile_flags=flags(has_zero_rated="no"))
+    r = client.post(f"/vat-engine/filings/{f['id']}/draft-computation", headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    ids = {c["id"] for c in r.json()["computation"]["checks"]}
+    assert "zero_rated_unexpected" in ids  # the warning fires under profile v1
+
+    # edit the profile (No → Yes, v2): the warning clears WITHOUT re-drafting
+    r = client.patch(f"/vat-engine/clients/{cid}/profile",
+                     json={"business_category": "Trading", "flags": flags(has_zero_rated="yes")},
+                     headers=H(ctx, "staff"))
+    assert r.status_code == 200 and r.json()["version"] == 2
+    f2 = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+    assert f2["status"] == "computation_draft"  # no manual re-draft happened
+    ids2 = {c["id"] for c in f2["computation"]["checks"]}
+    assert "zero_rated_unexpected" not in ids2  # current profile applies
+    assert "zero_rated_evidence" in ids2  # data-driven tick remains
+    assert f2["computation"]["profile_version"] == 2  # tracking, not pinned yet
+    assert any("Profile v2 now applies — checks re-evaluated" in e["text"] for e in f2["events"])
+    assert any("check set changed" in e["text"] for e in f2["events"])
+
+    # confirm → version PINNED at confirmation
+    r = client.post(f"/vat-engine/filings/{f['id']}/confirm-computation",
+                    json={"confirmations": ["zero_rated_evidence"]}, headers=H(ctx, "staff"))
+    assert r.status_code == 200, r.text
+    assert r.json()["computation"]["profile_version"] == 2
+    assert any("Profile v2 pinned to this computation" in e["text"] for e in r.json()["events"])
+
+    # later profile edits never touch the confirmed filing
+    r = client.patch(f"/vat-engine/clients/{cid}/profile",
+                     json={"business_category": "Trading", "flags": flags(has_zero_rated="no")},
+                     headers=H(ctx, "staff"))
+    assert r.status_code == 200 and r.json()["version"] == 3
+    f3 = client.get(f"/vat-engine/filings/{f['id']}", headers=H(ctx, "staff")).json()
+    assert f3["status"] == "awaiting_client_approval"
+    assert f3["computation"]["profile_version"] == 2  # still pinned
+    assert {c["id"] for c in f3["computation"]["checks"]} == ids2  # checks untouched
+    assert not any("Profile v3 now applies" in e["text"] for e in f3["events"])
+
+
 def test_working_paper_sheets_and_adjustment_loop(client):
     from openpyxl import load_workbook
 

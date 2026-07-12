@@ -451,6 +451,22 @@ def _log_to_open_filings(db: Session, user: User, client_id, txt: str):
         _log(db, f, user.id, txt)
 
 
+def _reevaluate_open_computations(db: Session, user: User, client_id, profile: VatClientProfile):
+    """An UNCONFIRMED computation evaluates its checks against the CURRENT profile — on any
+    profile change, open filings at computation_draft rebuild their checks (numbers are
+    unchanged; the rebuild resets any confirmation state). Version pinning starts at confirm."""
+    for fil in db.scalars(select(VatFiling).where(VatFiling.tenant_id == user.tenant_id,
+                                                  VatFiling.client_id == client_id,
+                                                  VatFiling.status == "computation_draft")).all():
+        old_ids = {c["id"] for c in (fil.computation or {}).get("checks") or []}
+        _build_computation(db, fil, user)
+        new_ids = {c["id"] for c in fil.computation["checks"]}
+        changed = old_ids != new_ids
+        _log(db, fil, user.id,
+             f"Profile v{profile.version} now applies — checks re-evaluated"
+             + (" (check set changed — confirmations reset; re-confirm)" if changed else "") + ".")
+
+
 def _realign_open_periods(db: Session, user: User, client_id, profile: VatClientProfile):
     """The stagger drives every deadline: open filings that haven't started collecting yet
     re-derive their period when the profile's stagger is recorded or changed."""
@@ -519,6 +535,7 @@ def create_profile(client_id: uuid.UUID, body: ProfileIn, user: User = Depends(c
                          + ". Applied to this filing.")
     if body.tax_period_stagger:
         _realign_open_periods(db, user, client_id, p)
+    _reevaluate_open_computations(db, user, client_id, p)
     db.commit()
     return _serialize_profile(p)
 
@@ -574,6 +591,7 @@ def update_profile(client_id: uuid.UUID, body: ProfileIn, user: User = Depends(c
                          f"Profile updated to v{p.version} by {user.name}: {rendered}")
     if stagger_changed:
         _realign_open_periods(db, user, client_id, p)
+    _reevaluate_open_computations(db, user, client_id, p)
     db.commit()
     return _serialize_profile(p)
 
@@ -1874,8 +1892,13 @@ def confirm_computation(fid: uuid.UUID, body: ConfirmComputationIn | None = None
 
     client = db.get(Client, f.client_id) if f.client_id else None
     client_name = client.name if client else "Client"
+    # PIN the profile version here: until confirmation the checks track the CURRENT profile;
+    # from confirmation onward THIS version is what the working paper and history record.
+    profile = _get_profile(db, f.tenant_id, f.client_id)
     f.computation = {**f.computation, "checks": stamped,
-                     "warning_note": body.warning_note.strip() or None}
+                     "warning_note": body.warning_note.strip() or None,
+                     "profile_version": profile.version if profile
+                     else f.computation.get("profile_version")}
     pdf = _computation_pdf(f, client_name)
     pname = f"VAT Computation {f.period_start:%b} - {f.period_end:%b %Y}.pdf"
     stored = _store_bytes(db, user, "client", f.client_id or f.id, pname, pdf)
@@ -1888,8 +1911,11 @@ def confirm_computation(fid: uuid.UUID, body: ConfirmComputationIn | None = None
     if warnings:
         _log(db, f, user.id, f'{len(warnings)} compliance warning(s) acknowledged by {user.name} — '
                              f'proceed-despite-warning reason: "{body.warning_note.strip()}"')
+    pin_txt = (f" Profile v{f.computation['profile_version']} pinned to this computation."
+               if f.computation.get("profile_version") else "")
     _log(db, f, user.id, f"Computation reviewed and CONFIRMED by staff. Rendered as {pname} "
-                         f"(stored on the client registry). Stage 5 — send to the client for approval.")
+                         f"(stored on the client registry).{pin_txt} "
+                         f"Stage 5 — send to the client for approval.")
     db.commit()
     return serialize(db, f, detail=True)
 
