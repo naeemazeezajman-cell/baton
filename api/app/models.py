@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     Text,
     UniqueConstraint,
@@ -61,6 +62,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(Text)
     must_reset: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    last_login_at: Mapped[datetime | None] = mapped_column(TS)  # feeds operator activity counts only
     created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
 
 
@@ -106,6 +108,49 @@ class ProposalEvent(Base):
     kind: Mapped[str] = mapped_column(Text, server_default="log")
     text_: Mapped[str] = mapped_column("text", Text)
     meta: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class PlatformOperator(Base):
+    """The developer's own login ABOVE all tenants — deliberately separate from users
+    (no tenant_id). Operator JWTs carry scope=platform and are rejected by every tenant
+    endpoint; tenant tokens are rejected by operator endpoints."""
+
+    __tablename__ = "platform_operators"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    email: Mapped[str] = mapped_column(CITEXT, unique=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+    must_reset: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    __table_args__ = (UniqueConstraint("tenant_id"),
+                      CheckConstraint("status IN ('trial','active','suspended','cancelled')",
+                                      name="subscriptions_status_check"))
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=GEN_UUID)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    plan_name: Mapped[str] = mapped_column(Text, server_default="Trial")
+    status: Mapped[str] = mapped_column(Text, server_default="trial")
+    seats_limit: Mapped[int] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    current_period_end: Mapped[datetime | None] = mapped_column(TS)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class PlatformEvent(Base):
+    """Append-only operator action log — never tenant business content."""
+
+    __tablename__ = "platform_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
+    operator_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    text_: Mapped[str] = mapped_column("text", Text)
 
 
 class HolderLog(Base):

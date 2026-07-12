@@ -505,6 +505,15 @@ function Shell() {
           </header>
 
           <main className="flex-1 overflow-y-auto p-6">
+            {me.role === "Admin" && firm.subscription?.expiring_soon && (
+              <div className="max-w-5xl mx-auto mb-4 rounded-xl border px-4 py-3 text-sm flex items-center gap-3" style={{ background: "var(--amber-soft)", borderColor: "#E4C99A" }}>
+                <span className="text-lg">⏳</span>
+                <span style={{ color: "#6B5A38" }}>
+                  <b>{firm.subscription.plan_name} subscription ends in {firm.subscription.days_left} day{firm.subscription.days_left !== 1 && "s"}</b> — after a 7-day
+                  grace period, logins are blocked. Contact the platform operator to renew.
+                </span>
+              </div>
+            )}
             {route.screen === "dashboard" && !isAcct && (
               <Dashboard me={me} isMgr={isMgr} batonQueue={batonQueue} myOpenTasks={myOpenTasks} myActivities={myActivities} proposals={proposals} duties={duties} markDutyDone={markDutyDone} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} gotoNew={() => setRoute({ screen: "new" })} onbQueue={onbQueue} openOnb={(id) => setRoute({ screen: "onboarding", id })} gotoMyClients={() => setRoute({ screen: "myclients" })} />
             )}

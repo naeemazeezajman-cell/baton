@@ -9,9 +9,29 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import get_db
-from .models import User
+from .models import Subscription, User
 
 bearer = HTTPBearer(auto_error=False)
+
+SUBSCRIPTION_INACTIVE_MSG = "Your firm's Baton subscription is inactive — contact your administrator"
+SUBSCRIPTION_GRACE_DAYS = 7
+
+
+def subscription_blocked(db: Session, tenant_id) -> bool:
+    """suspended/cancelled, or expired past the grace window → blocked. Tenants without a
+    subscription row (legacy) are never blocked."""
+    from sqlalchemy import select
+    sub = db.scalar(select(Subscription).where(Subscription.tenant_id == tenant_id))
+    if sub is None:
+        return False
+    if sub.status in ("suspended", "cancelled"):
+        return True
+    if sub.current_period_end is not None:
+        end = sub.current_period_end if sub.current_period_end.tzinfo else \
+            sub.current_period_end.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > end + timedelta(days=SUBSCRIPTION_GRACE_DAYS):
+            return True
+    return False
 
 
 def hash_password(password: str) -> str:
@@ -66,6 +86,9 @@ def _user_from_credentials(
     if credentials is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     payload = decode_token(credentials.credentials, expected_type)
+    if payload.get("scope") == "platform":
+        # platform operator tokens are NEVER valid on tenant endpoints
+        raise HTTPException(status_code=401, detail="Platform operator tokens are not valid for tenant endpoints")
     user = db.get(User, uuid.UUID(payload["sub"]))
     if user is None or not user.active:
         raise HTTPException(status_code=401, detail="User not found or deactivated")
@@ -82,10 +105,15 @@ def current_user_allow_reset(
 
 def current_user(
     user: User = Depends(current_user_allow_reset),
+    db: Session = Depends(get_db),
 ) -> User:
-    """Authenticated user. While must_reset is true every call except reset-password is refused."""
+    """Authenticated user. While must_reset is true every call except reset-password is
+    refused; an inactive subscription (suspended/cancelled or >grace past expiry) turns
+    every tenant API call into a 402."""
     if user.must_reset:
         raise HTTPException(status_code=403, detail={"code": "MUST_RESET", "message": "Password reset required"})
+    if subscription_blocked(db, user.tenant_id):
+        raise HTTPException(status_code=402, detail=SUBSCRIPTION_INACTIVE_MSG)
     return user
 
 

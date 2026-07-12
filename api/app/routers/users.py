@@ -72,6 +72,18 @@ def create_user(
     exists = db.scalar(tenant_select(User, admin).where(User.email == str(body.email)))
     if exists:
         raise HTTPException(status_code=409, detail="A user with this email already exists")
+    # seat enforcement: activating users beyond the subscription's seats_limit is refused
+    from sqlalchemy import func, select
+    from ..models import Subscription
+    sub = db.scalar(select(Subscription).where(Subscription.tenant_id == admin.tenant_id))
+    if sub and sub.seats_limit:
+        active_count = db.scalar(select(func.count()).select_from(User).where(
+            User.tenant_id == admin.tenant_id, User.active.is_(True)))
+        if active_count >= sub.seats_limit:
+            raise HTTPException(status_code=409,
+                                detail=f"Seat limit reached — your plan allows {sub.seats_limit} active "
+                                       f"user(s). Deactivate an account or ask the platform operator "
+                                       f"to raise the limit.")
     temp_password = secrets.token_urlsafe(9)
     new = User(
         tenant_id=admin.tenant_id,

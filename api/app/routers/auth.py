@@ -9,12 +9,14 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..models import User
 from ..security import (
+    SUBSCRIPTION_INACTIVE_MSG,
     _user_from_credentials,
     bearer,
     create_access_token,
     create_refresh_token,
     decode_token,
     hash_password,
+    subscription_blocked,
     verify_password,
 )
 
@@ -57,6 +59,11 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     user = next((u for u in candidates if verify_password(body.password, u.password_hash)), None)
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if subscription_blocked(db, user.tenant_id):
+        raise HTTPException(status_code=403, detail=SUBSCRIPTION_INACTIVE_MSG)
+    from ..workflow import now
+    user.last_login_at = now()  # feeds the operator's activity counts only
+    db.commit()
     return _tokens(user)
 
 

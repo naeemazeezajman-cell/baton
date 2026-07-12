@@ -1,16 +1,17 @@
+import os
 import secrets
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import emails
 from ..config import get_settings
 from ..db import get_db
-from ..models import Client, Duty, DutyEvent, Tenant, User
+from ..models import Client, Duty, DutyEvent, Subscription, Tenant, User
 from ..security import create_set_password_token, hash_password
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -98,6 +99,13 @@ def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
     )
     db.add(tenant)
     db.flush()
+
+    # every new firm starts on a 30-day trial — the platform operator formalizes it later.
+    # Seats: env default, but never below the deploying head-count (bootstrap must not self-block).
+    default_seats = int(os.getenv("DEFAULT_TRIAL_SEATS", "10"))
+    db.add(Subscription(tenant_id=tenant.id, plan_name="Trial", status="trial",
+                        seats_limit=max(default_seats, len(body.employees)),
+                        current_period_end=datetime.now(timezone.utc) + timedelta(days=30)))
 
     # pre-Baton duty clients become first-class client rows: one per DISTINCT client name
     # (case-insensitive, whitespace-collapsed) across every employee's pre-existing duties
@@ -190,7 +198,25 @@ def _firm_out(t: Tenant) -> dict:
 
 @router.get("/me")
 def get_firm(user=Depends(current_user), db: Session = Depends(get_db)):
-    return _firm_out(db.get(Tenant, user.tenant_id))
+    out = _firm_out(db.get(Tenant, user.tenant_id))
+    sub = db.scalar(select(Subscription).where(Subscription.tenant_id == user.tenant_id))
+    if sub:
+        days_left = None
+        if sub.current_period_end is not None:
+            end = sub.current_period_end if sub.current_period_end.tzinfo else \
+                sub.current_period_end.replace(tzinfo=timezone.utc)
+            days_left = (end - datetime.now(timezone.utc)).days
+        seats_used = db.scalar(select(func.count()).select_from(User).where(
+            User.tenant_id == user.tenant_id, User.active.is_(True)))
+        out["subscription"] = {"plan_name": sub.plan_name, "status": sub.status,
+                               "seats_limit": sub.seats_limit, "seats_used": seats_used,
+                               "current_period_end": sub.current_period_end,
+                               "days_left": days_left,
+                               "expiring_soon": days_left is not None and days_left <= 14
+                               and sub.status in ("trial", "active")}
+    else:
+        out["subscription"] = None
+    return out
 
 
 @router.patch("/me")

@@ -129,6 +129,7 @@ const mapOnboarding = (o) => ({
 const mapFirm = (t) => ({
   id: t.id, name: t.name, short: t.short, address: t.address || "", trn: t.trn || "",
   phone: t.phone || "", email: t.email, accent: t.accent || "#1E6E56",
+  subscription: t.subscription || null,
   services: t.services || [],
   templates: Object.fromEntries(
     Object.entries(t.templates || {}).map(([k, v]) => [k, v ? { name: v.name, url: fileUrl(v.file_id) } : null])

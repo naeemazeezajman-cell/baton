@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
-from .routers import auth, clients, duties, files, notices, onboardings, payments, performance, proposals, tenants, users
+from .routers import auth, clients, duties, files, notices, onboardings, payments, performance, platform, proposals, tenants, users
 
 
 @asynccontextmanager
@@ -41,6 +41,7 @@ app.include_router(notices.router)
 app.include_router(clients.router)
 app.include_router(performance.router)
 app.include_router(files.router)
+app.include_router(platform.router)
 
 # VAT-ENGINE (separate, removable module — see REMOVING-VAT-ENGINE.md): delete these two lines to detach
 from .routers import vat_engine  # noqa: E402
