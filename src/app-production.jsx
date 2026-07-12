@@ -518,7 +518,7 @@ function Shell() {
               <Payments payments={payments} duePayments={duePayments} clients={clients} now={now} byId={byId} raiseInvoice={raiseInvoice} recordReceipt={recordReceipt} healthOf={healthOf} />
             )}
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
-            {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
+            {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} duties={duties} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
             {route.screen === "performance" && isMgr && <PerformanceScreen />}
             {route.screen === "vat" && <VatEngineScreen initialDutyId={route.dutyId || null} />} {/* VAT-ENGINE (removable) */}
             {route.screen === "onboarding" && route.id && <OnboardingView oid={route.id} me={me} byId={byId} back={() => setRoute({ screen: "dashboard" })} />}
@@ -1055,7 +1055,7 @@ function ProposalList({ proposals, byId, now, open }) {
 
 /* ================================================================== */
 
-function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
+function Clients({ clients, healthOf, byId, proposals, duties = [], now, openP, canPerf }) {
   const [perfOpen, setPerfOpen] = useState(null);
   const [docsOpen, setDocsOpen] = useState(null);
   return (
@@ -1070,19 +1070,27 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
         {clients.map((c) => {
           const h = healthOf(c.id);
           const engagements = proposals.filter((p) => p.clientId === c.id);
-          const team = [...new Map(engagements.flatMap((p) => Object.entries(p.el?.assignments || {}))).entries()];
+          const clientDuties = duties.filter((d) => d.clientId === c.id && !d.closed);
+          const preBaton = c.origin === "pre_baton";
+          const services = c.services.length ? c.services : [...new Set(clientDuties.map((d) => d.service))];
+          const team = engagements.length
+            ? [...new Map(engagements.flatMap((p) => Object.entries(p.el?.assignments || {}))).entries()]
+            : clientDuties.map((d) => [d.service, d.staffId]);
           return (
             <div key={c.id} className="border-b last:border-0" style={{ borderColor: "var(--line)" }}>
-            <div onClick={() => openP(c.pid)} role="button" tabIndex={0} className="w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left hover:bg-gray-50 items-center cursor-pointer">
+            <div onClick={() => c.pid && openP(c.pid)} role="button" tabIndex={0} className={`w-full grid grid-cols-[70px_1fr_190px_140px_120px_100px] gap-3 px-5 py-3.5 text-sm text-left items-center ${c.pid ? "hover:bg-gray-50 cursor-pointer" : "cursor-default"}`}>
             <span className="font-mono2 text-xs">{c.code}</span>
             <span className="font-medium truncate">{c.name}
-              {c.confirmationBasis && c.confirmationBasis !== "signed_upload" && (
+              {preBaton && (
+                <span className="ml-1.5 text-[10px] font-normal px-1.5 py-0.5 rounded-full align-middle whitespace-nowrap" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>pre-Baton client</span>
+              )}
+              {!preBaton && c.confirmationBasis && c.confirmationBasis !== "signed_upload" && (
                 <span className="ml-1.5 text-[10px] font-normal px-1.5 py-0.5 rounded-full align-middle whitespace-nowrap" style={{ background: "var(--paper)", color: "var(--mut)", border: "1px solid var(--line)" }}>confirmed without signed proposal</span>
               )}
               {c.unauditedOnFile && (
                 <span className="ml-1.5 text-[10px] font-bold px-1.5 py-0.5 rounded-full align-middle whitespace-nowrap" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>unaudited financials on file</span>
               )}
-              <div className="text-[11px] font-normal truncate" style={{ color: "var(--mut)" }}>{c.services.join(" · ")}</div></span>
+              <div className="text-[11px] font-normal truncate" style={{ color: "var(--mut)" }}>{services.join(" · ")}</div></span>
             <span className="text-[11px]" style={{ color: "var(--mut)" }}>
               {team.length === 0 ? "Unassigned" : team.map(([svc, uId]) => <div key={svc} className="truncate">{svc.split(" (")[0]}: <b style={{ color: "var(--ink)" }}>{byId(uId).name.split(" ")[0]}</b></div>)}
             </span>
@@ -1090,7 +1098,7 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
             <span className="font-mono2 text-xs" style={{ color: "var(--mut)" }}>{fmtD(c.engagedAt)}</span>
             <span className="text-[11px] px-2 py-0.5 rounded-full font-bold text-center" style={{ background: h.badge[1] + "18", color: h.badge[1] }}>{h.badge[0]}</span>
             </div>
-            {engagements.length > 0 && (
+            {engagements.length > 0 ? (
               <div className="px-5 pb-1 -mt-1 flex gap-1.5 flex-wrap items-center">
                 <span className="text-[10px] uppercase tracking-wider font-bold" style={{ color: "var(--mut)" }}>Engagements ({engagements.length})</span>
                 {engagements.map((p) => (
@@ -1099,7 +1107,11 @@ function Clients({ clients, healthOf, byId, proposals, now, openP, canPerf }) {
                   </button>
                 ))}
               </div>
-            )}
+            ) : preBaton ? (
+              <div className="px-5 pb-1 -mt-1 text-[11px]" style={{ color: "var(--mut)" }}>
+                Relationship predates Baton — engaged via deployment record. No proposal history.
+              </div>
+            ) : null}
             <div className="px-5 pb-2 flex gap-4">
               {canPerf && (
                 <button onClick={() => setPerfOpen(perfOpen === c.id ? null : c.id)} className="text-[11px] underline" style={{ color: "var(--mut)" }}>

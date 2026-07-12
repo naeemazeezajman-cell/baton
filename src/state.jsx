@@ -263,6 +263,7 @@ export function DataProvider({ me, firm: firmRaw, onFirmChanged, children }) {
       id: c.id, code: c.ref, name: c.name, contact: c.contact,
       pid: pr?.id || null, engagedAt: ms(c.created_at),
       confirmationBasis: c.confirmation_basis || null,
+      origin: c.origin || "proposal",
       unauditedOnFile: !!c.unaudited_on_file,
       services: pr ? (pr.versions.at(-1)?.data.lines || []).map((l) => l.service) : [],
     };

@@ -29,7 +29,7 @@ def list_clients(user: User = Depends(current_user), db: Session = Depends(get_d
     return [
         {"id": c.id, "ref": c.ref, "name": c.name, "contact": c.contact,
          "from_proposal": c.from_proposal, "confirmation_basis": c.confirmation_basis,
-         "unaudited_on_file": c.id in unaudited,
+         "origin": c.origin, "unaudited_on_file": c.id in unaudited,
          "created_at": c.created_at}
         for c in rows
     ]

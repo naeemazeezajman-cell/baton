@@ -294,8 +294,15 @@ def create_proposal(
             prospect[k] = prospect.get(k) or (existing_client.contact or {}).get(k)
     else:
         # duplicate-prospect guard: refuse while an open matter exists for the same prospect
-        # (case-insensitive, whitespace-normalized); prior lost matters only flag a warning
+        # (case-insensitive, whitespace-normalized); prior lost matters only flag a warning.
+        # A name matching an EXISTING client (any origin, incl. pre-Baton) is never a new
+        # prospect — point to Existing client mode instead.
         target = _norm_name(body.prospect.name)
+        existing_by_name = next((c for c in db.scalars(tenant_select(Client, user)).all()
+                                 if _norm_name(c.name) == target), None)
+        if existing_by_name:
+            raise conflict(f'"{body.prospect.name.strip()}" is an existing client '
+                           f"({existing_by_name.ref}) — use Existing client mode to add an engagement.")
         same_prospect = [
             x for x in db.scalars(tenant_select(Proposal, user)).all()
             if _norm_name((x.prospect or {}).get("name")) == target

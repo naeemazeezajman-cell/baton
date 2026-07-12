@@ -10,12 +10,17 @@ from sqlalchemy.orm import Session
 from .. import emails
 from ..config import get_settings
 from ..db import get_db
-from ..models import Duty, Tenant, User
+from ..models import Client, Duty, DutyEvent, Tenant, User
 from ..security import create_set_password_token, hash_password
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
 ROLES = ("Admin", "Manager", "Staff", "Accountant")
+PRE_BATON_BASIS = "pre-existing relationship (pre-Baton deployment)"
+
+
+def _norm_client(s: str | None) -> str:
+    return " ".join((s or "").split()).lower()
 
 
 class FirmIn(BaseModel):
@@ -94,6 +99,22 @@ def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
     db.add(tenant)
     db.flush()
 
+    # pre-Baton duty clients become first-class client rows: one per DISTINCT client name
+    # (case-insensitive, whitespace-collapsed) across every employee's pre-existing duties
+    clients_by_norm: dict[str, Client] = {}
+
+    def client_for(d: DutyIn) -> Client:
+        key = _norm_client(d.client_name)
+        c = clients_by_norm.get(key)
+        if c is None:
+            c = Client(tenant_id=tenant.id, ref=f"CL-{len(clients_by_norm) + 1:03d}",
+                       name=" ".join(d.client_name.split()), contact=d.contact,
+                       origin="pre_baton", confirmation_basis=PRE_BATON_BASIS)
+            db.add(c)
+            db.flush()
+            clients_by_norm[key] = c
+        return c
+
     out_users: list[BootstrapUserOut] = []
     for emp in body.employees:
         temp_password = secrets.token_urlsafe(9)
@@ -111,18 +132,28 @@ def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
         db.add(user)
         db.flush()
         for d in emp.duties:
-            db.add(
-                Duty(
-                    tenant_id=tenant.id,
-                    staff_id=user.id,
-                    client_name=d.client_name,
-                    service=d.service,
-                    kind=d.kind,
-                    cadence=d.cadence,
-                    next_due=d.next_due,
-                    contact=d.contact,
-                )
+            c = client_for(d)
+            duty = Duty(
+                tenant_id=tenant.id,
+                staff_id=user.id,
+                client_name=c.name,
+                client_id=c.id,
+                service=d.service,
+                kind=d.kind,
+                cadence=d.cadence,
+                next_due=d.next_due,
+                contact=d.contact,
             )
+            db.add(duty)
+            db.flush()
+            # same client name with a different contact: the client record keeps the FIRST
+            # contact; this duty's own contact stays on the duty — noted on the trail
+            if d.contact and c.contact and d.contact != c.contact:
+                db.add(DutyEvent(tenant_id=tenant.id, duty_id=duty.id, by_user=None,
+                                 text_=f"Linked to client {c.ref} — the client record keeps the contact "
+                                       f"from the first registered duty; this duty's own contact "
+                                       f"({d.contact.get('email') or d.contact.get('name') or 'on record'}) "
+                                       f"is retained on the duty."))
         link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(user)}"
         emails.send_invite(user.email, user.name, tenant.short, link, temp_password)
         out_users.append(
