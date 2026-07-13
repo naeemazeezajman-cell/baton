@@ -24,7 +24,7 @@ api/
   alembic/             # migrations (init from models)
   tests/               # pytest: auth, tenancy isolation, state machine
   requirements.txt
-  Dockerfile           # local parity; App Service uses Oryx build or container
+  Dockerfile           # production image — Azure Container Apps runs this (see prompts/PHASE-5-containerapps.md)
 ```
 
 ## Patterns Claude Code must follow
