@@ -254,6 +254,15 @@ def operator_created_admin(client, seats=3):
     return out, {"Authorization": f"Bearer {tokens['access_token']}"}
 
 
+def test_complete_setup_route_is_registered(client):
+    """Deploy-wiring guard: the wizard's endpoint must exist on the app under exactly this
+    path — a router-prefix change that silently unregisters it becomes a live 404."""
+    from app.main import app
+    assert "/tenants/complete-setup" in app.openapi()["paths"]
+    # and it is tenant-JWT-authorized: anonymous calls are rejected, not 404
+    assert client.post("/tenants/complete-setup", json=SETUP_PAYLOAD).status_code == 401
+
+
 def test_admin_completes_setup_after_operator_creation(client):
     out, headers = operator_created_admin(client)
     # operator-created firm starts unconfigured — the wizard gate keys off empty services

@@ -339,6 +339,8 @@ function CompleteSetupHost() {
       });
       setResult(out);
     } catch (e) {
+      // retry after a lost response: the server already completed setup — proceed, don't dead-end
+      if (e.status === 409 && /already complete/i.test(e.message)) return auth.reloadFirm();
       setErr(e.message);
     }
   };
