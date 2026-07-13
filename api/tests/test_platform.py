@@ -8,7 +8,7 @@ from sqlalchemy import text as sql
 
 from app.db import engine
 from app.security import hash_password
-from .conftest import bootstrap_tenant, login_after_reset
+from .conftest import BOOTSTRAP_PAYLOAD, bootstrap_tenant, login_after_reset
 
 MSG = "Your firm's Baton subscription is inactive — contact your administrator"
 
@@ -163,6 +163,64 @@ def test_subscription_changes_are_logged_with_note(client):
     # the firm detail shows the same events, still counts-only
     detail = client.get(f"/platform/firms/{boot['tenant_id']}", headers=op).json()
     assert any("annual contract signed" in e["text"] for e in detail["events"])
+
+
+CREATE_FIRM_PAYLOAD = {
+    "firm": {"name": "Beta Books LLC", "short": "BetaBooks", "email": "admin@betabooks.ae"},
+    "employees": [
+        {"name": "Admin One", "email": "admin@betabooks.ae", "role": "Admin", "signatory": True},
+        {"name": "Staffer Two", "email": "staff@betabooks.ae", "role": "Staff"},
+    ],
+    "subscription": {"plan_name": "Professional", "status": "active", "seats_limit": 5},
+}
+
+
+def test_operator_creates_firm_with_subscription(client):
+    op = op_headers(client)
+    r = client.post("/platform/firms", json=CREATE_FIRM_PAYLOAD, headers=op)
+    assert r.status_code == 201, r.text
+    out = r.json()
+    # temp passwords surface exactly once, for every created user
+    assert len(out["users"]) == 2 and all(u["temp_password"] for u in out["users"])
+    sub = out["subscription"]
+    assert sub["plan_name"] == "Professional" and sub["status"] == "active"
+    assert sub["seats_limit"] == 5
+    assert sub["current_period_end"] is None  # active with no period end = open-ended
+    # the firm shows up in the list with its subscription
+    firms = client.get("/platform/firms", headers=op).json()
+    firm = next(f for f in firms if f["name"] == "Beta Books LLC")
+    assert firm["subscription"]["status"] == "active" and firm["seats_used"] == 2
+    # creation is on the platform log, attributed to the operator
+    log = client.get("/platform/log", headers=op).json()
+    assert any("firm created" in e["text"] and "Beta Books" in e["text"] for e in log)
+    # the admin's temp password works and the forced-reset gate applies
+    admin = next(u for u in out["users"] if u["role"] == "Admin")
+    tokens = login_after_reset(client, admin["email"], admin["temp_password"])
+    assert tokens["access_token"]
+
+
+def test_create_firm_rejects_non_operator_tokens(client):
+    assert client.post("/platform/firms", json=CREATE_FIRM_PAYLOAD).status_code == 401
+    boot, tenant_headers = tenant_with_admin(client)
+    assert client.post("/platform/firms", json=CREATE_FIRM_PAYLOAD,
+                       headers=tenant_headers).status_code == 401
+    # a new firm can never start suspended/cancelled
+    op = op_headers(client)
+    bad = {**CREATE_FIRM_PAYLOAD, "subscription": {"status": "suspended"}}
+    assert client.post("/platform/firms", json=bad, headers=op).status_code == 422
+
+
+def test_bootstrap_key_gates_the_public_endpoint(client, monkeypatch):
+    monkeypatch.setenv("BOOTSTRAP_KEY", "top-secret-key")
+    assert client.post("/tenants/bootstrap", json=BOOTSTRAP_PAYLOAD).status_code == 403
+    assert client.post("/tenants/bootstrap", json=BOOTSTRAP_PAYLOAD,
+                       headers={"X-Bootstrap-Key": "wrong"}).status_code == 403
+    r = client.post("/tenants/bootstrap", json=BOOTSTRAP_PAYLOAD,
+                    headers={"X-Bootstrap-Key": "top-secret-key"})
+    assert r.status_code == 201, r.text
+    # the operator path is untouched by the key gate (it authenticates by operator JWT)
+    op = op_headers(client)
+    assert client.post("/platform/firms", json=CREATE_FIRM_PAYLOAD, headers=op).status_code == 201
 
 
 def test_operator_can_never_fetch_tenant_business_content(client):

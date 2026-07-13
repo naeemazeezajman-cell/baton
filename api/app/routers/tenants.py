@@ -3,7 +3,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -73,10 +73,11 @@ class BootstrapOut(BaseModel):
     users: list[BootstrapUserOut]
 
 
-@router.post("/bootstrap", response_model=BootstrapOut, status_code=201)
-def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
-    """One-time firm setup from the setup wizard. Returns each user's temp password ONCE —
-    they are stored only as bcrypt hashes."""
+def perform_bootstrap(body: BootstrapIn, db: Session) -> BootstrapOut:
+    """Shared firm-creation logic: tenant + trial subscription + users (temp passwords
+    returned ONCE, stored only as bcrypt hashes) + pre-Baton duties/clients. Flushes but
+    does NOT commit — the caller owns the transaction (the operator console adjusts the
+    subscription in the same transaction before committing)."""
     if db.scalar(select(Tenant).where(Tenant.email == str(body.firm.email))):
         raise HTTPException(status_code=409, detail="A tenant with this email already exists")
     for emp in body.employees:
@@ -168,8 +169,21 @@ def bootstrap(body: BootstrapIn, db: Session = Depends(get_db)):
             BootstrapUserOut(id=user.id, name=user.name, email=user.email, role=user.role, temp_password=temp_password)
         )
 
-    db.commit()
     return BootstrapOut(tenant_id=tenant.id, users=out_users)
+
+
+@router.post("/bootstrap", response_model=BootstrapOut, status_code=201)
+def bootstrap(body: BootstrapIn, db: Session = Depends(get_db),
+              x_bootstrap_key: str | None = Header(default=None)):
+    """One-time firm setup from the setup wizard. When env BOOTSTRAP_KEY is set (always, in
+    production) the X-Bootstrap-Key header must match — otherwise anyone could create firms.
+    The operator console creates firms via POST /platform/firms (operator JWT) instead."""
+    required = os.getenv("BOOTSTRAP_KEY", "")
+    if required and not secrets.compare_digest(x_bootstrap_key or "", required):
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Bootstrap-Key")
+    out = perform_bootstrap(body, db)
+    db.commit()
+    return out
 
 
 # ---------- firm settings (STRUCTURE.md: tenants.py — bootstrap, firm settings, catalog) ----------

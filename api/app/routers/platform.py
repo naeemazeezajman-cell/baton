@@ -20,6 +20,7 @@ from ..db import get_db
 from ..models import (Client, Duty, File, PlatformEvent, PlatformOperator, Proposal,
                       Subscription, Tenant, User)
 from ..security import bearer, hash_password, verify_password
+from .tenants import BootstrapIn, perform_bootstrap
 
 router = APIRouter(prefix="/platform", tags=["platform"])
 
@@ -199,6 +200,48 @@ def update_subscription(tenant_id: uuid.UUID, body: SubscriptionPatchIn,
                                f"{'; '.join(changes)} — note: \"{body.note.strip()}\""))
     db.commit()
     return {"tenant_id": tenant_id, "subscription": _serialize_subscription(sub)}
+
+
+# ---------- create firm (operator-authed bootstrap; BOOTSTRAP_KEY never leaves the server) ----------
+
+class FirmSubscriptionIn(BaseModel):
+    plan_name: str = "Trial"
+    status: str = "trial"  # a new firm starts trial or active — never suspended/cancelled
+    seats_limit: int = Field(default=10, ge=1)
+    current_period_end: datetime | None = None  # empty + active = open-ended (never expires)
+
+
+class FirmCreateIn(BootstrapIn):
+    subscription: FirmSubscriptionIn = Field(default_factory=FirmSubscriptionIn)
+
+
+@router.post("/firms", status_code=201)
+def create_firm(body: FirmCreateIn, op: PlatformOperator = Depends(current_operator),
+                db: Session = Depends(get_db)):
+    """Create a firm from the operator console. Reuses the bootstrap logic in-process (the
+    public /tenants/bootstrap key gate is not involved), then applies the operator's chosen
+    subscription in the same transaction. Temp passwords are returned ONCE — the console
+    must surface them, since email may not be configured."""
+    if body.subscription.status not in ("trial", "active"):
+        raise HTTPException(status_code=422, detail="a new firm starts as trial or active")
+    boot = perform_bootstrap(body, db)
+    sub = db.scalar(select(Subscription).where(Subscription.tenant_id == boot.tenant_id))
+    s = body.subscription
+    sub.plan_name = s.plan_name
+    sub.status = s.status
+    sub.seats_limit = max(s.seats_limit, len(body.employees))  # never below the head-count
+    if s.current_period_end is not None:
+        sub.current_period_end = s.current_period_end
+    elif s.status == "active":
+        sub.current_period_end = None  # open-ended until the operator sets a period
+    db.add(PlatformEvent(operator_id=op.id, tenant_id=boot.tenant_id,
+                         text_=f"{body.firm.name}: firm created by {op.email} — "
+                               f"plan {sub.plan_name}, {sub.status}, seats {sub.seats_limit}, "
+                               f"{len(boot.users)} user(s) invited"))
+    db.commit()
+    return {"tenant_id": boot.tenant_id,
+            "users": [u.model_dump() for u in boot.users],
+            "subscription": _serialize_subscription(sub)}
 
 
 @router.get("/log")

@@ -2,7 +2,7 @@
    its own token (scope=platform), its own fetch wrapper. NOTHING here can show tenant
    business content — the API only serves firm metadata, subscriptions and counts. */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const TOKEN_KEY = "baton.platform_token";
@@ -139,6 +139,8 @@ function Console({ email, logout, onAuthLost, onMustReset }) {
   const [tab, setTab] = useState("firms");
   const [firms, setFirms] = useState(null);
   const [detail, setDetail] = useState(null);
+  const [focusSub, setFocusSub] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [log, setLog] = useState(null);
   const [err, setErr] = useState("");
 
@@ -152,7 +154,16 @@ function Console({ email, logout, onAuthLost, onMustReset }) {
   useEffect(() => { loadFirms(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (tab === "log") loadLog(); }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const openFirm = (tid) => pfetch(`/platform/firms/${tid}`).then((d) => { setDetail(d); setErr(""); }).catch(guard);
+  const openFirm = (tid, focus = false) =>
+    pfetch(`/platform/firms/${tid}`).then((d) => { setDetail(d); setFocusSub(focus); setErr(""); }).catch(guard);
+
+  // suspend/reactivate straight from a row — same mandatory-note rule as the detail view
+  const quickStatus = (f, status, label) => {
+    const note = window.prompt(`${label} ${f.name} — mandatory note (logged):`);
+    if (!note?.trim()) return;
+    pfetch(`/platform/firms/${f.tenant_id}/subscription`, { method: "PATCH", json: { status, note: note.trim() } })
+      .then(() => { setErr(""); loadFirms(); }).catch(guard);
+  };
 
   return (
     <div className="max-w-5xl mx-auto px-6 py-8">
@@ -172,9 +183,22 @@ function Console({ email, logout, onAuthLost, onMustReset }) {
       {err && <div className="mt-4 text-xs px-3 py-2 rounded-md" style={{ background: C.red + "22", color: C.red }}>{err}</div>}
 
       {detail ? (
-        <FirmDetail d={detail} back={() => { setDetail(null); loadFirms(); }} reload={() => openFirm(detail.tenant_id)} guard={guard} />
+        <FirmDetail d={detail} back={() => { setDetail(null); setFocusSub(false); loadFirms(); }}
+          reload={() => openFirm(detail.tenant_id, focusSub)} guard={guard} focusSub={focusSub} />
       ) : tab === "firms" ? (
-        <FirmsList firms={firms} open={openFirm} />
+        creating ? (
+          <CreateFirm guard={guard}
+            done={(tid) => { setCreating(false); loadFirms(); if (tid) openFirm(tid); }}
+            cancel={() => setCreating(false)} />
+        ) : (
+          <>
+            <div className="mt-4 flex justify-end">
+              <button onClick={() => setCreating(true)} className="px-4 py-2 rounded-lg text-sm font-semibold"
+                style={{ background: C.accent, color: "#08131f" }}>+ Create firm</button>
+            </div>
+            <FirmsList firms={firms} open={openFirm} quick={quickStatus} />
+          </>
+        )
       ) : (
         <LogView log={log} />
       )}
@@ -194,36 +218,52 @@ function StatCell({ label, value }) {
   );
 }
 
-function FirmsList({ firms, open }) {
+function RowAction({ color = null, onClick, children }) {
+  return (
+    <button onClick={onClick} className="px-2.5 py-1 rounded-md text-[11px] font-semibold border"
+      style={{ borderColor: color || C.line, color: color || C.ink }}>{children}</button>
+  );
+}
+
+function FirmsList({ firms, open, quick }) {
   if (!firms) return <div className="mt-6 text-sm" style={{ color: C.mut }}>Loading firms…</div>;
   return (
-    <div className="mt-4 space-y-2">
+    <div className="mt-2 space-y-2">
       {firms.map((f) => (
-        <button key={f.tenant_id} onClick={() => open(f.tenant_id)} className="w-full text-left rounded-xl border p-4 flex items-center gap-4 hover:brightness-110" style={{ background: C.panel, borderColor: C.line }}>
-          <span className="flex-1 min-w-0">
+        <div key={f.tenant_id} className="rounded-xl border p-4 flex items-center gap-4" style={{ background: C.panel, borderColor: C.line }}>
+          <button onClick={() => open(f.tenant_id)} className="flex-1 min-w-0 text-left hover:brightness-110">
             <div className="font-semibold truncate">{f.name} <span className="font-normal text-xs" style={{ color: C.mut }}>({f.short})</span></div>
             <div className="text-[11px] mt-0.5 flex items-center gap-2 flex-wrap" style={{ color: C.mut }}>
               <SubChip sub={f.subscription} />
               <span>since {fmtD(f.created_at)}</span>
               <span>seats {f.seats_used}/{f.subscription?.seats_limit ?? "—"}</span>
             </div>
-          </span>
-          <span className="hidden sm:flex gap-5">
+          </button>
+          <span className="hidden lg:flex gap-5">
             <StatCell label="active 7d" value={f.stats.active_users_7d} />
             <StatCell label="open props" value={f.stats.open_proposals} />
             <StatCell label="open duties" value={f.stats.open_duties} />
             <StatCell label="filings" value={f.stats.filings_in_progress} />
             <StatCell label="storage" value={fmtBytes(f.stats.storage_bytes)} />
           </span>
-        </button>
+          <span className="flex flex-col sm:flex-row gap-1.5 shrink-0">
+            <RowAction onClick={() => open(f.tenant_id)}>View</RowAction>
+            <RowAction onClick={() => open(f.tenant_id, true)}>Subscription</RowAction>
+            {f.subscription?.status === "suspended"
+              ? <RowAction color={C.accent} onClick={() => quick(f, "active", "Reactivate")}>Reactivate…</RowAction>
+              : <RowAction color={C.red} onClick={() => quick(f, "suspended", "Suspend")}>Suspend…</RowAction>}
+          </span>
+        </div>
       ))}
-      {firms.length === 0 && <div className="mt-6 text-sm" style={{ color: C.mut }}>No firms yet.</div>}
+      {firms.length === 0 && <div className="mt-6 text-sm" style={{ color: C.mut }}>No firms yet — create the first one.</div>}
     </div>
   );
 }
 
-function FirmDetail({ d, back, reload, guard }) {
+function FirmDetail({ d, back, reload, guard, focusSub }) {
   const sub = d.subscription;
+  const subRef = useRef(null);
+  useEffect(() => { if (focusSub) subRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }); }, [focusSub]);
   const [form, setForm] = useState({
     plan_name: sub?.plan_name || "Trial", status: sub?.status || "trial",
     seats_limit: sub?.seats_limit || 10,
@@ -266,7 +306,7 @@ function FirmDetail({ d, back, reload, guard }) {
           <StatCell label="storage" value={fmtBytes(d.stats.storage_bytes)} />
         </div>
 
-        <div className="mt-5 border-t pt-4" style={{ borderColor: C.line }}>
+        <div ref={subRef} className="mt-5 border-t pt-4" style={{ borderColor: C.line }}>
           <div className="text-[11px] uppercase tracking-wider font-bold mb-2" style={{ color: C.mut }}>Subscription</div>
           <div className="flex gap-2 flex-wrap items-end">
             <label className="text-[10px]" style={{ color: C.mut }}>Plan
@@ -300,6 +340,125 @@ function FirmDetail({ d, back, reload, guard }) {
           {(d.events || []).length === 0 && <div className="text-xs" style={{ color: C.mut }}>No operator actions yet.</div>}
         </div>
       </div>
+    </div>
+  );
+}
+
+const ROLES = ["Admin", "Manager", "Staff", "Accountant"];
+
+function CreateFirm({ done, cancel, guard }) {
+  const [f, setF] = useState({ name: "", short: "", adminName: "", adminEmail: "" });
+  const [emps, setEmps] = useState([]); // extra employees beyond the admin
+  const [sub, setSub] = useState({ plan_name: "Trial", status: "trial", seats_limit: 10, current_period_end: "" });
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null); // {tenant_id, users:[{..temp_password}]}
+
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const setEmp = (i, k) => (e) => setEmps(emps.map((r, j) => (j === i ? { ...r, [k]: e.target.value } : r)));
+  const valid = f.name.trim() && f.short.trim() && f.adminName.trim() && /.+@.+\..+/.test(f.adminEmail)
+    && emps.every((r) => r.name.trim() && /.+@.+\..+/.test(r.email));
+
+  const submit = async () => {
+    setBusy(true);
+    try {
+      const out = await pfetch("/platform/firms", {
+        method: "POST",
+        json: {
+          firm: { name: f.name.trim(), short: f.short.trim(), email: f.adminEmail.trim() },
+          employees: [
+            { name: f.adminName.trim(), email: f.adminEmail.trim(), role: "Admin", signatory: true },
+            ...emps.map((r) => ({ name: r.name.trim(), email: r.email.trim(), role: r.role })),
+          ],
+          subscription: {
+            plan_name: sub.plan_name.trim() || "Trial", status: sub.status,
+            seats_limit: Number(sub.seats_limit) || 1,
+            current_period_end: sub.current_period_end ? new Date(sub.current_period_end + "T23:59:59Z").toISOString() : null,
+          },
+        },
+      });
+      setResult(out);
+    } catch (e) { guard(e); } finally { setBusy(false); }
+  };
+
+  if (result) {
+    return (
+      <div className="mt-4 rounded-xl border p-5" style={{ background: C.panel, borderColor: C.accent }}>
+        <div className="text-sm font-bold" style={{ color: C.accent }}>Firm created — one-time temporary passwords</div>
+        <div className="text-xs mt-1 mb-3" style={{ color: C.mut }}>
+          Shown ONCE and never again (stored only as hashes). Copy them now — invite emails were
+          sent only if email delivery is configured. Every user must reset on first login.
+        </div>
+        {result.users.map((u) => (
+          <div key={u.id} className="flex items-center gap-3 py-1.5 border-b last:border-0 text-xs" style={{ borderColor: C.line }}>
+            <span className="w-40 truncate font-semibold">{u.name}</span>
+            <span className="w-16" style={{ color: C.mut }}>{u.role}</span>
+            <span className="flex-1 truncate" style={{ color: C.mut }}>{u.email}</span>
+            <code className="font-mono px-2 py-0.5 rounded" style={{ background: "#0E1626", color: C.amber }}>{u.temp_password}</code>
+          </div>
+        ))}
+        <button onClick={() => done(result.tenant_id)} className="mt-4 px-4 py-2 rounded-lg text-sm font-semibold"
+          style={{ background: C.accent, color: "#08131f" }}>I've copied the passwords — open the firm</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 rounded-xl border p-5" style={{ background: C.panel, borderColor: C.line }}>
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-bold">Create firm</h2>
+        <button onClick={cancel} className="text-xs underline" style={{ color: C.mut }}>cancel</button>
+      </div>
+
+      <div className="mt-3 grid sm:grid-cols-2 gap-3">
+        <label className="text-[10px]" style={{ color: C.mut }}>Firm name
+          <input value={f.name} onChange={set("name")} className={inputCls + " mt-1"} style={inputStyle} placeholder="AlphaLedger Accounting & Tax Consultancy LLC" /></label>
+        <label className="text-[10px]" style={{ color: C.mut }}>Short name
+          <input value={f.short} onChange={set("short")} className={inputCls + " mt-1"} style={inputStyle} placeholder="AlphaLedger" /></label>
+        <label className="text-[10px]" style={{ color: C.mut }}>Admin contact name
+          <input value={f.adminName} onChange={set("adminName")} className={inputCls + " mt-1"} style={inputStyle} /></label>
+        <label className="text-[10px]" style={{ color: C.mut }}>Admin email <span style={{ color: C.mut }}>(also the firm's contact email)</span>
+          <input type="email" value={f.adminEmail} onChange={set("adminEmail")} className={inputCls + " mt-1"} style={inputStyle} /></label>
+      </div>
+
+      <div className="mt-5 border-t pt-4" style={{ borderColor: C.line }}>
+        <div className="text-[11px] uppercase tracking-wider font-bold mb-2" style={{ color: C.mut }}>
+          Initial employees <span className="normal-case font-normal">— the admin above is created automatically</span>
+        </div>
+        {emps.map((r, i) => (
+          <div key={i} className="flex gap-2 mb-2 items-center">
+            <input value={r.name} onChange={setEmp(i, "name")} placeholder="Name" className={inputCls + " flex-1"} style={inputStyle} />
+            <input type="email" value={r.email} onChange={setEmp(i, "email")} placeholder="Email" className={inputCls + " flex-1"} style={inputStyle} />
+            <select value={r.role} onChange={setEmp(i, "role")} className={inputCls + " w-32"} style={inputStyle}>
+              {ROLES.map((x) => <option key={x}>{x}</option>)}
+            </select>
+            <button onClick={() => setEmps(emps.filter((_, j) => j !== i))} className="text-xs px-2" style={{ color: C.red }}>✕</button>
+          </div>
+        ))}
+        <button onClick={() => setEmps([...emps, { name: "", email: "", role: "Staff" }])}
+          className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: C.line, color: C.ink }}>+ Add employee</button>
+      </div>
+
+      <div className="mt-5 border-t pt-4" style={{ borderColor: C.line }}>
+        <div className="text-[11px] uppercase tracking-wider font-bold mb-2" style={{ color: C.mut }}>Initial subscription</div>
+        <div className="flex gap-2 flex-wrap items-end">
+          <label className="text-[10px]" style={{ color: C.mut }}>Plan
+            <input value={sub.plan_name} onChange={(e) => setSub({ ...sub, plan_name: e.target.value })} className={inputCls + " mt-1 w-32"} style={inputStyle} /></label>
+          <label className="text-[10px]" style={{ color: C.mut }}>Status
+            <select value={sub.status} onChange={(e) => setSub({ ...sub, status: e.target.value })} className={inputCls + " mt-1 w-32"} style={inputStyle}>
+              <option value="trial">trial</option><option value="active">active</option>
+            </select></label>
+          <label className="text-[10px]" style={{ color: C.mut }}>Seats
+            <input type="number" min="1" value={sub.seats_limit} onChange={(e) => setSub({ ...sub, seats_limit: e.target.value })} className={inputCls + " mt-1 w-20"} style={inputStyle} /></label>
+          <label className="text-[10px]" style={{ color: C.mut }}>Period end
+            <input type="date" value={sub.current_period_end} onChange={(e) => setSub({ ...sub, current_period_end: e.target.value })} className={inputCls + " mt-1 w-40"} style={inputStyle} /></label>
+        </div>
+        <div className="mt-1 text-[10px]" style={{ color: C.mut }}>
+          Leave period end empty: trial defaults to 30 days; active runs open-ended until you set one.
+        </div>
+      </div>
+
+      <button disabled={busy || !valid} onClick={submit} className="mt-5 px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-40"
+        style={{ background: C.accent, color: "#08131f" }}>{busy ? "Creating…" : "Create firm"}</button>
     </div>
   );
 }
