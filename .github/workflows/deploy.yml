@@ -26,8 +26,16 @@ jobs:
       - run: npm ci
       - run: npm run build:demo # the public portfolio site keeps serving the in-memory demo at /baton/
       - run: npm run build:prod-pages -- --outDir dist/app # API-backed production app at /baton/app/
-      # Pages has no SPA fallback: /baton/app/platform must resolve to a real file
-      - run: mkdir -p dist/app/platform && cp dist/app/index.html dist/app/platform/index.html
+      # Pages has no SPA fallback and only honors 404.html at the SITE root (a 404.html
+      # inside dist/app/ is ignored) — so the prod app's index.html becomes the site-wide
+      # 404 page; its asset URLs are absolute (/baton/app/...), so it works from any path.
+      # The platform/index.html copy additionally makes the canonical console URL a real
+      # file (HTTP 200 instead of a 404-status fallback).
+      - run: |
+          mkdir -p dist/app/platform
+          cp dist/app/index.html dist/app/platform/index.html
+          cp dist/app/index.html dist/404.html
+          touch dist/.nojekyll
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

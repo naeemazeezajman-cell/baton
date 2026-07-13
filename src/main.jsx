@@ -4,11 +4,12 @@ import "./index.css";
 
 // VITE_DEMO_MODE=true → the self-contained in-memory demo (the public portfolio site).
 // Production build → the API-backed app (real login, server state).
-// <base>/platform → the Platform Operator console (the developer's own login above all tenants).
-// BASE_URL is "/" on a root-domain deploy and "/baton/app/" on GitHub Pages, so the
-// console is reachable at /platform and /baton/app/platform respectively.
+// A "platform" path segment → the Platform Operator console (the developer's own login
+// above all tenants). Segment match instead of a prefix check so it works at /platform on
+// a root-domain deploy AND /baton/app/platform under the GitHub Pages base path — including
+// when Pages serves the route via the 404.html SPA fallback.
 const DEMO = import.meta.env.VITE_DEMO_MODE === "true";
-const PLATFORM = window.location.pathname.startsWith(import.meta.env.BASE_URL + "platform");
+const PLATFORM = window.location.pathname.split("/").includes("platform");
 const App = lazy(() =>
   PLATFORM ? import("./platform/index.jsx")
     : DEMO ? import("./baton-prototype.jsx") : import("./app-production.jsx"));
