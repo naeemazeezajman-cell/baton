@@ -344,19 +344,14 @@ function FirmDetail({ d, back, reload, guard, focusSub }) {
   );
 }
 
-const ROLES = ["Admin", "Manager", "Staff", "Accountant"];
-
 function CreateFirm({ done, cancel, guard }) {
   const [f, setF] = useState({ name: "", short: "", adminName: "", adminEmail: "" });
-  const [emps, setEmps] = useState([]); // extra employees beyond the admin
   const [sub, setSub] = useState({ plan_name: "Trial", status: "trial", seats_limit: 10, current_period_end: "" });
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null); // {tenant_id, users:[{..temp_password}]}
 
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
-  const setEmp = (i, k) => (e) => setEmps(emps.map((r, j) => (j === i ? { ...r, [k]: e.target.value } : r)));
-  const valid = f.name.trim() && f.short.trim() && f.adminName.trim() && /.+@.+\..+/.test(f.adminEmail)
-    && emps.every((r) => r.name.trim() && /.+@.+\..+/.test(r.email));
+  const valid = f.name.trim() && f.short.trim() && f.adminName.trim() && /.+@.+\..+/.test(f.adminEmail);
 
   const submit = async () => {
     setBusy(true);
@@ -365,10 +360,8 @@ function CreateFirm({ done, cancel, guard }) {
         method: "POST",
         json: {
           firm: { name: f.name.trim(), short: f.short.trim(), email: f.adminEmail.trim() },
-          employees: [
-            { name: f.adminName.trim(), email: f.adminEmail.trim(), role: "Admin", signatory: true },
-            ...emps.map((r) => ({ name: r.name.trim(), email: r.email.trim(), role: r.role })),
-          ],
+          // only the seed Admin — they add employees themselves in the setup wizard
+          employees: [{ name: f.adminName.trim(), email: f.adminEmail.trim(), role: "Admin", signatory: true }],
           subscription: {
             plan_name: sub.plan_name.trim() || "Trial", status: sub.status,
             seats_limit: Number(sub.seats_limit) || 1,
@@ -420,22 +413,9 @@ function CreateFirm({ done, cancel, guard }) {
           <input type="email" value={f.adminEmail} onChange={set("adminEmail")} className={inputCls + " mt-1"} style={inputStyle} /></label>
       </div>
 
-      <div className="mt-5 border-t pt-4" style={{ borderColor: C.line }}>
-        <div className="text-[11px] uppercase tracking-wider font-bold mb-2" style={{ color: C.mut }}>
-          Initial employees <span className="normal-case font-normal">— the admin above is created automatically</span>
-        </div>
-        {emps.map((r, i) => (
-          <div key={i} className="flex gap-2 mb-2 items-center">
-            <input value={r.name} onChange={setEmp(i, "name")} placeholder="Name" className={inputCls + " flex-1"} style={inputStyle} />
-            <input type="email" value={r.email} onChange={setEmp(i, "email")} placeholder="Email" className={inputCls + " flex-1"} style={inputStyle} />
-            <select value={r.role} onChange={setEmp(i, "role")} className={inputCls + " w-32"} style={inputStyle}>
-              {ROLES.map((x) => <option key={x}>{x}</option>)}
-            </select>
-            <button onClick={() => setEmps(emps.filter((_, j) => j !== i))} className="text-xs px-2" style={{ color: C.red }}>✕</button>
-          </div>
-        ))}
-        <button onClick={() => setEmps([...emps, { name: "", email: "", role: "Staff" }])}
-          className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: C.line, color: C.ink }}>+ Add employee</button>
+      <div className="mt-2 text-[11px]" style={{ color: C.mut }}>
+        The admin signs in with a one-time password, is forced to reset it, and lands in the
+        setup wizard — firm details, activities, employees, roles and signatures are self-served.
       </div>
 
       <div className="mt-5 border-t pt-4" style={{ borderColor: C.line }}>

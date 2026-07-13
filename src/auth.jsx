@@ -67,7 +67,7 @@ export function AuthProvider({ children }) {
 
 const inputCls = "mt-1 w-full border rounded-md px-3 py-2 text-sm";
 
-export function LoginScreen({ onSetup }) {
+export function LoginScreen() {
   const { login } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -104,9 +104,6 @@ export function LoginScreen({ onSetup }) {
             {busy ? "Signing in…" : "Sign in"}
           </button>
         </div>
-        <button onClick={onSetup} className="mt-5 text-[11px] underline" style={{ color: "#5D7288" }}>
-          First deployment? Set up your firm
-        </button>
       </div>
     </div>
   );

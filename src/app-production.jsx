@@ -253,14 +253,7 @@ export default function App() {
 
 function Gate() {
   const auth = useAuth();
-  const [setupMode, setSetupMode] = useState(false);
 
-  if (setupMode)
-    return (
-      <Frame accent="#1E6E56">
-        <SetupWizardHost onCancel={() => setSetupMode(false)} />
-      </Frame>
-    );
   if (auth.status === "loading")
     return (
       <Frame accent="#1E6E56">
@@ -278,7 +271,15 @@ function Gate() {
   if (auth.status !== "authed" || !auth.me)
     return (
       <Frame accent="#1E6E56">
-        <LoginScreen onSetup={() => setSetupMode(true)} />
+        <LoginScreen />
+      </Frame>
+    );
+  // Operator-created firm, not yet set up (no activities configured): the Admin lands in
+  // the wizard right after the forced reset and self-serves the whole configuration.
+  if (auth.me.role === "Admin" && (auth.firm?.services || []).length === 0)
+    return (
+      <Frame accent="#1E6E56">
+        <CompleteSetupHost />
       </Frame>
     );
   return (
@@ -288,9 +289,11 @@ function Gate() {
   );
 }
 
-/* First deployment — the wizard UI is verbatim; completion POSTs /tenants/bootstrap and
-   shows the server-issued temporary credentials exactly once. */
-function SetupWizardHost({ onCancel }) {
+/* First Admin login on an operator-created firm — the wizard UI is verbatim; completion
+   POSTs /tenants/complete-setup (Admin JWT) to configure the EXISTING tenant, and shows
+   the server-issued temporary credentials for NEW employees exactly once. */
+function CompleteSetupHost() {
+  const auth = useAuth();
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
 
@@ -300,6 +303,7 @@ function SetupWizardHost({ onCancel }) {
       const sigOf = async (u) => {
         if (!u.sigSpecimen) return null;
         if (u.sigSpecimen.type === "typed") return { type: "typed", text: u.sigSpecimen.text };
+        if (u.sigSpecimen.url?.startsWith("data:")) return { type: "image", url: u.sigSpecimen.url };
         const raw = rawFromUrl(u.sigSpecimen.url);
         if (!raw) return null;
         const dataUrl = await new Promise((res, rej) => {
@@ -322,7 +326,7 @@ function SetupWizardHost({ onCancel }) {
           })),
         });
       }
-      const out = await api.public.post("/tenants/bootstrap", {
+      const out = await api.post("/tenants/complete-setup", {
         firm: {
           name: newFirm.name, short: newFirm.short, address: newFirm.address || null,
           trn: newFirm.trn || null, phone: newFirm.phone || null, email: newFirm.email, accent: newFirm.accent,
@@ -343,9 +347,11 @@ function SetupWizardHost({ onCancel }) {
     return (
       <div className="min-h-screen py-10 px-6" style={{ background: "var(--paper)" }}>
         <div className="max-w-3xl mx-auto">
-          <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>🚀 Firm deployed — credentials issued</h1>
+          <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>🚀 {result.users.length ? "Setup complete — credentials issued" : "Setup complete"}</h1>
           <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>
-            Invite emails with these temporary passwords were sent to every employee. They are shown here <b>once</b> — passwords are stored hashed and cannot be recovered. First login forces a reset.
+            {result.users.length
+              ? <>Invite emails with these temporary passwords were sent to the new employees. They are shown here <b>once</b> — passwords are stored hashed and cannot be recovered. First login forces a reset.</>
+              : <>Your firm is configured. You can add employees any time under Admin → Employees & roles.</>}
           </p>
           <div className="mt-5 space-y-1.5">
             {result.users.map((u) => (
@@ -355,12 +361,27 @@ function SetupWizardHost({ onCancel }) {
               </div>
             ))}
           </div>
-          <button onClick={onCancel} className="mt-6 px-5 py-2.5 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
-            Go to login →
+          <button onClick={() => auth.reloadFirm()} className="mt-6 px-5 py-2.5 rounded-lg text-white text-sm font-semibold" style={{ background: "var(--accent)" }}>
+            Enter Baton →
           </button>
         </div>
       </div>
     );
+
+  const sig = auth.me.sig_specimen;
+  const initial = {
+    firm: {
+      name: auth.firm?.name || "", short: auth.firm?.short || "", address: auth.firm?.address || "",
+      trn: auth.firm?.trn || "", phone: auth.firm?.phone || "", email: auth.firm?.email || "",
+      accent: auth.firm?.accent || "#1E6E56",
+    },
+    emps: [{
+      id: uid(), name: auth.me.name, designation: auth.me.designation || "", email: auth.me.email,
+      role: "Admin", tempPw: "", signatory: !!auth.me.signatory,
+      sig: sig ? (sig.type === "typed" ? { type: "typed", text: sig.text } : { type: "image", url: sig.url }) : null,
+      acts: [], actsOpen: false, locked: true,
+    }],
+  };
 
   return (
     <>
@@ -369,7 +390,8 @@ function SetupWizardHost({ onCancel }) {
           <div className="text-sm px-3 py-2.5 rounded-lg font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>⚠️ {err}</div>
         </div>
       )}
-      <SetupWizard onCancel={onCancel} onDone={deploy} />
+      <SetupWizard onCancel={auth.logout} cancelLabel="Log out" onDone={deploy} initial={initial}
+        seatsLimit={auth.firm?.subscription?.seats_limit ?? null} />
     </>
   );
 }
@@ -596,33 +618,6 @@ function Bell({ notices, onRead }) {
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function Login({ users, firm, onPick, onSetup }) {
-  return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: "var(--ink)" }}>
-      <div className="w-full max-w-2xl px-6 py-10">
-        <div className="font-disp text-white text-3xl tracking-tight">{firm.short}</div>
-        <div className="mt-1 text-sm" style={{ color: "#8FA3B8" }}>{firm.name} · Sign in <span className="opacity-60">(prototype — pick a user to simulate their login)</span></div>
-        <div className="mt-8 grid grid-cols-2 gap-3">
-          {users.map((u) => (
-            <button key={u.id} onClick={() => onPick(u)} className="text-left p-4 rounded-xl bg-white/95 hover:bg-white transition group">
-              <div className="flex items-center justify-between">
-                <div className="font-semibold">{u.name}</div>
-                <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{u.role}</span>
-              </div>
-              <div className="text-xs mt-1" style={{ color: "var(--mut)" }}>{u.designation} · {u.email}</div>
-              <div className="text-[11px] mt-3 font-medium opacity-0 group-hover:opacity-100 transition" style={{ color: "var(--accent)" }}>Sign in →</div>
-            </button>
-          ))}
-        </div>
-        <div className="mt-6 flex items-center justify-between text-[11px]" style={{ color: "#5D7288" }}>
-          <span>In production: email + password, forced reset on first login, optional 2FA, session timeout, full login audit.</span>
-          <button onClick={onSetup} className="underline whitespace-nowrap ml-4" style={{ color: "#5D7288" }}>Re-deploy: set up a different firm</button>
-        </div>
-      </div>
     </div>
   );
 }
@@ -3523,21 +3518,22 @@ function ActAdder({ onAdd }) {
   );
 }
 
-function SetupWizard({ onCancel, onDone }) {
+function SetupWizard({ onCancel, onDone, initial = null, seatsLimit = null, cancelLabel = "Cancel setup" }) {
   const [step, setStep] = useState(1);
-  const [f, setF] = useState({ name: "", short: "", address: "", trn: "", phone: "", email: "", accent: "#1E6E56" });
-  const [emps, setEmps] = useState([{ id: uid(), name: "", designation: "", email: "", role: "", tempPw: genTempPw(), signatory: false, sig: null, acts: [], actsOpen: false }]);
+  const [f, setF] = useState(initial?.firm ?? { name: "", short: "", address: "", trn: "", phone: "", email: "", accent: "#1E6E56" });
+  const [emps, setEmps] = useState(initial?.emps ?? [{ id: uid(), name: "", designation: "", email: "", role: "", tempPw: genTempPw(), signatory: false, sig: null, acts: [], actsOpen: false }]);
   const [services, setServices] = useState([...SERVICES]);
   const [newSvc, setNewSvc] = useState("");
   const [templates, setTemplates] = useState({ letterhead: null, proposal: null, el: null });
 
   const setEmp = (id, patch) => setEmps((es) => es.map((e) => (e.id === id ? { ...e, ...patch } : e)));
   const validEmp = (e) => e.name.trim() && e.email.trim();
+  const overSeats = seatsLimit != null && emps.length > seatsLimit;
 
   const stepOK = {
     1: f.name.trim() && f.short.trim() && f.email.trim(),
     2: services.length > 0,
-    3: emps.length > 0 && emps.every(validEmp),
+    3: emps.length > 0 && emps.every(validEmp) && !overSeats,
     4: emps.every((e) => e.role) && emps.some((e) => e.role === "Admin"),
     5: true, // credentials are issued server-side at deployment — nothing to do here
     6: emps.filter((e) => e.signatory).length >= 1 && emps.filter((e) => e.signatory).every((e) => e.sig),
@@ -3555,7 +3551,7 @@ function SetupWizard({ onCancel, onDone }) {
       <div className="max-w-3xl mx-auto">
         <div className="flex items-center justify-between">
           <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>First deployment — firm setup</h1>
-          <button onClick={onCancel} className="text-xs underline" style={{ color: "var(--mut)" }}>Cancel setup</button>
+          <button onClick={onCancel} className="text-xs underline" style={{ color: "var(--mut)" }}>{cancelLabel}</button>
         </div>
         <div className="mt-4 flex items-center gap-2 text-[11px] font-medium">
           {STEPS.map((s, i) => (
@@ -3628,11 +3624,11 @@ function SetupWizard({ onCancel, onDone }) {
                   <div className="flex gap-2 items-center">
                     <input placeholder="Full name *" value={e.name} onChange={(ev) => setEmp(e.id, { name: ev.target.value })} className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
                     <input placeholder="Designation" value={e.designation} onChange={(ev) => setEmp(e.id, { designation: ev.target.value })} className="w-40 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
-                    <input placeholder="Work email *" value={e.email} onChange={(ev) => setEmp(e.id, { email: ev.target.value })} className="w-52 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+                    <input placeholder="Work email *" value={e.email} disabled={!!e.locked} title={e.locked ? "Your own account — email cannot change during setup" : undefined} onChange={(ev) => setEmp(e.id, { email: ev.target.value })} className="w-52 border rounded-md px-3 py-2 text-sm disabled:opacity-60" style={{ borderColor: "var(--line)" }} />
                     <button onClick={() => setEmp(e.id, { actsOpen: !e.actsOpen })} className="px-2.5 py-2 rounded-md border text-xs font-medium whitespace-nowrap" style={{ borderColor: (e.acts || []).length ? "var(--accent)" : "var(--line)", color: (e.acts || []).length ? "var(--accent)" : "var(--mut)" }}>
                       Duties ({(e.acts || []).length}) {e.actsOpen ? "▾" : "▸"}
                     </button>
-                    {emps.length > 1 && <button onClick={() => setEmps(emps.filter((x) => x.id !== e.id))} style={{ color: "var(--red)" }}>×</button>}
+                    {emps.length > 1 && !e.locked && <button onClick={() => setEmps(emps.filter((x) => x.id !== e.id))} style={{ color: "var(--red)" }}>×</button>}
                   </div>
                   {e.actsOpen && (
                     <div className="mt-2 pt-2 border-t" style={{ borderColor: "var(--line)" }}>
@@ -3650,6 +3646,13 @@ function SetupWizard({ onCancel, onDone }) {
               ))}
             </div>
             <button onClick={() => setEmps([...emps, { id: uid(), name: "", designation: "", email: "", role: "", tempPw: genTempPw(), signatory: false, sig: null, acts: [], actsOpen: false }])} className="mt-3 px-3 py-2 rounded-md border text-sm font-medium" style={{ borderColor: "var(--line)" }}>+ Add employee</button>
+            {seatsLimit != null && (
+              <div className="mt-3 text-[11px] px-2.5 py-2 rounded-md font-medium" style={overSeats ? { background: "var(--red-soft)", color: "var(--red)" } : { background: "var(--accent-soft)", color: "var(--accent)" }}>
+                {emps.length}/{seatsLimit} seats — {overSeats
+                  ? "over your subscription's seat limit. Remove employees, or ask the platform operator to raise it."
+                  : "your subscription's seat limit."}
+              </div>
+            )}
           </Card>
         )}
 
@@ -3658,9 +3661,9 @@ function SetupWizard({ onCancel, onDone }) {
             <div className="space-y-2">
               {emps.map((e) => (
                 <div key={e.id} className="flex gap-3 items-center text-sm">
-                  <span className="flex-1 font-medium">{e.name || "—"} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>{e.email}</span></span>
+                  <span className="flex-1 font-medium">{e.name || "—"} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>{e.email}{e.locked && " · you"}</span></span>
                   {["Admin", "Manager", "Staff", "Accountant"].map((r) => (
-                    <button key={r} onClick={() => setEmp(e.id, { role: r, signatory: r === "Admin" || r === "Manager" ? true : e.signatory })} className="px-2.5 py-1.5 rounded-full text-xs font-medium border" style={e.role === r ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { borderColor: "var(--line)", color: "var(--mut)" }}>{r}</button>
+                    <button key={r} disabled={!!e.locked} title={e.locked ? "Your own role stays Admin during setup" : undefined} onClick={() => setEmp(e.id, { role: r, signatory: r === "Admin" || r === "Manager" ? true : e.signatory })} className="px-2.5 py-1.5 rounded-full text-xs font-medium border disabled:opacity-50" style={e.role === r ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" } : { borderColor: "var(--line)", color: "var(--mut)" }}>{r}</button>
                   ))}
                 </div>
               ))}
@@ -3679,7 +3682,7 @@ function SetupWizard({ onCancel, onDone }) {
               {emps.map((e) => (
                 <div key={e.id} className="flex gap-3 items-center text-sm border rounded-md px-3 py-2" style={{ borderColor: "var(--line)" }}>
                   <span className="flex-1 font-medium">{e.name} <span className="font-normal text-xs" style={{ color: "var(--mut)" }}>{e.email} · {e.role}</span></span>
-                  <span className="font-mono2 text-xs px-2 py-1 rounded" style={{ background: "var(--paper)", color: "var(--mut)" }}>issued at deployment</span>
+                  <span className="font-mono2 text-xs px-2 py-1 rounded" style={{ background: "var(--paper)", color: "var(--mut)" }}>{e.locked ? "already active (you)" : "issued at deployment"}</span>
                 </div>
               ))}
             </div>

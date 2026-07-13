@@ -73,6 +73,57 @@ class BootstrapOut(BaseModel):
     users: list[BootstrapUserOut]
 
 
+def _client_registry(db: Session, tenant_id):
+    """client_for(duty): one client row per distinct client name (case-insensitive,
+    whitespace-collapsed), resuming the CL-xxx sequence from what the tenant already has."""
+    clients_by_norm: dict[str, Client] = {
+        _norm_client(c.name): c
+        for c in db.scalars(select(Client).where(Client.tenant_id == tenant_id))
+    }
+    counter = len(clients_by_norm)
+
+    def client_for(d: DutyIn) -> Client:
+        nonlocal counter
+        key = _norm_client(d.client_name)
+        c = clients_by_norm.get(key)
+        if c is None:
+            counter += 1
+            c = Client(tenant_id=tenant_id, ref=f"CL-{counter:03d}",
+                       name=" ".join(d.client_name.split()), contact=d.contact,
+                       origin="pre_baton", confirmation_basis=PRE_BATON_BASIS)
+            db.add(c)
+            db.flush()
+            clients_by_norm[key] = c
+        return c
+
+    return client_for
+
+
+def _add_pre_baton_duty(db: Session, tenant_id, user: User, d: DutyIn, client_for) -> None:
+    c = client_for(d)
+    duty = Duty(
+        tenant_id=tenant_id,
+        staff_id=user.id,
+        client_name=c.name,
+        client_id=c.id,
+        service=d.service,
+        kind=d.kind,
+        cadence=d.cadence,
+        next_due=d.next_due,
+        contact=d.contact,
+    )
+    db.add(duty)
+    db.flush()
+    # same client name with a different contact: the client record keeps the FIRST
+    # contact; this duty's own contact stays on the duty — noted on the trail
+    if d.contact and c.contact and d.contact != c.contact:
+        db.add(DutyEvent(tenant_id=tenant_id, duty_id=duty.id, by_user=None,
+                         text_=f"Linked to client {c.ref} — the client record keeps the contact "
+                               f"from the first registered duty; this duty's own contact "
+                               f"({d.contact.get('email') or d.contact.get('name') or 'on record'}) "
+                               f"is retained on the duty."))
+
+
 def perform_bootstrap(body: BootstrapIn, db: Session) -> BootstrapOut:
     """Shared firm-creation logic: tenant + trial subscription + users (temp passwords
     returned ONCE, stored only as bcrypt hashes) + pre-Baton duties/clients. Flushes but
@@ -108,22 +159,7 @@ def perform_bootstrap(body: BootstrapIn, db: Session) -> BootstrapOut:
                         seats_limit=max(default_seats, len(body.employees)),
                         current_period_end=datetime.now(timezone.utc) + timedelta(days=30)))
 
-    # pre-Baton duty clients become first-class client rows: one per DISTINCT client name
-    # (case-insensitive, whitespace-collapsed) across every employee's pre-existing duties
-    clients_by_norm: dict[str, Client] = {}
-
-    def client_for(d: DutyIn) -> Client:
-        key = _norm_client(d.client_name)
-        c = clients_by_norm.get(key)
-        if c is None:
-            c = Client(tenant_id=tenant.id, ref=f"CL-{len(clients_by_norm) + 1:03d}",
-                       name=" ".join(d.client_name.split()), contact=d.contact,
-                       origin="pre_baton", confirmation_basis=PRE_BATON_BASIS)
-            db.add(c)
-            db.flush()
-            clients_by_norm[key] = c
-        return c
-
+    client_for = _client_registry(db, tenant.id)
     out_users: list[BootstrapUserOut] = []
     for emp in body.employees:
         temp_password = secrets.token_urlsafe(9)
@@ -141,28 +177,7 @@ def perform_bootstrap(body: BootstrapIn, db: Session) -> BootstrapOut:
         db.add(user)
         db.flush()
         for d in emp.duties:
-            c = client_for(d)
-            duty = Duty(
-                tenant_id=tenant.id,
-                staff_id=user.id,
-                client_name=c.name,
-                client_id=c.id,
-                service=d.service,
-                kind=d.kind,
-                cadence=d.cadence,
-                next_due=d.next_due,
-                contact=d.contact,
-            )
-            db.add(duty)
-            db.flush()
-            # same client name with a different contact: the client record keeps the FIRST
-            # contact; this duty's own contact stays on the duty — noted on the trail
-            if d.contact and c.contact and d.contact != c.contact:
-                db.add(DutyEvent(tenant_id=tenant.id, duty_id=duty.id, by_user=None,
-                                 text_=f"Linked to client {c.ref} — the client record keeps the contact "
-                                       f"from the first registered duty; this duty's own contact "
-                                       f"({d.contact.get('email') or d.contact.get('name') or 'on record'}) "
-                                       f"is retained on the duty."))
+            _add_pre_baton_duty(db, tenant.id, user, d, client_for)
         link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(user)}"
         emails.send_invite(user.email, user.name, tenant.short, link, temp_password)
         out_users.append(
@@ -244,3 +259,84 @@ def update_firm(body: FirmUpdateIn, user=Depends(require_roles("Admin")), db: Se
         t.email = str(body.email)
     db.commit()
     return _firm_out(t)
+
+
+# ---------- first-login setup (operator-created firm, Admin self-serves the wizard) ----------
+
+class CompleteSetupIn(BaseModel):
+    firm: FirmIn
+    services: list[str] = Field(min_length=1)  # "no activities configured" = setup incomplete
+    templates: dict = Field(default_factory=dict)
+    employees: list[EmployeeIn]  # includes the seed Admin (matched by email, updated in place)
+
+
+@router.post("/complete-setup", status_code=201)
+def complete_setup(body: CompleteSetupIn, admin: User = Depends(require_roles("Admin")),
+                   db: Session = Depends(get_db)):
+    """One-shot wizard completion for a firm the platform operator created with only the
+    seed Admin. Applies firm details + activity catalog, updates employees whose email
+    already exists (the admin — role and password untouched), creates the rest with
+    one-time temp passwords, and registers pre-Baton duties. Refused once services are
+    configured — from then on Firm settings / Employees & roles own these changes."""
+    t = db.get(Tenant, admin.tenant_id)
+    if t.services:
+        raise HTTPException(status_code=409,
+                            detail="Setup is already complete — use Firm settings and Employees & roles")
+    for emp in body.employees:
+        if emp.role not in ROLES:
+            raise HTTPException(status_code=422, detail=f"Unknown role {emp.role!r} for {emp.email}")
+    lowered = [e.email.lower() for e in body.employees]
+    if len(set(lowered)) != len(lowered):
+        raise HTTPException(status_code=422, detail="Duplicate employee emails in payload")
+
+    # the operator entered only name/short/email — the admin completes (and may correct) the rest
+    t.name, t.short = body.firm.name, body.firm.short
+    t.address, t.trn, t.phone = body.firm.address, body.firm.trn, body.firm.phone
+    t.email = str(body.firm.email)
+    if body.firm.accent:
+        t.accent = body.firm.accent
+    t.services = body.services
+    t.templates = body.templates
+
+    existing = {u.email.lower(): u for u in db.scalars(select(User).where(User.tenant_id == t.id))}
+    new_emps = [e for e in body.employees if e.email.lower() not in existing]
+
+    # seat enforcement — same rule as POST /users, checked up front for the whole batch
+    sub = db.scalar(select(Subscription).where(Subscription.tenant_id == t.id))
+    if sub and sub.seats_limit:
+        active_count = db.scalar(select(func.count()).select_from(User).where(
+            User.tenant_id == t.id, User.active.is_(True)))
+        if active_count + len(new_emps) > sub.seats_limit:
+            raise HTTPException(status_code=409,
+                                detail=f"Seat limit reached — your plan allows {sub.seats_limit} active "
+                                       f"user(s) and this setup needs {active_count + len(new_emps)}. "
+                                       f"Remove employees or ask the platform operator to raise the limit.")
+
+    client_for = _client_registry(db, t.id)
+    out_users: list[BootstrapUserOut] = []
+    for emp in body.employees:
+        user = existing.get(emp.email.lower())
+        if user is None:
+            temp_password = secrets.token_urlsafe(9)
+            user = User(tenant_id=t.id, name=emp.name, designation=emp.designation,
+                        email=str(emp.email), role=emp.role, signatory=emp.signatory,
+                        sig_specimen=emp.sig, password_hash=hash_password(temp_password),
+                        must_reset=True)
+            db.add(user)
+            db.flush()
+            link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(user)}"
+            emails.send_invite(user.email, user.name, t.short, link, temp_password)
+            out_users.append(BootstrapUserOut(id=user.id, name=user.name, email=user.email,
+                                              role=user.role, temp_password=temp_password))
+        else:
+            # the seed admin finishing their own row: profile updates; role/password stay
+            user.name = emp.name
+            user.designation = emp.designation or user.designation
+            user.signatory = emp.signatory
+            if emp.sig is not None:
+                user.sig_specimen = emp.sig
+        for d in emp.duties:
+            _add_pre_baton_duty(db, t.id, user, d, client_for)
+
+    db.commit()
+    return {"tenant_id": t.id, "users": out_users}

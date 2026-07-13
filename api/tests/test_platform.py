@@ -223,6 +223,76 @@ def test_bootstrap_key_gates_the_public_endpoint(client, monkeypatch):
     assert client.post("/platform/firms", json=CREATE_FIRM_PAYLOAD, headers=op).status_code == 201
 
 
+SETUP_PAYLOAD = {
+    "firm": {"name": "Gamma Tax Consultancy LLC", "short": "GammaTax", "address": "DIFC, Dubai",
+             "trn": "TRN 100-9999-8888-777", "phone": "+971 4 000 0000",
+             "email": "owner@gammatax.ae", "accent": "#123456"},
+    "services": ["VAT Filing", "Bookkeeping (Monthly)"],
+    "templates": {},
+    "employees": [
+        {"name": "Owner One", "designation": "Managing Partner", "email": "owner@gammatax.ae",
+         "role": "Admin", "signatory": True, "sig": {"type": "typed", "text": "O.O."}},
+        {"name": "New Staff", "email": "staff@gammatax.ae", "role": "Staff",
+         "duties": [{"client_name": "Desert Rose Trading", "service": "VAT Filing", "kind": "filing",
+                     "cadence": "quarterly", "next_due": "2026-09-30T00:00:00Z"}]},
+    ],
+}
+
+
+def operator_created_admin(client, seats=3):
+    """Operator creates a firm with ONLY the seed Admin; returns the admin's live session."""
+    op = op_headers(client)
+    r = client.post("/platform/firms", json={
+        "firm": {"name": "Gamma Tax LLC", "short": "GammaTax", "email": "owner@gammatax.ae"},
+        "employees": [{"name": "Owner One", "email": "owner@gammatax.ae", "role": "Admin", "signatory": True}],
+        "subscription": {"plan_name": "Trial", "status": "trial", "seats_limit": seats},
+    }, headers=op)
+    assert r.status_code == 201, r.text
+    out = r.json()
+    admin = out["users"][0]
+    tokens = login_after_reset(client, admin["email"], admin["temp_password"])
+    return out, {"Authorization": f"Bearer {tokens['access_token']}"}
+
+
+def test_admin_completes_setup_after_operator_creation(client):
+    out, headers = operator_created_admin(client)
+    # operator-created firm starts unconfigured — the wizard gate keys off empty services
+    assert client.get("/tenants/me", headers=headers).json()["services"] == []
+    r = client.post("/tenants/complete-setup", json=SETUP_PAYLOAD, headers=headers)
+    assert r.status_code == 201, r.text
+    # only the NEW employee gets a temp password; the admin is updated, never duplicated
+    assert [u["email"] for u in r.json()["users"]] == ["staff@gammatax.ae"]
+    users = client.get("/users", headers=headers).json()
+    assert len(users) == 2
+    admin_row = next(u for u in users if u["email"] == "owner@gammatax.ae")
+    assert admin_row["role"] == "Admin" and admin_row["signatory"] is True
+    assert admin_row["designation"] == "Managing Partner"
+    # firm details + catalog landed
+    me = client.get("/tenants/me", headers=headers).json()
+    assert me["services"] == SETUP_PAYLOAD["services"]
+    assert me["trn"] == "TRN 100-9999-8888-777" and me["name"] == "Gamma Tax Consultancy LLC"
+    # the pre-Baton duty registered a first-class client
+    assert any(c["name"] == "Desert Rose Trading" for c in client.get("/clients", headers=headers).json())
+    # one-shot: once configured, the endpoint refuses — ongoing changes go through
+    # Firm settings (PATCH /tenants/me) and Employees & roles (POST /users)
+    assert client.post("/tenants/complete-setup", json=SETUP_PAYLOAD, headers=headers).status_code == 409
+
+
+def test_complete_setup_enforces_seat_limit(client):
+    out, headers = operator_created_admin(client, seats=2)
+    over = {**SETUP_PAYLOAD, "employees": SETUP_PAYLOAD["employees"] + [
+        {"name": "Extra Person", "email": "extra@gammatax.ae", "role": "Staff"},
+    ]}  # existing admin + 2 new = 3 active > 2 seats
+    r = client.post("/tenants/complete-setup", json=over, headers=headers)
+    assert r.status_code == 409 and "Seat limit" in r.json()["detail"]
+    # atomic: nothing was created and the firm is still unconfigured
+    assert len(client.get("/users", headers=headers).json()) == 1
+    assert client.get("/tenants/me", headers=headers).json()["services"] == []
+    # trimming to the seat limit succeeds (admin + 1 new = 2)
+    r = client.post("/tenants/complete-setup", json=SETUP_PAYLOAD, headers=headers)
+    assert r.status_code == 201, r.text
+
+
 def test_operator_can_never_fetch_tenant_business_content(client):
     boot, tenant_headers = tenant_with_admin(client)
     op = op_headers(client)
