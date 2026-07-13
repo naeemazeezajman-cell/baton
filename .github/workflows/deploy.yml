@@ -24,7 +24,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build:demo # the public portfolio site keeps serving the in-memory demo
+      - run: npm run build:demo # the public portfolio site keeps serving the in-memory demo at /baton/
+      - run: npm run build:prod-pages -- --outDir dist/app # API-backed production app at /baton/app/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

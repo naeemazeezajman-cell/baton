@@ -4,6 +4,9 @@ build/
 .env
 .env.*
 !.env.example
+# no secrets in these two — the demo flag and the public API URL; CI needs them to build correctly
+!.env.demo
+!.env.prod-pages
 *.log
 .DS_Store
 Thumbs.db

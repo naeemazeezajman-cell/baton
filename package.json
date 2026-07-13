@@ -8,6 +8,7 @@
     "dev:demo": "vite --mode demo",
     "build": "vite build",
     "build:demo": "vite build --mode demo",
+    "build:prod-pages": "vite build --mode prod-pages",
     "preview": "vite preview"
   },
   "dependencies": {
