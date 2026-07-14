@@ -683,10 +683,12 @@ def sign_route(pid: uuid.UUID, body: SignRouteIn, user: User = Depends(current_u
     require_holder(p, user)
     require_status(p, "manager_review")
     signatory = _user(db, user, body.signatory_id)
-    if signatory.id == user.id:
-        raise conflict("You cannot route the document to yourself for counter-signature")
     if signatory.role != "Admin" or not signatory.signatory:
         raise conflict("The signatory must be an Admin with signing authority")
+    # Small-firm owner who both drafts and counter-signs: self-routing is valid when they
+    # hold both roles. The counter-signature is still the explicit, identity-confirmed
+    # senior-approve action below — a deliberate second act, never an auto-approval.
+    self_sign = signatory.id == user.id
     p.signatures = {**p.signatures, "manager": {"by": str(user.id), "at": iso(now())}}
     p.signatory_id = signatory.id
     p.status = "senior_review"
@@ -696,8 +698,13 @@ def sign_route(pid: uuid.UUID, body: SignRouteIn, user: User = Depends(current_u
     log_event(db, p, user.id, f"Proposal approved & digitally signed by {user.name} (identity re-confirmed)")
     if body.note:
         log_event(db, p, user.id, f'Note to signatory: "{body.note}"')
-    pass_holder(db, p, signatory, user, "routed for senior review & counter-signature")
-    _notify(db, p, signatory.id, f"{p.ref}: proposal awaiting your review & signature")
+    if self_sign:
+        # no baton pass to another person — the same holder now counter-signs as senior
+        log_event(db, p, None, f"{user.name} is also the senior signatory — counter-signature required "
+                               f"to lock the document (a separate identity-confirmed sign step)")
+    else:
+        pass_holder(db, p, signatory, user, "routed for senior review & counter-signature")
+        _notify(db, p, signatory.id, f"{p.ref}: proposal awaiting your review & signature")
     db.commit()
     return _serialize(p)
 

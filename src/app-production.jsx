@@ -2097,7 +2097,10 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
 
   const managerMayAct = iAmRequester && p.status === "manager_review";
   const iAmSenior = me.id === p.signatoryId && p.status === "senior_review";
-  const signatories = users.filter((u) => u.role === "Admin" && u.signatory && u.id !== me.id); // counter-signature = senior management only
+  // Every Admin with signing authority, INCLUDING the drafter themselves — a small-firm
+  // owner legitimately drafts and counter-signs. Self-routing still requires the explicit
+  // senior counter-sign afterwards, so it's a deliberate act, not an auto-approval.
+  const signatories = users.filter((u) => u.role === "Admin" && u.signatory);
   const canReview = me.role === "Manager" || me.role === "Admin";
 
   if (!latest) return <div className="mt-8 text-sm text-center" style={{ color: "var(--mut)" }}>No document generated yet — the drafter generates v1 from the workspace once fees and terms are in place.</div>;
@@ -2199,8 +2202,13 @@ function DocTab({ p, byId, firm, me, users, actions, iAmRequester, formDirty }) 
                   <textarea value={seniorComment} onChange={(e) => setSeniorComment(e.target.value)} rows={2} placeholder={`Note to the signatory (optional) — e.g. "Discussed with client: AED 2,500 is final for this engagement. Please proceed."`} className="mt-1.5 w-full border rounded-md px-2.5 py-2 text-xs" style={{ borderColor: "var(--line)" }} />
                   <select value={signatoryPick} onChange={(e) => setSignatoryPick(e.target.value)} className="mt-1.5 w-full border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
                     <option value="">Select senior signatory…</option>
-                    {signatories.map((u) => <option key={u.id} value={u.id}>{u.name} — {u.designation}</option>)}
+                    {signatories.map((u) => <option key={u.id} value={u.id}>{u.name} — {u.designation}{u.id === me.id ? " (yourself)" : ""}</option>)}
                   </select>
+                  {signatoryPick === me.id && (
+                    <div className="mt-1.5 text-[11px] px-2 py-1.5 rounded-md" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                      You hold both roles — after signing here you'll counter-sign as senior signatory in the next step (a separate, logged signature).
+                    </div>
+                  )}
                   <label className="flex items-start gap-2 mt-2 text-[11px]" style={{ color: "var(--mut)" }}>
                     <input type="checkbox" checked={confirmSig} onChange={(e) => setConfirmSig(e.target.checked)} className="mt-0.5" />
                     I re-confirm my identity and authorize applying <b>my own</b> signature to this document (in production: password / 2FA re-entry).
@@ -2381,7 +2389,7 @@ function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequ
 
   const d = p.versions[p.versions.length - 1]?.data;
   const iAmELSenior = p.el && me.id === p.el.signatoryId && p.status === "el_senior_review";
-  const signatories = users.filter((u) => u.role === "Admin" && u.signatory && u.id !== p.requestedBy); // EL signature = senior management only
+  const signatories = users.filter((u) => u.role === "Admin" && u.signatory); // EL signature = senior management only (the owner may be the requester and the signatory both)
   const staff = users.filter((u) => u.role === "Staff");
   const firstBill = d ? d.lines.reduce((a, l) => a + num(l.fee), 0) : 0;
   const assignments = p.el?.assignments || {};
@@ -2580,7 +2588,7 @@ function EngTab({ p, byId, firm, me, users, client, workloadOf, actions, iAmRequ
                   <label className="text-xs font-semibold mt-3 block" style={{ color: "var(--mut)" }}>Route for signature to</label>
                   <select value={signatoryPick} onChange={(e) => setSignatoryPick(e.target.value)} className="mt-1 w-full border rounded-md px-2 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
                     <option value="">Select senior signatory…</option>
-                    {signatories.map((u) => <option key={u.id} value={u.id}>{u.name} — {u.designation}</option>)}
+                    {signatories.map((u) => <option key={u.id} value={u.id}>{u.name} — {u.designation}{u.id === me.id ? " (yourself)" : ""}</option>)}
                   </select>
                   {unassigned.length > 0 && (
                     <div className="mt-2 text-[11px] px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>
