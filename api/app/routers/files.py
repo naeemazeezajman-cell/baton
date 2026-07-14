@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .. import blobs
+from .. import blobs, emails
 from ..config import get_settings
 from ..db import get_db
 from ..models import File, User
@@ -79,6 +79,27 @@ def _download_token(file_id: uuid.UUID) -> str:
         {"sub": str(file_id), "type": "file", "exp": datetime.now(timezone.utc) + timedelta(minutes=blobs.LINK_TTL_MIN)},
         s.JWT_SECRET, algorithm="HS256",
     )
+
+
+def file_download_url(row: File) -> str:
+    """Short-lived download URL for a stored file — Azure SAS, or a signed local-dev URL."""
+    url = blobs.sas_link(row.blob_path)
+    if url is None:  # local dev / no blob storage
+        url = f"{get_settings().FRONTEND_ORIGIN}/files/{row.id}/download?token={_download_token(row.id)}"
+    return url
+
+
+def attachments_or_links(rows: list[File]) -> tuple[list[dict], list[str]]:
+    """Turn stored files into email attachments, or — when their combined size would exceed
+    the ACS message limit — into download-link body lines instead. Returns
+    (attachments, link_lines): exactly one side is populated. Attachments carry no expiry and
+    need no storage public access; the link fallback keeps oversized sends working."""
+    attachments = [blobs.file_attachment(r.name, r.blob_path) for r in rows]
+    total = sum(len(a["contentInBase64"]) for a in attachments)
+    if total <= emails.ATTACHMENT_LIMIT_BASE64:
+        return attachments, []
+    links = [f"- {r.name}: {file_download_url(r)}" for r in rows]
+    return [], links
 
 
 @router.get("/{file_id}/link")

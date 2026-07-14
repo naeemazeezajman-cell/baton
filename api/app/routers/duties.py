@@ -18,13 +18,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import blobs, emails
-from ..config import get_settings
 from ..db import get_db
 from ..models import Duty, DutyCompletion, DutyEvent, User
 from ..security import current_user, require_roles
 from ..tenancy import get_scoped_or_404, tenant_select
 from ..workflow import conflict, now
-from .files import _download_token, store_upload
+from .files import attachments_or_links, store_upload
 
 router = APIRouter(prefix="/duties", tags=["duties"])
 
@@ -186,22 +185,22 @@ def apply_completion(db: Session, d: Duty, user: User, method: str, stored: list
 
     note_txt = f' · note: "{note}"' if note else ""
     if method == "sent":
-        links = []
-        for f in stored:
-            url = blobs.sas_link(f.blob_path)
-            if url is None:
-                url = f"{get_settings().FRONTEND_ORIGIN}/files/{f.id}/download?token={_download_token(f.id)}"
-            links.append(f"- {f.name}: {url}")
         contact_name = (d.contact or {}).get("name") or "Sir/Madam"
-        emails.send_client(
-            emailed_to, f"{d.service} — {d.client_name}",
-            f"Dear {contact_name},\n\nPlease find the following for {d.client_name} "
-            f"(links valid {blobs.LINK_TTL_MIN} minutes):\n" + "\n".join(links) +
-            "\n\nKindly let us know if you have any questions.\n\nBest regards",
-        )
+        attachments, link_lines = attachments_or_links(stored)
+        body = (f"Dear {contact_name},\n\nPlease find attached the following for {d.client_name}:\n"
+                + "\n".join(f"- {f.name}" for f in stored))
+        if link_lines:
+            body += (f"\n\n(The files were too large to attach — download within "
+                     f"{blobs.LINK_TTL_MIN} minutes:)\n" + "\n".join(link_lines))
+        body += ("\n\nKindly let us know if you have any questions."
+                 f"\n\n{emails.reply_to_line(user.name, user.email)}\n\nBest regards")
+        emails.send_client(emailed_to, f"{d.service} — {d.client_name}", body,
+                           reply_to=(user.email, user.name), attachments=attachments)
+        how = "download link(s)" if link_lines else "attached"
         _log(db, d, user.id, f"Completed ({late_txt}) — {len(stored)} deliverable(s) uploaded and emailed to "
                              f"{emailed_to}: {names}{note_txt}. Due date was {fmt_d(due_at)}.")
-        _log(db, d, None, f"Deliverables email dispatched to {emailed_to} with secure download links.")
+        _log(db, d, None, f"Deliverables email dispatched to {emailed_to} ({how}); "
+                          f"replies route to {user.name} <{user.email}>.")
     elif method == "proof":
         rec_txt = ""
         if record_obj:

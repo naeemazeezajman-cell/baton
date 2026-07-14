@@ -721,7 +721,7 @@ def test_add_to_register_and_add_to_ledger_resolutions(client, monkeypatch):
     # the computation email tells the client to book the correction
     sent = {}
     monkeypatch.setattr(vat_engine.emails, "send_client",
-                        lambda to, subject, body: sent.update(to=to, body=body))
+                        lambda to, subject, body, **kw: sent.update(to=to, body=body))
     r = client.post(f"/vat-engine/filings/{fid}/confirm-computation", json={}, headers=H(ctx, "staff"))
     assert r.status_code == 200, r.text
     r = client.post(f"/vat-engine/filings/{fid}/send-computation",

@@ -15,13 +15,12 @@ from fastapi import APIRouter, Depends, File as FileParam, Form, HTTPException, 
 from sqlalchemy.orm import Session
 
 from .. import blobs, emails
-from ..config import get_settings
 from ..db import get_db
 from ..models import Client, Payment, Tenant, User
 from ..security import current_user, require_roles
 from ..tenancy import get_scoped_or_404, tenant_select
 from ..workflow import conflict, iso, now
-from .files import _download_token, store_upload
+from .files import attachments_or_links, store_upload
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -119,23 +118,21 @@ def raise_invoice(
     contact_name = contact.get("contactPerson") or contact.get("name") or "Sir/Madam"
 
     stored = [store_upload(db, user, "payment", p.id, f) for f in invoice]
-    links = []
-    for f in stored:
-        url = blobs.sas_link(f.blob_path)
-        if url is None:
-            url = f"{get_settings().FRONTEND_ORIGIN}/files/{f.id}/download?token={_download_token(f.id)}"
-        links.append(f"- {f.name}: {url}")
+    attachments, link_lines = attachments_or_links(stored)
 
     firm = db.get(Tenant, user.tenant_id)
+    body = (f"Dear {contact_name},\n\n"
+            f"Please find attached invoice {number} for {p.label} — AED {float(p.amount):,.0f}, "
+            f"due {p.due_at:%d %b %Y}.")
+    if link_lines:
+        body += (f"\n\n(The invoice was too large to attach — download within "
+                 f"{blobs.LINK_TTL_MIN} minutes:)\n" + "\n".join(link_lines))
+    body += (f"\n\nKindly arrange payment by the due date."
+             f"\n\n{emails.reply_to_line(user.name, user.email)}"
+             f"\n\nBest regards\n{firm.name}")
     emails.send_client(
-        contact_email,
-        f"{firm.short} — Invoice {number}: {p.label}",
-        f"Dear {contact_name},\n\n"
-        f"Please find invoice {number} for {p.label} — AED {float(p.amount):,.0f}, "
-        f"due {p.due_at:%d %b %Y} (links valid {blobs.LINK_TTL_MIN} minutes):\n"
-        + "\n".join(links) +
-        f"\n\nKindly arrange payment by the due date. For any questions contact {firm.email}."
-        f"\n\nBest regards\n{firm.name}",
+        contact_email, f"{firm.short} — Invoice {number}: {p.label}", body,
+        reply_to=(user.email, user.name), attachments=attachments,
     )
 
     p.invoice = {"number": number, "date": inv_date.isoformat(),

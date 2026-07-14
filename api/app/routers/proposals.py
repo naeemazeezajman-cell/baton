@@ -14,7 +14,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .. import ai, emails
+from .. import ai, blobs, emails
 from ..db import get_db
 from ..models import Client, Duty, HolderLog, Notice, Payment, Proposal, ProposalEvent, SignatureUse, User
 from ..security import current_user, require_roles
@@ -34,7 +34,7 @@ from ..workflow import (
     require_status,
 )
 from .duties import fmt_dur as _fmt_dur
-from .files import store_upload
+from .files import attachments_or_links, store_upload
 
 router = APIRouter(prefix="/proposals", tags=["proposals"])
 workload_router = APIRouter(prefix="/users", tags=["users"])
@@ -143,6 +143,8 @@ class ClientMailIn(BaseModel):
     subject: str
     body: str
     attach_version: int | None = None
+    # file ids (proposal-entity uploads, e.g. the generated PDF) to attach to the email
+    attachment_file_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class StaffActivityIn(BaseModel):
@@ -830,6 +832,23 @@ def approve_version(pid: uuid.UUID, body: ApproveVersionIn, user: User = Depends
 
 # ---------- client sends / conversion ----------
 
+def _client_mail_parts(db: Session, user: User, body: ClientMailIn) -> tuple[str, list[dict]]:
+    """Build (body_text, attachments) for a client send: attach any requested proposal-entity
+    files (tenancy-checked), fall back to a link line if oversized, and append the Reply-To
+    body line naming the acting staff member."""
+    from ..models import File
+    attachments, link_lines = [], []
+    if body.attachment_file_ids:
+        rows = [get_scoped_or_404(db, File, fid, user) for fid in body.attachment_file_ids]
+        attachments, link_lines = attachments_or_links(rows)
+    text = body.body
+    if link_lines:
+        text += (f"\n\nThe document(s) were too large to attach — download within "
+                 f"{blobs.LINK_TTL_MIN} minutes:\n" + "\n".join(link_lines))
+    text += f"\n\n{emails.reply_to_line(user.name, user.email)}"
+    return text, attachments
+
+
 @router.post("/{pid}/send-client")
 def send_client(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Email the signed proposal to the client (prototype sendClientEmail kind=proposal)."""
@@ -837,7 +856,9 @@ def send_client(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current
     _require_requester(p, user)
     require_status(p, "signed")
     attach_v = body.attach_version or _latest_version(p)["v"]
-    emails.send_client(str(body.to), body.subject, body.body)
+    text, attachments = _client_mail_parts(db, user, body)
+    emails.send_client(str(body.to), body.subject, text,
+                       reply_to=(user.email, user.name), attachments=attachments)
     p.status = "proposal_sent"
     p.proposal_sent_at = now()
     log_event(db, p, user.id,
@@ -1113,7 +1134,9 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
     for pay in pays:
         db.add(pay)
 
-    emails.send_client(str(body.to), body.subject, body.body)
+    text, attachments = _client_mail_parts(db, user, body)
+    emails.send_client(str(body.to), body.subject, text,
+                       reply_to=(user.email, user.name), attachments=attachments)
     p.el = {**p.el, "sent_at": iso(t0)}
     p.status = "el_sent"
     p.onboarding_completed_at = t0  # part 1 completion stamp — the process closes here

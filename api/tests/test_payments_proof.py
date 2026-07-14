@@ -56,7 +56,9 @@ def test_raise_invoice_validation_and_auto_email(client, caplog):
                for e in p["events"])
     mail = caplog.text
     assert "AlphaLedger — Invoice INV-7001" in mail
-    assert "INV-7001.pdf:" in mail and "token=" in mail  # secure link, local dev mode
+    # the invoice is now a real attachment (not a SAS/token link), and replies route to the accountant
+    assert "attachments=['INV-7001.pdf']" in mail
+    assert "reply_to=fatima@alphaledger.ae" in mail
     assert "due" in mail and "Kindly arrange payment" in mail
 
     # invoiced-but-unpaid still drives health (both overdue classes count)

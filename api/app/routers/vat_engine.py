@@ -35,7 +35,7 @@ from ..security import current_user
 from ..tenancy import get_scoped_or_404, tenant_select
 from ..workflow import conflict, iso, now
 from .duties import CADENCE_MONTHS, apply_completion, fmt_d
-from .files import _download_token
+from .files import attachments_or_links
 
 TS = TIMESTAMP(timezone=True)
 GEN_UUID = text("gen_random_uuid()")
@@ -343,11 +343,6 @@ def _store_upload(db: Session, user: User, entity: str, entity_id, upload: Uploa
     return _store_bytes(db, user, entity, entity_id, upload.filename, upload.file.read())
 
 
-def _file_link(f: FileModel) -> str:
-    url = blobs.sas_link(f.blob_path)
-    if url is None:
-        url = f"{get_settings().FRONTEND_ORIGIN}/files/{f.id}/download?token={_download_token(f.id)}"
-    return url
 
 
 def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
@@ -1365,7 +1360,9 @@ def request_missing_invoice(fid: uuid.UUID, item_id: uuid.UUID, body: MailIn,
     it = _item(db, f, item_id)
     if it.bucket not in ("ledger_only", "invoice_only"):
         raise conflict("Only reconciliation differences can be chased with the client")
-    emails.send_client(str(body.to), body.subject, body.body)
+    emails.send_client(str(body.to), body.subject,
+                       body.body + f"\n\n{emails.reply_to_line(user.name, user.email)}",
+                       reply_to=(user.email, user.name))
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="missing_invoice",
                             item_id=it.id, to_email=str(body.to), subject=body.subject, by_user=user.id))
     it.resolution = {"action": "requested", "by": str(user.id), "at": iso(now()), "to": str(body.to)}
@@ -1538,9 +1535,15 @@ def request_from_client(fid: uuid.UUID, body: RequestFromClientIn,
     template = _ledger_template_bytes() if body.kind == "ledger" else _register_template_bytes()
     tname = "VAT Ledger Template.xlsx" if body.kind == "ledger" else "Invoice Register Template.xlsx"
     stored = _store_bytes(db, user, "vat_filing", f.id, tname, template)
-    link = _file_link(stored)
+    attachments, link_lines = attachments_or_links([stored])
+    if link_lines:
+        doc_txt = (f"\n\nTemplate ({tname}) — download within {blobs.LINK_TTL_MIN} minutes:\n"
+                   + "\n".join(link_lines))
+    else:
+        doc_txt = f"\n\nThe template ({tname}) is attached to this email."
     emails.send_client(str(body.to), body.subject,
-                       body.body + f"\n\nTemplate ({tname}) — download link (valid {blobs.LINK_TTL_MIN} minutes):\n{link}")
+                       body.body + doc_txt + f"\n\n{emails.reply_to_line(user.name, user.email)}",
+                       reply_to=(user.email, user.name), attachments=attachments)
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind=body.kind,
                             to_email=str(body.to), subject=body.subject, by_user=user.id))
     label = "VAT ledger" if body.kind == "ledger" else "invoice register"
@@ -1928,8 +1931,13 @@ def send_computation(fid: uuid.UUID, body: MailIn, user: User = Depends(current_
     _require_status(f, "awaiting_client_approval")
     pdf_id = (f.computation or {}).get("pdf_file_id")
     pdf_row = db.get(FileModel, uuid.UUID(pdf_id)) if pdf_id else None
-    link = f"\n\nComputation ({f.computation['pdf_name']}) — download link (valid {blobs.LINK_TTL_MIN} minutes):\n" \
-           f"{_file_link(pdf_row)}" if pdf_row else ""
+    attachments, link_lines = attachments_or_links([pdf_row]) if pdf_row else ([], [])
+    doc_txt = ""
+    if pdf_row and link_lines:
+        doc_txt = (f"\n\nComputation ({f.computation['pdf_name']}) — download within "
+                   f"{blobs.LINK_TTL_MIN} minutes:\n" + "\n".join(link_lines))
+    elif pdf_row:
+        doc_txt = f"\n\nThe computation ({f.computation['pdf_name']}) is attached to this email."
     corrections = db.scalars(select(VatFilingItem).where(
         VatFilingItem.filing_id == f.id, VatFilingItem.origin == "ledger_correction")).all()
     corr_txt = ""
@@ -1939,7 +1947,9 @@ def send_computation(fid: uuid.UUID, body: MailIn, user: User = Depends(current_
                         f"- {i.invoice_no} — {i.party}, net AED {float(i.net):,.2f}, "
                         f"VAT AED {float(i.vat):,.2f} ({(i.resolution or {}).get('correction_note') or i.notes})"
                         for i in corrections))
-    emails.send_client(str(body.to), body.subject, body.body + corr_txt + link)
+    emails.send_client(str(body.to), body.subject,
+                       body.body + corr_txt + doc_txt + f"\n\n{emails.reply_to_line(user.name, user.email)}",
+                       reply_to=(user.email, user.name), attachments=attachments)
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="computation",
                             to_email=str(body.to), subject=body.subject, by_user=user.id))
     _log(db, f, user.id, f'Computation emailed to the client at {body.to} — subject: "{body.subject}" '
