@@ -81,6 +81,7 @@ export const api = {
   get: (path) => request(path),
   getBlob: (path) => request(path, { blob: true }),
   post: (path, json) => request(path, { method: "POST", json }),
+  put: (path, json) => request(path, { method: "PUT", json }),
   patch: (path, json) => request(path, { method: "PATCH", json }),
   postForm: (path, formData) => request(path, { method: "POST", form: formData }),
   public: {

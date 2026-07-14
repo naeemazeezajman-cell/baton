@@ -1166,24 +1166,16 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
 
 # ---------- performance report (process closes at el_sent) ----------
 
-# the prototype's starsFor scale, exactly (baton-prototype.jsx)
-STARS_SCALE = [
-    {"max_days": 0.5, "stars": 5},
-    {"max_days": 1, "stars": 4.5},
-    {"max_days": 2, "stars": 4},
-    {"max_days": 3, "stars": 3.5},
-    {"max_days": 5, "stars": 3},
-    {"max_days": 7, "stars": 2},
-    {"max_days": None, "stars": 1},
-]
-STARS_SCALE_TEXT = "≤½ day ★5 · ≤1d ★4½ · ≤2d ★4 · ≤3d ★3½ · ≤5d ★3 · ≤7d ★2 · beyond ★1"
+# The shape of the scale is fixed; the firm sets the per-holder hold target that stretches
+# it (perf_config). The defaults reproduce the prototype's starsFor scale exactly.
+from ..perf_config import hold_scale as _hold_scale, hold_scale_text, hold_stars  # noqa: E402
+
+STARS_SCALE = _hold_scale(0.5)  # default scale (hold target ½ day) — back-compat export
+STARS_SCALE_TEXT = hold_scale_text(0.5)
 
 
-def stars_for(avg_days: float) -> float:
-    for step in STARS_SCALE:
-        if step["max_days"] is None or avg_days <= step["max_days"]:
-            return step["stars"]
-    return 1
+def stars_for(avg_days: float, hold_target_days: float = 0.5) -> float:
+    return hold_stars(avg_days, hold_target_days)
 
 
 @router.get("/{pid}/report")
@@ -1198,6 +1190,11 @@ def performance_report(pid: uuid.UUID, user: User = Depends(require_roles("Admin
     completed = p.onboarding_completed_at
     created = p.created_at
     total_ms = int((completed - created).total_seconds() * 1000)
+
+    # firm targets: the config version active when this cycle completed governs its stars
+    from ..perf_config import ConfigTimeline
+    cfg, cfg_version = ConfigTimeline(db, user.tenant_id).at(completed)
+    hold_target = cfg["proposal"]["hold_target_days"]
 
     rows = db.scalars(
         select(HolderLog).where(HolderLog.proposal_id == p.id).order_by(HolderLog.started_at, HolderLog.id)
@@ -1226,7 +1223,7 @@ def performance_report(pid: uuid.UUID, user: User = Depends(require_roles("Admin
             "total_held_ms": total_held,
             "holdings": sorted(holdings, key=lambda h: -h["duration_ms"]),
             "avg_holding_ms": int(avg),
-            "stars": stars_for(avg / 86400000),
+            "stars": stars_for(avg / 86400000, hold_target),
         })
     per_employee.sort(key=lambda r: (-r["stars"], r["total_held_ms"]))
 
@@ -1234,7 +1231,9 @@ def performance_report(pid: uuid.UUID, user: User = Depends(require_roles("Admin
         "ref": p.ref, "prospect": p.prospect.get("name"),
         "created_at": created, "completed_at": completed, "total_ms": total_ms,
         "per_employee": per_employee,
-        "stars_scale": STARS_SCALE, "stars_scale_text": STARS_SCALE_TEXT,
+        "config_version": cfg_version,
+        "cycle_target_days": cfg["proposal"]["cycle_target_days"],
+        "stars_scale": _hold_scale(hold_target), "stars_scale_text": hold_scale_text(hold_target),
     }
 
 

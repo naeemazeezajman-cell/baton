@@ -95,11 +95,14 @@ def _pass_baton(db: Session, ob: Onboarding, to_user_id, by: User, reason: str =
 
 
 def _compute_stars(db: Session, ob: Onboarding) -> list[dict]:
-    """Per-participant stars from this onboarding's holding spans — proposal starsFor scale."""
-    from .proposals import stars_for
+    """Per-participant stars from this onboarding's holding spans, sealed at completion
+    under the firm's config active at that moment (config_version stamped with them)."""
+    from ..perf_config import ConfigTimeline, hold_stars
     rows = db.scalars(select(HolderLog).where(HolderLog.onboarding_id == ob.id)
                       .order_by(HolderLog.started_at, HolderLog.id)).all()
     end_default = ob.completed_at or now()
+    cfg, cfg_version = ConfigTimeline(db, ob.tenant_id).at(end_default)
+    hold_target = cfg["onboarding"]["hold_target_days"]
     per: dict = {}
     for h in rows:
         if h.user_id is None:
@@ -109,8 +112,9 @@ def _compute_stars(db: Session, ob: Onboarding) -> list[dict]:
     out = []
     for uid_, durs in per.items():
         avg = sum(durs) / len(durs)
-        out.append({"user_id": str(uid_), "stars": stars_for(avg / 86400000),
-                    "total_held_ms": int(sum(durs)), "holdings": len(durs)})
+        out.append({"user_id": str(uid_), "stars": hold_stars(avg / 86400000, hold_target),
+                    "total_held_ms": int(sum(durs)), "holdings": len(durs),
+                    "config_version": cfg_version})
     out.sort(key=lambda e: (-e["stars"], e["total_held_ms"]))
     return out
 

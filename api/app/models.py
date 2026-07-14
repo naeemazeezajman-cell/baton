@@ -360,3 +360,20 @@ class Notice(Base):
     at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
     text_: Mapped[str] = mapped_column("text", Text)
     read: Mapped[bool | None] = mapped_column(Boolean, server_default=text("false"))
+
+
+class PerformanceConfig(Base):
+    """Firm-definable performance targets — append-only versions (the audit log itself).
+    Star computation resolves the version active at an item's completion time, so a
+    config change applies to future scoring only. Version 0 = built-in defaults."""
+
+    __tablename__ = "performance_config"
+    __table_args__ = (UniqueConstraint("tenant_id", "version"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    version: Mapped[int] = mapped_column(Integer)
+    config: Mapped[dict] = mapped_column(JSONB)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)

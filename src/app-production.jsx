@@ -502,6 +502,8 @@ function Shell() {
             {isMgr && <NavBtn label="New proposal request" active={route.screen === "new"} onClick={() => setRoute({ screen: "new" })} />}
             {(isMgr || isAcct) && <NavBtn label="Clients" active={route.screen === "clients"} onClick={() => setRoute({ screen: "clients" })} />}
             {isMgr && <NavBtn label="★ Performance" active={route.screen === "performance"} onClick={() => setRoute({ screen: "performance" })} />}
+            {isMgr && <NavBtn label="⏳ Pending board" active={route.screen === "pending"} onClick={() => setRoute({ screen: "pending" })} />}
+            {isMgr && <NavBtn label="Performance settings" active={route.screen === "perfsettings"} onClick={() => setRoute({ screen: "perfsettings" })} />}
             <VatEngineNav active={route.screen === "vat"} onClick={() => setRoute({ screen: "vat" })} /> {/* VAT-ENGINE (removable) */}
             {isAcct && <NavBtn label="Payments" active={route.screen === "payments"} onClick={() => setRoute({ screen: "payments" })} />}
             {me.role === "Admin" && (
@@ -553,6 +555,15 @@ function Shell() {
             {route.screen === "proposals" && <ProposalList proposals={proposals} byId={byId} now={now} open={(id) => setRoute({ screen: "detail", id })} />}
             {route.screen === "clients" && <Clients clients={clients} healthOf={healthOf} byId={byId} proposals={proposals} duties={duties} now={now} openP={(id) => setRoute({ screen: "detail", id })} canPerf={isMgr} />}
             {route.screen === "performance" && isMgr && <PerformanceScreen />}
+            {route.screen === "pending" && isMgr && (
+              <PendingBoard byId={byId} goto={(item) => {
+                if (item.type === "proposal") setRoute({ screen: "detail", id: item.ref });
+                else if (item.type === "onboarding") setRoute({ screen: "onboarding", id: item.ref });
+                else if (item.type === "duty") setRoute({ screen: "myclients" });
+                else setRoute({ screen: "payments" });
+              }} />
+            )}
+            {route.screen === "perfsettings" && isMgr && <PerformanceSettings />}
             {route.screen === "vat" && <VatEngineScreen initialDutyId={route.dutyId || null} />} {/* VAT-ENGINE (removable) */}
             {route.screen === "onboarding" && route.id && <OnboardingView oid={route.id} me={me} byId={byId} back={() => setRoute({ screen: "dashboard" })} />}
             {route.screen === "new" && isMgr && <NewRequest users={users} me={me} firm={firm} clients={clients} onCreate={(form) => { actions.createRequest(form).then(() => setRoute({ screen: "dashboard" })).catch(() => {}); }} />}
@@ -3197,6 +3208,28 @@ function OnboardingView({ oid, me, byId, back }) {
 
 /* ---------- firm-wide performance (management only) ---------- */
 
+/* One-line summary of the firm's active performance standard (feature: firm-definable
+   targets) — shown on the Performance tab and the pending board so the standard is public. */
+function targetsSummary(t, v) {
+  const bits = [];
+  if (t.proposal.cycle_target_days != null) bits.push(`proposal cycle ≤${t.proposal.cycle_target_days}d`);
+  bits.push(`proposal hold ≤${t.proposal.hold_target_days}d`);
+  if (t.onboarding.cycle_target_days != null) bits.push(`onboarding cycle ≤${t.onboarding.cycle_target_days}d`);
+  bits.push(`onboarding hold ≤${t.onboarding.hold_target_days}d`);
+  bits.push(`duty grace ${t.duty.grace_bands.join("/")}d`);
+  if (t.invoicing.target_days != null) bits.push(`invoice within ${t.invoicing.target_days}d of EL send`);
+  bits.push(`invoice grace ${t.invoicing.grace_bands.join("/")}d`);
+  return `Firm standard (v${v}): ${bits.join(" · ")}`;
+}
+
+const fmtAge = (ms) => {
+  if (ms == null) return "—";
+  const d = Math.floor(ms / 86400000);
+  if (d >= 1) return `${d}d ${Math.floor((ms % 86400000) / 3600000)}h`;
+  const h = Math.floor(ms / 3600000);
+  return h >= 1 ? `${h}h` : `${Math.max(1, Math.floor(ms / 60000))}m`;
+};
+
 function PerformanceScreen() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
@@ -3254,12 +3287,225 @@ function PerformanceScreen() {
           );
         })}
       </div>
+      {data.targets && (
+        <div className="mt-3 text-[11px] px-3 py-2 rounded-md font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+          {targetsSummary(data.targets, data.config_version)} — changed under Performance settings; new targets apply to future scoring only.
+        </div>
+      )}
       <div className="mt-3 text-[10px] space-y-0.5" style={{ color: "var(--mut)" }}>
         <div>Proposal cycles: {data.proposal_stars_scale_text}</div>
         <div>Duty completions: {data.duty_stars_scale_text}</div>
         <div>Onboarding relays: {data.onboarding_stars_scale_text}</div>
         <div>Invoicing: {data.invoicing_stars_scale_text}</div>
       </div>
+    </div>
+  );
+}
+
+/* ---------- Pending across the firm (manager/admin) ---------- */
+
+const PENDING_TYPE = {
+  proposal: ["PROPOSAL", "var(--accent)"],
+  onboarding: ["ONBOARDING", "#5C4A8A"],
+  duty: ["DUTY", "var(--amber)"],
+  invoice: ["INVOICE", "var(--ink)"],
+  receipt: ["RECEIPT", "var(--ink)"],
+};
+
+function PendingBoard({ goto }) {
+  const [b, setB] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    api.get("/performance/pending").then(setB).catch((e) => setErr(e.message));
+  }, []);
+  if (err) return <div className="max-w-5xl mx-auto text-sm" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!b) return <div className="max-w-5xl mx-auto text-sm" style={{ color: "var(--mut)" }}>Loading pending work…</div>;
+
+  const dueText = (item) => {
+    if (!item.due_at) return null;
+    const ms = new Date(item.due_at).getTime() - Date.now();
+    const d = Math.floor(Math.abs(ms) / 86400000);
+    return ms < 0 ? `${d}d overdue` : `due in ${d}d`;
+  };
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Pending across the firm</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>
+        Everything currently waiting on someone, aging-sorted and grouped by person: held proposals,
+        onboardings in progress, open duties, and the in-house accountant's invoicing queue.
+        Red rows are overdue or beyond the firm's target.
+      </p>
+      <div className="mt-2 text-[11px] px-3 py-2 rounded-md font-medium" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+        {targetsSummary(b.targets, b.config_version)}
+      </div>
+
+      {b.people.length === 0 && <div className="mt-6 text-sm" style={{ color: "var(--mut)" }}>Nothing is pending anywhere. 🎉</div>}
+      {b.people.map((p) => (
+        <div key={p.user_id || "accounts"} className="mt-4 bg-white rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)" }}>
+          <div className="flex items-center gap-3 px-5 py-3 border-b" style={{ borderColor: "var(--line)", background: "var(--paper)" }}>
+            <span className="flex-1 text-sm"><b>{p.name}</b>
+              <span className="ml-2 text-xs" style={{ color: "var(--mut)" }}>{p.designation ? `${p.designation} · ` : ""}{p.role}</span></span>
+            <span className="text-xs font-mono2" style={{ color: "var(--mut)" }}>{p.counts.total} pending</span>
+            {p.counts.overdue > 0 && (
+              <span className="text-[11px] px-2 py-0.5 rounded-full font-bold" style={{ background: "var(--red-soft)", color: "var(--red)" }}>
+                {p.counts.overdue} overdue / over target
+              </span>
+            )}
+          </div>
+          {p.items.map((item, i) => {
+            const [badge, badgeColor] = PENDING_TYPE[item.type] || [item.type, "var(--mut)"];
+            const hot = item.overdue || item.over_target;
+            const due = dueText(item);
+            return (
+              <button key={i} onClick={() => goto(item)} className="w-full flex items-center gap-3 px-5 py-2.5 text-left text-sm border-b last:border-0 hover:bg-gray-50"
+                style={{ borderColor: "var(--line)", background: hot ? "var(--red-soft)" : undefined }}>
+                <span className="w-24 shrink-0 text-[9px] font-bold tracking-wider" style={{ color: badgeColor }}>{badge}</span>
+                <span className="flex-1 min-w-0">
+                  <span className="font-medium">{item.label}</span>
+                  <span className="ml-2 text-xs" style={{ color: "var(--mut)" }}>{item.sublabel}</span>
+                </span>
+                {item.pending_since && (
+                  <span className="text-xs font-mono2 whitespace-nowrap" style={{ color: item.over_target ? "var(--red)" : "var(--mut)" }}>
+                    held {fmtAge(item.age_ms)}{item.over_target && " · over target"}
+                  </span>
+                )}
+                {due && (
+                  <span className="text-xs font-mono2 whitespace-nowrap font-semibold"
+                    style={{ color: item.overdue ? "var(--red)" : (new Date(item.due_at).getTime() - Date.now() < 3 * 86400000 ? "var(--amber)" : "var(--mut)") }}>
+                    {due}
+                  </span>
+                )}
+                <span className="text-xs underline shrink-0" style={{ color: "var(--accent)" }}>open</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Performance settings (firm-definable targets, manager/admin) ---------- */
+
+function PerfNum({ label, value, set, step = 1, placeholder, hint }) {
+  return (
+    <label className="text-xs font-semibold block" style={{ color: "var(--mut)" }}>{label}
+      <input type="number" min="0" step={step} value={value} placeholder={placeholder}
+        onChange={(e) => set(e.target.value)}
+        className="mt-1 w-full border rounded-md px-3 py-2 text-sm font-normal" style={{ borderColor: "var(--line)" }} />
+      {hint && <div className="mt-0.5 text-[10px] font-normal">{hint}</div>}
+    </label>
+  );
+}
+
+function PerformanceSettings() {
+  const [data, setData] = useState(null);
+  const [f, setF] = useState(null);
+  const [note, setNote] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = () => api.get("/performance/config").then((d) => {
+    setData(d);
+    const c = d.config;
+    setF({
+      p_cycle: c.proposal.cycle_target_days ?? "", p_hold: c.proposal.hold_target_days,
+      o_cycle: c.onboarding.cycle_target_days ?? "", o_hold: c.onboarding.hold_target_days,
+      d1: c.duty.grace_bands[0], d2: c.duty.grace_bands[1], d3: c.duty.grace_bands[2],
+      i_target: c.invoicing.target_days ?? "", i1: c.invoicing.grace_bands[0], i2: c.invoicing.grace_bands[1], i3: c.invoicing.grace_bands[2],
+    });
+  }).catch((e) => setErr(e.message));
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (err && !f) return <div className="max-w-3xl mx-auto text-sm" style={{ color: "var(--mut)" }}>{err}</div>;
+  if (!f) return <div className="max-w-3xl mx-auto text-sm" style={{ color: "var(--mut)" }}>Loading targets…</div>;
+
+  const opt = (v) => (v === "" ? null : Number(v));
+  const save = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.put("/performance/config", {
+        config: {
+          proposal: { cycle_target_days: opt(f.p_cycle), hold_target_days: Number(f.p_hold) },
+          onboarding: { cycle_target_days: opt(f.o_cycle), hold_target_days: Number(f.o_hold) },
+          duty: { grace_bands: [Number(f.d1), Number(f.d2), Number(f.d3)] },
+          invoicing: { target_days: opt(f.i_target), grace_bands: [Number(f.i1), Number(f.i2), Number(f.i3)] },
+        },
+        note: note.trim(),
+      });
+      setNote("");
+      await load();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const set = (k) => (v) => setF({ ...f, [k]: v });
+  return (
+    <div className="max-w-3xl mx-auto">
+      <h1 className="font-disp text-2xl font-bold tracking-tight" style={{ color: "var(--ink)" }}>Performance settings</h1>
+      <p className="text-sm mt-1" style={{ color: "var(--mut)" }}>
+        The firm's time targets that drive star ratings. The computation is fixed and applied server-side —
+        only these thresholds change, every change is logged, and new targets apply to <b>future</b> scoring
+        only (sealed history keeps the standard that was active when the work completed). Currently v{data.version}.
+      </p>
+
+      <Card title="Proposal → engagement cycle" sub="How fast a matter should move. The hold target drives each holder's stars; the cycle target flags slow matters on the pending board.">
+        <div className="grid grid-cols-2 gap-3">
+          <PerfNum label="Per-holder target hold time (days)" value={f.p_hold} set={set("p_hold")} step={0.5}
+            hint="★5 at or under this; the rest of the scale stretches with it" />
+          <PerfNum label="Cycle target — complete within (days)" value={f.p_cycle} set={set("p_cycle")}
+            placeholder="no target" hint="optional; empty = no cycle target" />
+        </div>
+      </Card>
+
+      <Card title="Duty completion — grace bands" sub="Duties are always scored against the statutory deadline (not configurable). The firm sets only how much lateness maps to each star.">
+        <div className="grid grid-cols-3 gap-3">
+          <PerfNum label="★4 up to (days late)" value={f.d1} set={set("d1")} step={0.5} />
+          <PerfNum label="★3 up to (days late)" value={f.d2} set={set("d2")} step={0.5} />
+          <PerfNum label="★2 up to (days late)" value={f.d3} set={set("d3")} step={0.5} />
+        </div>
+        <div className="mt-2 text-[10px]" style={{ color: "var(--mut)" }}>On/before due is always ★5; beyond the last band is ★1; declared-without-proof stays capped at ★3.</div>
+      </Card>
+
+      <Card title="Onboarding relay" sub="Same mechanics as proposals — target durations for the documentation relay.">
+        <div className="grid grid-cols-2 gap-3">
+          <PerfNum label="Per-holder target hold time (days)" value={f.o_hold} set={set("o_hold")} step={0.5} />
+          <PerfNum label="Cycle target — complete within (days)" value={f.o_cycle} set={set("o_cycle")} placeholder="no target" />
+        </div>
+      </Card>
+
+      <Card title="Invoicing (accountant)" sub="Target days from EL send to invoice-raised; when set it becomes the ★5 anchor (otherwise the payment's own due date is used).">
+        <div className="grid grid-cols-4 gap-3">
+          <PerfNum label="Target (days from EL send)" value={f.i_target} set={set("i_target")} placeholder="use due date" />
+          <PerfNum label="★4 up to (days late)" value={f.i1} set={set("i1")} step={0.5} />
+          <PerfNum label="★3 up to (days late)" value={f.i2} set={set("i2")} step={0.5} />
+          <PerfNum label="★2 up to (days late)" value={f.i3} set={set("i3")} step={0.5} />
+        </div>
+      </Card>
+
+      <div className="mt-4 flex gap-2 items-center">
+        <input value={note} onChange={(e) => setNote(e.target.value)}
+          placeholder="Mandatory note — why is the standard changing? (kept on the change log)"
+          className="flex-1 border rounded-md px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }} />
+        <button disabled={busy || !note.trim()} onClick={save}
+          className="px-5 py-2 rounded-lg text-white text-sm font-semibold disabled:opacity-40" style={{ background: "var(--accent)" }}>
+          {busy ? "Saving…" : "Save as new version"}
+        </button>
+      </div>
+      {err && <div className="mt-2 text-xs px-2.5 py-2 rounded-md font-medium" style={{ background: "var(--red-soft)", color: "var(--red)" }}>⚠️ {err}</div>}
+
+      <Card title="Change log" sub="Every version, newest first — who changed the standard, when, and why.">
+        {data.history.length === 0 && <div className="text-xs" style={{ color: "var(--mut)" }}>No changes yet — the built-in defaults (v0) apply.</div>}
+        {data.history.map((h) => (
+          <div key={h.version} className="flex gap-3 items-baseline py-1.5 text-xs border-b last:border-0" style={{ borderColor: "var(--line)" }}>
+            <span className="font-mono2 font-bold w-8">v{h.version}</span>
+            <span className="w-36 font-mono2" style={{ color: "var(--mut)" }}>{fmtDT(new Date(h.at).getTime())}</span>
+            <span className="w-32 truncate" style={{ color: "var(--mut)" }}>{h.by || "—"}</span>
+            <span className="flex-1">"{h.note}"</span>
+          </div>
+        ))}
+      </Card>
     </div>
   );
 }
