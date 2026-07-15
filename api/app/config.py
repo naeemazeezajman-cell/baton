@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     FILES_DIR: str = "var/files"
     ANTHROPIC_API_KEY: str = ""  # server-side only; empty = payment-terms polish disabled
     SCHEDULER_ENABLED: bool = True  # daily 07:00 Asia/Dubai digest (off in tests)
+    # Upload limits (uploads.py). Every one is a rejection threshold, so 0 = unlimited and
+    # the defaults are what production runs on unless an env var says otherwise.
+    MAX_UPLOAD_MB: int = 10  # per file, enforced before the bytes are materialized
+    TENANT_STORAGE_QUOTA_MB: int = 2048  # total stored bytes per firm
+    DEMO_STORAGE_QUOTA_MB: int = 200  # tighter, because the demo firm's credentials are public
 
 
 @lru_cache

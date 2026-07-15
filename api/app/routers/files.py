@@ -13,6 +13,7 @@ from ..db import get_db
 from ..models import File, User
 from ..security import current_user
 from ..tenancy import get_scoped_or_404
+from ..uploads import check_quota, read_capped
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -30,8 +31,13 @@ class FileOut(BaseModel):
 
 
 def store_upload(db: Session, user: User, entity: str, entity_id: uuid.UUID, upload: UploadFile) -> File:
-    """Save an upload to blob storage and register the files row (no commit)."""
-    data = upload.file.read()
+    """Save an upload to blob storage and register the files row (no commit).
+
+    413s an oversized file or one that would exhaust the firm's storage quota (uploads.py).
+    The quota is charged before the blob is written, so a refused upload leaves nothing behind.
+    """
+    data = read_capped(upload)
+    check_quota(db, user.tenant_id, len(data))
     path = blobs.blob_path_for(user.tenant_id, entity, upload.filename)
     blobs.save_blob(path, data)
     row = File(
