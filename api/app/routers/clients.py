@@ -97,7 +97,8 @@ def client_documents(client_id: uuid.UUID, user: User = Depends(current_user), d
     # resolve onboarding uploader names via the files table
     file_ids = [d["file_id"] for d in docs if d["uploaded_by"] == "—"]
     if file_ids:
-        frows = {str(f.id): f for f in db.scalars(select(File).where(File.id.in_(file_ids))).all()}
+        frows = {str(f.id): f for f in db.scalars(
+            tenant_select(File, user).where(File.id.in_(file_ids))).all()}
         for d in docs:
             f = frows.get(str(d["file_id"]))
             if f:

@@ -41,6 +41,10 @@ class Tenant(Base):
     accent: Mapped[str | None] = mapped_column(Text, server_default="#14606B")
     services: Mapped[list] = mapped_column(JSONB, server_default=text("'[]'"))
     templates: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'"))
+    # Publicly-credentialed showcase firm (see demo_seed.py). Narrow by design: it suppresses
+    # outbound email and freezes credentials/roster. It NEVER widens data visibility — a demo
+    # user is scoped by tenant_id exactly like any other user.
+    demo: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(TS, server_default=NOW)
 
 

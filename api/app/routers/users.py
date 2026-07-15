@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .. import emails
 from ..config import get_settings
 from ..db import get_db
+from ..demo import deny_if_demo
 from ..models import Tenant, User
 from ..security import create_set_password_token, current_user, hash_password, require_roles
 from ..tenancy import get_scoped_or_404, tenant_select
@@ -99,7 +100,8 @@ def create_user(
     db.flush()
     tenant = db.get(Tenant, admin.tenant_id)
     link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(new)}"
-    emails.send_invite(new.email, new.name, tenant.short, link, temp_password)
+    emails.send_invite(new.email, new.name, tenant.short, link, temp_password,
+                       db=db, tenant_id=tenant.id)
     db.commit()
     return new
 
@@ -112,6 +114,8 @@ def update_user(
     db: Session = Depends(get_db),
 ):
     target = get_scoped_or_404(db, User, user_id, admin)
+    # the demo roster is the product tour — re-roling the seeded staff empties the boards
+    deny_if_demo(db, admin, "Editing the seeded demo staff")
     if body.role is not None:
         _validate_role(body.role)
         target.role = body.role
@@ -134,6 +138,8 @@ def deactivate_user(
     target = get_scoped_or_404(db, User, user_id, admin)
     if target.id == admin.id:
         raise HTTPException(status_code=409, detail="You cannot deactivate your own account")
+    # login() only matches active users — deactivating a published login retires it for good
+    deny_if_demo(db, admin, "Deactivating a demo account")
     target.active = False
     db.commit()
     return target
@@ -146,11 +152,15 @@ def resend_invite(
     db: Session = Depends(get_db),
 ):
     target = get_scoped_or_404(db, User, user_id, admin)
+    # before the must_reset check: demo accounts are seeded must_reset=False, so that 409
+    # would answer first and explain the refusal with the wrong reason
+    deny_if_demo(db, admin, "Re-inviting a demo account")
     if not target.must_reset:
         raise HTTPException(status_code=409, detail="User has already set their password")
     temp_password = secrets.token_urlsafe(9)
     target.password_hash = hash_password(temp_password)
     tenant = db.get(Tenant, admin.tenant_id)
     link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(target)}"
-    emails.send_invite(target.email, target.name, tenant.short, link, temp_password)
+    emails.send_invite(target.email, target.name, tenant.short, link, temp_password,
+                       db=db, tenant_id=tenant.id)
     db.commit()

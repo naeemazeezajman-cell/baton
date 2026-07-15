@@ -26,10 +26,13 @@ def _force_email_failure(monkeypatch):
 
 def test_email_send_reports_failure_instead_of_raising(monkeypatch):
     _force_email_failure(monkeypatch)
+    # tenant_id=None — no tenant context in a unit test, and the demo check short-circuits on
+    # it without touching the session, so these go straight down the provider branch
+    no_tenant = {"db": None, "tenant_id": None}
     # every public send returns False on failure and never raises
-    assert emails.send_invite("x@y.ae", "X", "Firm", "http://link", "temp123") is False
-    assert emails.send_client("x@y.ae", "subject", "body") is False
-    assert emails.send_reset("x@y.ae", "X", "http://link") is False
+    assert emails.send_invite("x@y.ae", "X", "Firm", "http://link", "temp123", **no_tenant) is False
+    assert emails.send_client("x@y.ae", "subject", "body", **no_tenant) is False
+    assert emails.send_reset("x@y.ae", "X", "http://link", **no_tenant) is False
 
 
 def test_create_firm_succeeds_when_email_client_raises(client, monkeypatch):

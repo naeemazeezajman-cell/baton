@@ -102,7 +102,8 @@ def run_daily_digest(db: Session, force: bool = False) -> dict:
                     "\n\nReminders repeat daily until each item moves.\n\n— Baton")
             subject_bits = ([f"{len(duties)} overdue deadline(s)"] if duties else []) + \
                            ([f"{len(obs)} aging onboarding(s)"] if obs else [])
-            emails._send(u.email, "Baton — " + ", ".join(subject_bits), body)
+            emails._send(u.email, "Baton — " + ", ".join(subject_bits), body,
+                         db=db, tenant_id=tenant.id)
             db.add(Notice(tenant_id=tenant.id, user_id=u.id,
                           text_=f"Daily digest: {' and '.join(notice_bits)} need your action"))
             sent_duty += 1
@@ -125,7 +126,8 @@ def run_daily_digest(db: Session, force: bool = False) -> dict:
                         f"{len(attention)} receivable(s) need attention:\n\n" + "\n".join(lines) +
                         "\n\nMark invoices raised and record receipts as they arrive. "
                         "Reminders repeat daily until each receipt status is updated.\n\n— Baton")
-                emails._send(acct.email, f"Baton — receivables digest ({len(attention)} item(s))", body)
+                emails._send(acct.email, f"Baton — receivables digest ({len(attention)} item(s))", body,
+                             db=db, tenant_id=tenant.id)
                 db.add(Notice(tenant_id=tenant.id, user_id=acct.id,
                               text_=f"Daily digest: {len(attention)} receivable(s) awaiting invoice/receipt updates"))
                 sent_recv += 1

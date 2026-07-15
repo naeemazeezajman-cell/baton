@@ -343,11 +343,18 @@ def _store_upload(db: Session, user: User, entity: str, entity_id, upload: Uploa
     return _store_bytes(db, user, entity, entity_id, upload.filename, upload.file.read())
 
 
+def _client(db: Session, f: VatFiling) -> Client | None:
+    """The filing's client, scoped to the filing's tenant. Never db.get(Client, ...) — a
+    primary-key fetch would follow a mis-tenanted client_id straight into another tenant's
+    row and surface its name/ref/contact through serialize()."""
+    if not f.client_id:
+        return None
+    return db.scalar(select(Client).where(Client.id == f.client_id, Client.tenant_id == f.tenant_id))
 
 
 def serialize(db: Session, f: VatFiling, detail: bool = False) -> dict:
     duty = db.get(Duty, f.duty_id)
-    client = db.get(Client, f.client_id) if f.client_id else None
+    client = _client(db, f)
     staff = db.get(User, f.staff_id)
     out = {
         "id": f.id, "duty_id": f.duty_id, "client_id": f.client_id,
@@ -1093,7 +1100,7 @@ def _reconcile(db: Session, f: VatFiling, user: User):
 
     ledger_only = [i for i in ledger if i.bucket == "ledger_only"]
     invoice_only = unused
-    excel = _recon_workbook(f, items, db.get(Client, f.client_id) if f.client_id else None)
+    excel = _recon_workbook(f, items, _client(db, f))
     fname = f"VAT Reconciliation {f.period_start:%b} - {f.period_end:%b %Y}.xlsx"
     stored = _store_bytes(db, user, "client", f.client_id or f.id, fname, excel)
     f.recon = {
@@ -1362,7 +1369,7 @@ def request_missing_invoice(fid: uuid.UUID, item_id: uuid.UUID, body: MailIn,
         raise conflict("Only reconciliation differences can be chased with the client")
     emails.send_client(str(body.to), body.subject,
                        body.body + f"\n\n{emails.reply_to_line(user.name, user.email)}",
-                       reply_to=(user.email, user.name))
+                       reply_to=(user.email, user.name), db=db, tenant_id=user.tenant_id)
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="missing_invoice",
                             item_id=it.id, to_email=str(body.to), subject=body.subject, by_user=user.id))
     it.resolution = {"action": "requested", "by": str(user.id), "at": iso(now()), "to": str(body.to)}
@@ -1518,7 +1525,7 @@ def recon_workbook(fid: uuid.UUID, user: User = Depends(current_user), db: Sessi
         raise conflict("No reconciliation has run yet")
     items = db.scalars(select(VatFilingItem).where(VatFilingItem.filing_id == f.id)
                        .order_by(VatFilingItem.source, VatFilingItem.row_no)).all()
-    client = db.get(Client, f.client_id) if f.client_id else None
+    client = _client(db, f)
     return _xlsx_response(_recon_workbook(f, items, client),
                           f.recon.get("excel_name") or "VAT Reconciliation.xlsx")
 
@@ -1543,7 +1550,8 @@ def request_from_client(fid: uuid.UUID, body: RequestFromClientIn,
         doc_txt = f"\n\nThe template ({tname}) is attached to this email."
     emails.send_client(str(body.to), body.subject,
                        body.body + doc_txt + f"\n\n{emails.reply_to_line(user.name, user.email)}",
-                       reply_to=(user.email, user.name), attachments=attachments)
+                       reply_to=(user.email, user.name), attachments=attachments,
+                       db=db, tenant_id=user.tenant_id)
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind=body.kind,
                             to_email=str(body.to), subject=body.subject, by_user=user.id))
     label = "VAT ledger" if body.kind == "ledger" else "invoice register"
@@ -1690,7 +1698,7 @@ def _build_computation(db: Session, f: VatFiling, user: User) -> dict:
     }
     # refresh the registry copy of the working paper — reflects resolutions AND the computation
     if f.recon:
-        client = db.get(Client, f.client_id) if f.client_id else None
+        client = _client(db, f)
         stored_x = _store_bytes(db, user, "client", f.client_id or f.id,
                                 f.recon.get("excel_name") or "VAT Reconciliation.xlsx",
                                 _recon_workbook(f, items, client))
@@ -1893,7 +1901,7 @@ def confirm_computation(fid: uuid.UUID, body: ConfirmComputationIn | None = None
             stamped.append({**c, "acknowledged_by": str(user.id), "acknowledged_by_name": user.name,
                             "acknowledged_at": iso(now())})
 
-    client = db.get(Client, f.client_id) if f.client_id else None
+    client = _client(db, f)
     client_name = client.name if client else "Client"
     # PIN the profile version here: until confirmation the checks track the CURRENT profile;
     # from confirmation onward THIS version is what the working paper and history record.
@@ -1949,7 +1957,8 @@ def send_computation(fid: uuid.UUID, body: MailIn, user: User = Depends(current_
                         for i in corrections))
     emails.send_client(str(body.to), body.subject,
                        body.body + corr_txt + doc_txt + f"\n\n{emails.reply_to_line(user.name, user.email)}",
-                       reply_to=(user.email, user.name), attachments=attachments)
+                       reply_to=(user.email, user.name), attachments=attachments,
+                       db=db, tenant_id=user.tenant_id)
     db.add(VatClientRequest(tenant_id=f.tenant_id, filing_id=f.id, kind="computation",
                             to_email=str(body.to), subject=body.subject, by_user=user.id))
     _log(db, f, user.id, f'Computation emailed to the client at {body.to} — subject: "{body.subject}" '

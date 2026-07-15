@@ -133,6 +133,7 @@ def raise_invoice(
     emails.send_client(
         contact_email, f"{firm.short} — Invoice {number}: {p.label}", body,
         reply_to=(user.email, user.name), attachments=attachments,
+        db=db, tenant_id=user.tenant_id,
     )
 
     p.invoice = {"number": number, "date": inv_date.isoformat(),

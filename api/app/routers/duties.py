@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from .. import blobs, emails
 from ..db import get_db
-from ..models import Duty, DutyCompletion, DutyEvent, User
+from ..models import Client, Duty, DutyCompletion, DutyEvent, User
 from ..security import current_user, require_roles
 from ..tenancy import get_scoped_or_404, tenant_select
 from ..workflow import conflict, now
@@ -118,10 +118,13 @@ def create_duty(body: DutyCreateIn, user: User = Depends(require_roles("Admin", 
     if body.cadence not in CADENCES:
         raise HTTPException(status_code=422, detail=f"cadence must be one of {CADENCES}")
     staff = get_scoped_or_404(db, User, body.staff_id, user)
+    # client_id arrives from the request body — scope it, or a duty (and the VAT filing
+    # opened from it) would carry an FK into another tenant's clients row.
+    client = get_scoped_or_404(db, Client, body.client_id, user) if body.client_id else None
     kind = duty_kind(body.service)
     d = Duty(
         tenant_id=user.tenant_id, staff_id=staff.id, client_name=body.client_name,
-        client_id=body.client_id, service=body.service, kind=kind,
+        client_id=client.id if client else None, service=body.service, kind=kind,
         contact=body.contact.model_dump() if body.contact else None,
         cadence=body.cadence, next_due=body.next_due,
     )
@@ -195,7 +198,8 @@ def apply_completion(db: Session, d: Duty, user: User, method: str, stored: list
         body += ("\n\nKindly let us know if you have any questions."
                  f"\n\n{emails.reply_to_line(user.name, user.email)}\n\nBest regards")
         emails.send_client(emailed_to, f"{d.service} — {d.client_name}", body,
-                           reply_to=(user.email, user.name), attachments=attachments)
+                           reply_to=(user.email, user.name), attachments=attachments,
+                           db=db, tenant_id=user.tenant_id)
         how = "download link(s)" if link_lines else "attached"
         _log(db, d, user.id, f"Completed ({late_txt}) — {len(stored)} deliverable(s) uploaded and emailed to "
                              f"{emailed_to}: {names}{note_txt}. Due date was {fmt_d(due_at)}.")

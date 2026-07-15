@@ -858,7 +858,8 @@ def send_client(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current
     attach_v = body.attach_version or _latest_version(p)["v"]
     text, attachments = _client_mail_parts(db, user, body)
     emails.send_client(str(body.to), body.subject, text,
-                       reply_to=(user.email, user.name), attachments=attachments)
+                       reply_to=(user.email, user.name), attachments=attachments,
+                       db=db, tenant_id=user.tenant_id)
     p.status = "proposal_sent"
     p.proposal_sent_at = now()
     log_event(db, p, user.id,
@@ -1136,7 +1137,8 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
 
     text, attachments = _client_mail_parts(db, user, body)
     emails.send_client(str(body.to), body.subject, text,
-                       reply_to=(user.email, user.name), attachments=attachments)
+                       reply_to=(user.email, user.name), attachments=attachments,
+                       db=db, tenant_id=user.tenant_id)
     p.el = {**p.el, "sent_at": iso(t0)}
     p.status = "el_sent"
     p.onboarding_completed_at = t0  # part 1 completion stamp — the process closes here
@@ -1181,6 +1183,7 @@ def el_send(pid: uuid.UUID, body: ClientMailIn, user: User = Depends(current_use
                 + "\n".join(lines) +
                 "\n\nMark each invoice raised in the accounting software and record receipts as they arrive. "
                 "Daily reminders run until every receipt status is updated.\n\n— Baton",
+                db=db, tenant_id=user.tenant_id,
             )
         names = ", ".join(a.name for a in accountants)
         log_event(db, p, None, f"Accountant notification dispatched to {names} — invoice timeline "

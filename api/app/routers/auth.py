@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..demo import deny_if_demo
 from ..models import User
 from ..security import (
     SUBSCRIPTION_INACTIVE_MSG,
@@ -92,6 +93,9 @@ def reset_password(
     else:
         # Bearer path deliberately bypasses the must_reset gate — this is the one allowed call.
         user = _user_from_credentials(credentials, db)
+    # The demo logins are published; whoever changed one would lock out every later visitor.
+    # Guarded on both paths — the set-password token is mailable, so it is no weaker.
+    deny_if_demo(db, user, "Changing your password")
     user.password_hash = hash_password(body.new_password)
     user.must_reset = False
     db.commit()

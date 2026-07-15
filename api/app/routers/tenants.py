@@ -179,7 +179,8 @@ def perform_bootstrap(body: BootstrapIn, db: Session) -> BootstrapOut:
         for d in emp.duties:
             _add_pre_baton_duty(db, tenant.id, user, d, client_for)
         link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(user)}"
-        emails.send_invite(user.email, user.name, tenant.short, link, temp_password)
+        emails.send_invite(user.email, user.name, tenant.short, link, temp_password,
+                           db=db, tenant_id=tenant.id)
         out_users.append(
             BootstrapUserOut(id=user.id, name=user.name, email=user.email, role=user.role, temp_password=temp_password)
         )
@@ -325,7 +326,8 @@ def complete_setup(body: CompleteSetupIn, admin: User = Depends(require_roles("A
             db.add(user)
             db.flush()
             link = f"{get_settings().FRONTEND_ORIGIN}/set-password?token={create_set_password_token(user)}"
-            emails.send_invite(user.email, user.name, t.short, link, temp_password)
+            emails.send_invite(user.email, user.name, t.short, link, temp_password,
+                               db=db, tenant_id=t.id)
             out_users.append(BootstrapUserOut(id=user.id, name=user.name, email=user.email,
                                               role=user.role, temp_password=temp_password))
         else:
